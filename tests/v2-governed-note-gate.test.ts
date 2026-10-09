@@ -1,11 +1,435 @@
 import assert from 'node:assert/strict';
+import { AssertionError } from 'node:assert';
 import fs, { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
-import childProcess, { spawnSync } from 'node:child_process';
+import childProcess, { spawnSync, spawn } from 'node:child_process';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { syncBuiltinESMExports } from 'node:module';
-import test from 'node:test';
-import { createHash } from 'node:crypto';
+import nodeTest, { describe, after } from 'node:test';
+import { createHash, randomUUID } from 'node:crypto';
+import { Worker, isMainThread, parentPort, workerData } from 'node:worker_threads';
+
+type Body = (context: { diagnostic(message: string): void }) => void | Promise<void>;
+const controls: { name: string; timeout?: number; body: Body }[] = [];
+function test(name: string, options: { timeout: number } | Body, body?: Body) {
+    assert.ok(!controls.some(value => value.name === name));
+    controls.push({ name, timeout: typeof options === 'function' ? undefined : options.timeout,
+        body: typeof options === 'function' ? options : body! });
+}
+const realmAbort = new AbortController();
+const pendingGates = new Set<Promise<unknown>>();
+const outcomes = ['completed', 'completed-after-abort', 'assertion-failed', 'other-failed', 'aborted-before-body'] as const;
+const phases = ['body', 'fixture-git', 'fixture-copy', 'fixture-write', 'gate'] as const;
+const gitOperations = ['init', 'config', 'add', 'commit', 'status', 'diff', 'rev-parse', 'update-index', 'other'] as const;
+type Phase = typeof phases[number];
+type NativeAvailability = { ordinal: number; ready: boolean; started: boolean; direct: boolean; closure: boolean; closed: boolean;
+    closeObserved: boolean; closeCode: number | null; directCode: number | null; closureCode: number | null; activeProcesses: number | null };
+type BodyDiagnostic = { outcome: typeof outcomes[number]; phase: Phase; abortBeforeCatch: boolean;
+    git: { operation: typeof gitOperations[number]; status: number | null; category: 'none' | 'timeout' | 'launch' | 'other' } | null;
+    native: NativeAvailability[] };
+let phase: Phase = 'body';
+let gitDiagnostic: BodyDiagnostic['git'] = null;
+const observedHelpers: any[] = [];
+function bodyDiagnostic(outcome: BodyDiagnostic['outcome'], abortBeforeCatch: boolean): BodyDiagnostic {
+    return { outcome, phase, abortBeforeCatch, git: gitDiagnostic, native: observedHelpers.map((proof, index) => ({
+        ordinal: index + 1, ready: proof.ready === true, started: proof.started === true, direct: !!proof.direct,
+        closure: !!proof.closure, closed: proof.closed === true, closeObserved: proof.closeObserved === true,
+        closeCode: proof.closeCode ?? null, directCode: proof.direct?.nativeCode ?? null,
+        closureCode: proof.closure?.nativeCode ?? null, activeProcesses: proof.closure?.activeProcesses ?? null })) };
+}
+const exactKeys = (value: any, keys: string[]) => value && typeof value === 'object' && !Array.isArray(value)
+    && Object.keys(value).length === keys.length && keys.every(key => Object.hasOwn(value, key));
+const numericOrNull = (value: unknown) => value === null || Number.isSafeInteger(value);
+function validBody(value: any): value is BodyDiagnostic {
+    return exactKeys(value, ['outcome', 'phase', 'abortBeforeCatch', 'git', 'native'])
+        && outcomes.includes(value.outcome) && phases.includes(value.phase) && typeof value.abortBeforeCatch === 'boolean'
+        && (value.git === null || exactKeys(value.git, ['operation', 'status', 'category']) && gitOperations.includes(value.git.operation)
+            && numericOrNull(value.git.status) && ['none', 'timeout', 'launch', 'other'].includes(value.git.category))
+        && Array.isArray(value.native) && value.native.length <= 34 && value.native.every((proof: any, index: number) =>
+            exactKeys(proof, ['ordinal', 'ready', 'started', 'direct', 'closure', 'closed', 'closeObserved', 'closeCode', 'directCode', 'closureCode', 'activeProcesses'])
+            && proof.ordinal === index + 1 && ['ready', 'started', 'direct', 'closure', 'closed', 'closeObserved'].every(key => typeof proof[key] === 'boolean')
+            && numericOrNull(proof.directCode) && numericOrNull(proof.closeCode) && numericOrNull(proof.closureCode) && numericOrNull(proof.activeProcesses)
+            && (proof.activeProcesses === null || proof.activeProcesses >= 0)
+            && proof.direct === (proof.directCode !== null) && proof.closure === (proof.closureCode !== null && proof.activeProcesses !== null));
+}
+
+// Cheap guards precede the scheduler implementation. They exercise the same
+// transport/admission path as the original bodies, without native work.
+function registerIsolationGuards() {
+    nodeTest('control isolation guard confines builtin and process faults to one fresh realm', async () => {
+        const before = { read: fs.readFileSync, namedRead: readFileSync, spawn: childProcess.spawn,
+            namedSpawn: spawn, write: process.stdout.write, error: process.stderr.write, platform: process.platform };
+        const state = new SharedArrayBuffer(16), pool = new ControlPool();
+        const results = await Promise.all([pool.run('probe:mutate', undefined, state), pool.run('probe:companion', undefined, state)]);
+        assert.ok(results.every(value => value.exitCode === 0 && value.stdoutEnded && value.stderrEnded));
+        assert.equal(Atomics.load(new Int32Array(state), 1), 1);
+        assert.deepEqual({ read: fs.readFileSync, namedRead: readFileSync, spawn: childProcess.spawn,
+            namedSpawn: spawn, write: process.stdout.write, error: process.stderr.write, platform: process.platform }, before);
+    });
+    nodeTest('control isolation guard admits at most two fresh workers and joins their output', async () => {
+        const state = new SharedArrayBuffer(16), pool = new ControlPool();
+        const results = await Promise.all(Array.from({ length: 4 }, () => pool.run('probe:bounded', undefined, state)));
+        assert.equal(pool.maximumActive, 2); assert.equal(Atomics.load(new Int32Array(state), 0), 0);
+        assert.equal(Atomics.load(new Int32Array(state), 1), 2);
+        assert.equal(new Set(results.map(value => value.token)).size, 4);
+        assert.ok(results.every(value => value.stdout === 'CONTROL_GUARD_DRAIN\n' && value.stderr === 'CONTROL_GUARD_DRAIN\n'
+            && value.stdoutEnded && value.stderrEnded && value.exitCode === 0));
+    });
+    nodeTest('control isolation guard refuses missing malformed duplicate and misattributed completion', async () => {
+        for (const mode of ['missing', 'malformed', 'duplicate', 'wrong-id', 'wrong-token', 'premature', 'unknown']) {
+            const pool = new ControlPool();
+            await assert.rejects(pool.run('probe:' + mode), /CONTROL_ISOLATION_FAILED/);
+            assert.equal(pool.active, 0);
+        }
+    });
+    nodeTest('control isolation guard worker failure stops queued admission and awaits sibling cancellation', async () => {
+        const state = new SharedArrayBuffer(16), pool = new ControlPool();
+        const results = await Promise.allSettled([pool.run('probe:wait-abort', undefined, state),
+            pool.run('probe:fail', undefined, state), pool.run('probe:never', undefined, state)]);
+        assert.ok(results.every(value => value.status === 'rejected'));
+        assert.equal(pool.launched, 2); assert.equal(pool.active, 0);
+        assert.equal(Atomics.load(new Int32Array(state), 2), 1, 'sibling finally finished before join');
+        assert.equal(Atomics.load(new Int32Array(state), 3), 0, 'queued body never dispatched');
+    });
+    nodeTest('control isolation guard cancellation joins cooperative cleanup and refuses subsequent admission', async () => {
+        const state = new SharedArrayBuffer(16), pool = new ControlPool(), words = new Int32Array(state);
+        const result = pool.run('probe:wait-abort', undefined, state);
+        // Attach the rejection handler before cancellation can reject it.
+        const settled = Promise.allSettled([result]);
+        await until(() => Atomics.load(words, 0) === 1);
+        pool.cancel();
+        assert.equal((await settled)[0].status, 'rejected');
+        await assert.rejects(pool.run('probe:never', undefined, state), /CONTROL_ISOLATION_FAILED/);
+        assert.equal(Atomics.load(words, 2), 1); assert.equal(Atomics.load(words, 3), 0);
+        assert.equal(pool.active, 0);
+    });
+    nodeTest('control isolation guard unexpected worker exit cannot supply completion or native proof', async () => {
+        const pool = new ControlPool(); await assert.rejects(pool.run('probe:exit'), /CONTROL_ISOLATION_FAILED/);
+        assert.equal(pool.active, 0); assert.equal(pool.launched, 1);
+    });
+    nodeTest('control isolation guard shared interrupt route cancels every registered pool and unregisters after join', async () => {
+        const pool = new ControlPool();
+        const result = await pool.run('probe:interrupt-registry');
+        assert.equal(result.exitCode, 0); assert.ok(result.stdoutEnded && result.stderrEnded);
+        assert.deepEqual(result.diagnostics, ['handler-event-routing-only; two pools joined; no native work']);
+    });
+    nodeTest('control isolation guard fixed categories distinguish body failure from cancellation without raw payloads', async () => {
+        for (const [id, outcome] of [['probe:assertion', 'assertion-failed'], ['probe:other-failure', 'other-failed'],
+            ['probe:abort-after-body', 'completed-after-abort']] as const) {
+            const pool = new ControlPool(); await assert.rejects(pool.run(id), /CONTROL_ISOLATION_FAILED/);
+            assert.equal(pool.joined[0].body?.outcome, outcome);
+            assert.doesNotMatch(JSON.stringify(pool.joined[0].body), /PRIVATE_DIAGNOSTIC_CANARY/);
+            const [completion, cancellation] = pool.receipts;
+            assert.equal(completion.kind, 'completion'); assert.equal(completion.controlId, id);
+            assert.equal(cancellation.kind, 'cancel'); assert.equal(cancellation.category, 'body-result');
+            assert.equal(cancellation.controlId, id); assert.ok(completion.sequence < cancellation.sequence);
+            assert.ok(completion.receivedAt <= cancellation.receivedAt);
+        }
+        const pool = new ControlPool(), pending = pool.run('probe:never', undefined, new SharedArrayBuffer(16));
+        const result = Promise.allSettled([pending]); pool.cancel(); await result;
+        assert.equal(pool.joined[0].body?.outcome, 'aborted-before-body');
+    });
+    nodeTest('control isolation guard rejects unknown diagnostic fields and nonnumeric native availability', async () => {
+        for (const id of ['probe:malformed-body', 'probe:extra-body-field', 'probe:bad-native']) {
+            const pool = new ControlPool(); await assert.rejects(pool.run(id), /CONTROL_ISOLATION_FAILED/);
+            assert.equal(pool.joined[0].body, undefined);
+            assert.equal(pool.receipts[0].kind, 'cancel'); assert.equal(pool.receipts[0].category, 'protocol');
+        }
+    });
+    nodeTest('control native cancellation guard closes two admitted Jobs before joining and refuses queued admission', async t => {
+        const state = new SharedArrayBuffer(16), words = new Int32Array(state), pool = new ControlPool();
+        const settled = Promise.allSettled([pool.run('probe:native-abort', 60000, state),
+            pool.run('probe:native-abort', 60000, state), pool.run('probe:never', undefined, state)]);
+        let admitted = false;
+        try { await until(() => Atomics.load(words, 0) === 2, 60000); admitted = true; }
+        catch { /* Refuse only after all admitted work has joined below. */ }
+        finally { pool.cancel(); }
+        assert.ok((await settled).every(value => value.status === 'rejected'));
+        assert.ok(admitted, 'both actual runtime stages must be admitted');
+        assert.equal(pool.launched, 2); assert.equal(pool.active, 0); assert.equal(Atomics.load(words, 3), 0);
+        assert.equal(pool.joined.length, 2);
+        for (const joined of pool.joined) {
+            assert.equal(joined.exitCode, 0); assert.ok(joined.stdoutEnded && joined.stderrEnded);
+            assert.equal(joined.diagnostics.length, 1);
+            const evidence = JSON.parse(joined.diagnostics[0]);
+            assert.equal(evidence.observation, 'native-cancellation-guard');
+            assert.equal(evidence.assertionsComplete, true);
+            t.diagnostic(JSON.stringify({ ...evidence, token: joined.token, workerExitCode: joined.exitCode,
+                stdoutEnded: joined.stdoutEnded, stderrEnded: joined.stderrEnded }));
+        }
+    });
+}
+
+const isolationFailure = () => new Error('CONTROL_ISOLATION_FAILED');
+const ownerUrl = new URL(import.meta.url);
+const ownerHash = createHash('sha256').update(readFileSync(ownerUrl)).digest('hex');
+type JoinedControl = { token: string; exitCode: number; stdout: string; stderr: string;
+    stdoutEnded: boolean; stderrEnded: boolean; diagnostics: string[]; body?: BodyDiagnostic };
+type CancelCategory = 'requested' | 'interrupt' | 'body-result' | 'case-deadline' | 'protocol' | 'worker-error' | 'output' | 'worker-lifecycle';
+type ControlReceipt = { kind: 'completion' | 'cancel'; sequence: number; receivedAt: number; controlId: string | null;
+    category?: CancelCategory; body?: BodyDiagnostic; token?: string };
+type Request = { id: string; timeout?: number; state?: SharedArrayBuffer;
+    resolve(value: JoinedControl): void; reject(error: Error): void };
+const activePools = new Set<ControlPool>();
+let interrupted = false;
+function installInterruptRouting() {
+    const cancel = () => {
+        interrupted = true;
+        for (const pool of [...activePools]) pool.cancel('interrupt');
+    };
+    process.on('SIGINT', cancel); process.on('SIGTERM', cancel);
+    return () => { process.off('SIGINT', cancel); process.off('SIGTERM', cancel); };
+}
+class ControlPool {
+    active = 0; maximumActive = 0; launched = 0;
+    readonly joined: JoinedControl[] = [];
+    readonly receipts: ControlReceipt[] = [];
+    private sequence = 0;
+    private original = false;
+    private failed = false;
+    private queue: Request[] = [];
+    private inflight = new Set<() => void>();
+    run(id: string, timeout?: number, state?: SharedArrayBuffer): Promise<JoinedControl> {
+        if (this.failed || interrupted) return Promise.reject(isolationFailure());
+        this.original ||= id.startsWith('control:');
+        activePools.add(this);
+        return new Promise((resolve, reject) => { this.queue.push({ id, timeout, state, resolve, reject }); this.pump(); });
+    }
+    cancel(category: CancelCategory = 'requested', controlId: string | null = null) {
+        if (!this.failed) this.record({ kind: 'cancel', category, controlId });
+        this.failed = true;
+        for (const request of this.queue.splice(0)) request.reject(isolationFailure());
+        for (const cancel of this.inflight) cancel();
+        this.unregisterWhenJoined();
+    }
+    private record(value: Omit<ControlReceipt, 'sequence' | 'receivedAt'>) {
+        const receipt = { ...value, sequence: ++this.sequence, receivedAt: performance.now() };
+        this.receipts.push(receipt);
+        if (this.original) process.stdout.write(JSON.stringify({ observation: 'control-receipt', ownerSha256: ownerHash, ...receipt }) + '\n');
+    }
+    private unregisterWhenJoined() { if (this.active === 0 && this.queue.length === 0) activePools.delete(this); }
+    private pump() {
+        while (!this.failed && this.active < 2 && this.queue.length) {
+            const request = this.queue.shift()!;
+            this.active++; this.launched++; this.maximumActive = Math.max(this.maximumActive, this.active);
+            void this.execute(request).then(result => {
+                this.active--;
+                if (this.failed) request.reject(isolationFailure()); else request.resolve(result);
+                this.pump(); this.unregisterWhenJoined();
+            }, () => { this.active--; this.cancel('worker-lifecycle', request.id); request.reject(isolationFailure()); });
+        }
+    }
+    private async execute(request: Request): Promise<JoinedControl> {
+        const token = randomUUID();
+        const worker = new Worker(ownerUrl, { workerData: { owner: 'governed-control-v1', id: request.id,
+            token, hash: ownerHash, state: request.state }, stdout: true, stderr: true });
+        let invalid = false, ready = false, completed = false, ok = false;
+        const result: JoinedControl = { token, exitCode: -1, stdout: '', stderr: '', stdoutEnded: false, stderrEnded: false, diagnostics: [] };
+        const cancel = () => { invalid = true; worker.postMessage({ kind: 'abort', token }); };
+        this.inflight.add(cancel);
+        // Case deadlines request cooperative cancellation; they never abandon a
+        // Worker or substitute terminate()/exit for the runner's native proof.
+        const timer = request.timeout === undefined ? undefined : setTimeout(() => this.cancel('case-deadline', request.id), request.timeout);
+        const drain = (stream: NodeJS.ReadableStream, channel: 'stdout' | 'stderr') => new Promise<void>(resolve => {
+            stream.on('data', (bytes: Buffer) => {
+                if (Buffer.byteLength(result[channel]) + bytes.length > 8 * 1024 * 1024) { invalid = true; this.cancel('output', request.id); }
+                else result[channel] += bytes.toString('utf8');
+            });
+            stream.once('end', () => { result[channel === 'stdout' ? 'stdoutEnded' : 'stderrEnded'] = true; resolve(); });
+            stream.once('error', () => { invalid = true; this.cancel('output', request.id); resolve(); });
+            stream.once('close', () => { if (!result[channel === 'stdout' ? 'stdoutEnded' : 'stderrEnded']) { invalid = true; resolve(); } });
+        });
+        const drained = Promise.all([drain(worker.stdout!, 'stdout'), drain(worker.stderr!, 'stderr')]);
+        worker.on('message', value => {
+            if (!value || value.id !== request.id || value.token !== token || value.hash !== ownerHash) { invalid = true; this.cancel('protocol', request.id); return; }
+            if (value.kind === 'ready' && !ready && !completed && Object.keys(value).length === 4) {
+                ready = true; worker.postMessage({ kind: 'start', token });
+            } else if (value.kind === 'complete' && ready && !completed && Object.keys(value).length === 7
+                && typeof value.ok === 'boolean' && Array.isArray(value.diagnostics)
+                && validBody(value.body) && value.ok === (value.body.outcome === 'completed')
+                && value.diagnostics.every((entry: unknown) => typeof entry === 'string' && entry.length < 1048576)) {
+                completed = true; ok = value.ok; result.diagnostics = value.diagnostics; result.body = value.body;
+                this.record({ kind: 'completion', controlId: request.id, token, body: value.body });
+                if (!ok) this.cancel('body-result', request.id);
+            } else { invalid = true; this.cancel('protocol', request.id); }
+        });
+        worker.once('error', () => { invalid = true; this.cancel('worker-error', request.id); });
+        try {
+            result.exitCode = await new Promise<number>(resolve => worker.once('exit', resolve));
+            await drained;
+            if (invalid || !ready || !completed || !ok || result.exitCode !== 0 || !result.stdoutEnded || !result.stderrEnded) throw isolationFailure();
+            return result;
+        } finally {
+            clearTimeout(timer); this.inflight.delete(cancel);
+            this.joined.push(result);
+            if (request.id.startsWith('control:')) {
+                // Only the existing safe runner records cross this boundary.
+                // Arbitrary worker errors/output never become a diagnostic lane.
+                for (const line of result.stdout.split('\n').filter(Boolean)) {
+                    try {
+                        const record = JSON.parse(line);
+                        if (!(record.gate === 'v2-governed-summary-commands'
+                            || ['candidate', 'measured-artifacts', 'compiled-inputs'].includes(record.observation))) throw isolationFailure();
+                        process.stdout.write(JSON.stringify({ ...record, controlId: request.id, controlToken: token }) + '\n');
+                    } catch { invalid = true; }
+                }
+                for (const line of result.stderr.split('\n').filter(Boolean)) {
+                    if (['GOVERNED_SUMMARY_COMMANDS_GATE_FAILED', 'FOUNDATION_OUTPUT_BUSY',
+                        'VERIFIED_READ_OUTPUT_CLOSURE_UNCONFIRMED'].includes(line)) process.stderr.write(line + '\n');
+                    else invalid = true;
+                }
+                process.stdout.write(JSON.stringify({ observation: 'control-lifecycle', controlId: request.id, token,
+                    completed, ok, exitCode: result.exitCode, stdoutEnded: result.stdoutEnded, stderrEnded: result.stderrEnded,
+                    nativeClosure: 'asserted-only-by-original-body', disposition: invalid ? 'uncertain' : 'joined' }) + '\n');
+            }
+            if (invalid) throw isolationFailure();
+        }
+    }
+}
+
+async function until(predicate: () => boolean, timeout = 10000) {
+    const limit = Date.now() + timeout;
+    while (!predicate()) {
+        if (Date.now() >= limit) throw isolationFailure();
+        await new Promise(resolve => setTimeout(resolve, 5));
+    }
+}
+
+async function probe(id: string, state: SharedArrayBuffer | undefined, diagnostics: string[]) {
+    const words = state && new Int32Array(state);
+    if (id === 'probe:assertion') assert.fail('PRIVATE_DIAGNOSTIC_CANARY');
+    else if (id === 'probe:other-failure') throw new Error('PRIVATE_DIAGNOSTIC_CANARY');
+    else if (id === 'probe:abort-after-body') realmAbort.abort();
+    else if (id === 'probe:mutate') {
+        const read = fs.readFileSync, originalSpawn = childProcess.spawn, write = process.stdout.write,
+            error = process.stderr.write, platform = Object.getOwnPropertyDescriptor(process, 'platform')!;
+        try {
+            fs.readFileSync = (() => Buffer.from('isolated')) as unknown as typeof read;
+            childProcess.spawn = (() => { throw isolationFailure(); }) as typeof spawn;
+            process.stdout.write = (() => true) as typeof write; process.stderr.write = (() => true) as typeof error;
+            Object.defineProperty(process, 'platform', { ...platform, value: 'isolated' }); syncBuiltinESMExports();
+            assert.equal(readFileSync(ownerUrl).toString(), 'isolated'); assert.throws(() => spawn('unused'), /CONTROL_ISOLATION_FAILED/);
+            assert.equal(process.platform, 'isolated');
+            Atomics.store(words!, 0, 1); await until(() => Atomics.load(words!, 1) === 1);
+        } finally {
+            fs.readFileSync = read; childProcess.spawn = originalSpawn; process.stdout.write = write; process.stderr.write = error;
+            Object.defineProperty(process, 'platform', platform); syncBuiltinESMExports();
+        }
+    } else if (id === 'probe:companion') {
+        await until(() => Atomics.load(words!, 0) === 1);
+        assert.equal(createHash('sha256').update(readFileSync(ownerUrl)).digest('hex'), ownerHash);
+        assert.equal(readFileSync, fs.readFileSync); assert.equal(spawn, childProcess.spawn);
+        assert.notEqual(process.platform, 'isolated');
+        process.stdout.write('CONTROL_GUARD_DRAIN\n'); process.stderr.write('CONTROL_GUARD_DRAIN\n');
+        Atomics.store(words!, 1, 1);
+    } else if (id === 'probe:bounded') {
+        const active = Atomics.add(words!, 0, 1) + 1;
+        Atomics.store(words!, 1, Math.max(Atomics.load(words!, 1), active));
+        assert.ok(active <= 2); await until(() => Atomics.load(words!, 1) === 2);
+        await new Promise(resolve => setTimeout(resolve, 20));
+        Atomics.sub(words!, 0, 1);
+        // Completion is intentionally followed by a scheduled write below:
+        // the parent must wait for normal exit and both drained streams.
+        setTimeout(() => { process.stdout.write('CONTROL_GUARD_DRAIN\n'); process.stderr.write('CONTROL_GUARD_DRAIN\n'); }, 20);
+    } else if (id === 'probe:wait-abort') {
+        Atomics.store(words!, 0, 1);
+        try { await until(() => realmAbort.signal.aborted); }
+        finally { await new Promise(resolve => setTimeout(resolve, 20)); Atomics.store(words!, 2, 1); }
+    } else if (id === 'probe:fail') {
+        await until(() => Atomics.load(words!, 0) === 1); throw isolationFailure();
+    } else if (id === 'probe:interrupt-registry') {
+        const a = new SharedArrayBuffer(16), b = new SharedArrayBuffer(16);
+        const first = new ControlPool(), second = new ControlPool();
+        const listeners = [process.listenerCount('SIGINT'), process.listenerCount('SIGTERM')];
+        const uninstall = installInterruptRouting();
+        const settled = Promise.allSettled([first.run('probe:wait-abort', undefined, a), second.run('probe:wait-abort', undefined, b)]);
+        let admitted = false;
+        try {
+            await until(() => Atomics.load(new Int32Array(a), 0) === 1 && Atomics.load(new Int32Array(b), 0) === 1);
+            assert.equal(activePools.size, 2); admitted = true;
+        } catch { /* Event routing below must still join admitted work. */ }
+        finally { process.emit('SIGINT'); }
+        const outcomes = await settled;
+        uninstall();
+        assert.ok(admitted); assert.ok(outcomes.every(value => value.status === 'rejected'));
+        assert.equal(activePools.size, 0); assert.equal(first.active + second.active, 0);
+        assert.equal(Atomics.load(new Int32Array(a), 2), 1); assert.equal(Atomics.load(new Int32Array(b), 2), 1);
+        await assert.rejects(new ControlPool().run('probe:never', undefined, a), /CONTROL_ISOLATION_FAILED/);
+        assert.equal(Atomics.load(new Int32Array(a), 3), 0);
+        assert.deepEqual([process.listenerCount('SIGINT'), process.listenerCount('SIGTERM')], listeners);
+        diagnostics.push('handler-event-routing-only; two pools joined; no native work');
+    } else if (id === 'probe:native-abort') {
+        const f = fixture();
+        f.put('scripts/check-runtime.js', record + "log('runtime');setTimeout(()=>process.exit(0),30000);"); f.commit();
+        f.observeAdmission(() => Atomics.add(words!, 0, 1));
+        const result = await f.run({ timeoutMs: 60000 });
+        refused(f, result); assert.ok(realmAbort.signal.aborted);
+        // CreateProcess admission precedes execution of the child's first JS
+        // instruction. Cancellation may therefore leave no runtime trace.
+        assert.ok(f.trace().length <= 1 && f.trace().every(value => value === 'runtime')); assert.equal(f.native.length, 1);
+        const actual = f.native[0], receipt = f.events.find(event => event.stage);
+        assert.ok(actual.started && actual.direct && actual.closure && actual.closed);
+        assert.ok(Number.isInteger(actual.direct.nativeCode)); assert.equal(actual.closure.activeProcesses, 0);
+        assert.equal(receipt.cleanup, 'complete'); assert.equal(receipt.closure, 'windows-job-active-zero');
+        assert.equal(receipt.code, 130); assert.equal(existsSync(join(f.root, '.fresh-start-foundation.lock')), false);
+        diagnostics.push(JSON.stringify({ observation: 'native-cancellation-guard', assertionsComplete: true,
+            root: f.root, direct: actual.direct, closure: actual.closure, bridgeClosed: actual.closed, receipt,
+            trace: f.trace(), laterStages: 0, qualification: false, lockPresent: false }));
+    } else if (id === 'probe:never') { Atomics.store(words!, 3, 1); }
+    else if (id === 'probe:exit') { process.exit(0); }
+    else if (!['probe:missing', 'probe:malformed', 'probe:duplicate', 'probe:wrong-id', 'probe:wrong-token', 'probe:premature',
+        'probe:malformed-body', 'probe:extra-body-field', 'probe:bad-native'].includes(id)) throw isolationFailure();
+}
+
+async function runRealm() {
+    const data = workerData;
+    assert.ok(parentPort && data?.owner === 'governed-control-v1' && data.hash === ownerHash && typeof data.token === 'string');
+    const port = parentPort!;
+    const envelope = (kind: string) => ({ kind, id: data.id, token: data.token, hash: ownerHash });
+    const diagnostics: string[] = [];
+    const completed = (body: BodyDiagnostic) => ({ ...envelope('complete'), ok: body.outcome === 'completed', diagnostics, body });
+    let start!: () => void;
+    const started = new Promise<void>(resolve => { start = resolve; });
+    port.on('message', value => {
+        if (value?.token !== data.token) { realmAbort.abort(); start(); }
+        else if (value.kind === 'abort') { realmAbort.abort(); start(); }
+        else if (value.kind === 'start') start();
+        else { realmAbort.abort(); start(); }
+    });
+    if (data.id === 'probe:premature') port.postMessage(completed(bodyDiagnostic('completed', false)));
+    port.postMessage(envelope('ready')); await started;
+    let outcome: BodyDiagnostic['outcome'] = 'aborted-before-body', abortBeforeCatch = false;
+    try {
+        if (realmAbort.signal.aborted) throw isolationFailure();
+        outcome = 'other-failed';
+        if (typeof data.id === 'string' && data.id.startsWith('probe:')) await probe(data.id, data.state, diagnostics);
+        else {
+            const index = controls.findIndex((_value, index) => data.id === 'control:' + index);
+            assert.ok(index >= 0); await controls[index].body({ diagnostic(message) { diagnostics.push(message); } });
+        }
+        outcome = realmAbort.signal.aborted ? 'completed-after-abort' : 'completed';
+    } catch (error) {
+        abortBeforeCatch = realmAbort.signal.aborted;
+        if (outcome !== 'aborted-before-body') outcome = error instanceof AssertionError ? 'assertion-failed' : 'other-failed';
+        realmAbort.abort();
+    }
+    finally {
+        // Real gate promises always settle through their unchanged runner. A
+        // body exception is never permission to abandon an in-flight Job.
+        await Promise.allSettled([...pendingGates]);
+        const result = completed(bodyDiagnostic(outcome, abortBeforeCatch));
+        if (data.id === 'probe:malformed') port.postMessage({ ...result, ok: 'true' });
+        else if (data.id === 'probe:malformed-body') port.postMessage({ ...result, body: { ...result.body, phase: 'PRIVATE_DIAGNOSTIC_CANARY' } });
+        else if (data.id === 'probe:extra-body-field') port.postMessage({ ...result, body: { ...result.body, message: 'PRIVATE_DIAGNOSTIC_CANARY' } });
+        else if (data.id === 'probe:bad-native') port.postMessage({ ...result, body: { ...result.body, native: [{ ordinal: 1, ready: true,
+            started: true, direct: true, closure: false, closed: false, closeObserved: false, closeCode: null,
+            directCode: 'PRIVATE_DIAGNOSTIC_CANARY', closureCode: null, activeProcesses: null }] } });
+        else if (data.id === 'probe:wrong-id') port.postMessage({ ...result, id: 'control:other' });
+        else if (data.id === 'probe:wrong-token') port.postMessage({ ...result, token: 'other' });
+        else if (data.id !== 'probe:missing') { port.postMessage(result); if (data.id === 'probe:duplicate') port.postMessage(result); }
+        port.close();
+    }
+}
 
 const names = ['v2-governed-note-contracts', 'v2-governed-note-redaction', 'v2-governed-note-authority',
     'v2-governed-note-provenance', 'v2-governed-note-codec', 'v2-governed-note-command', 'v2-governed-note-replay',
@@ -49,8 +473,13 @@ function physicalSnapshot(root: string): Map<string, string> {
     visit(''); return result;
 }
 function fixtureGit(root: string, ...args: string[]) {
+    phase = 'fixture-git';
+    const operation = args.includes('commit') ? 'commit' : gitOperations.find(value => value === args[0]) ?? 'other';
+    gitDiagnostic = { operation, status: null, category: 'launch' };
     const result = spawnSync('git', ['--git-dir', join(root, '.git'), '--work-tree', root, '-C', root, ...args],
         { encoding: 'utf8', windowsHide: true, timeout: 10000 });
+    gitDiagnostic = { operation, status: result.status, category: result.error
+        ? (result.error as NodeJS.ErrnoException).code === 'ETIMEDOUT' ? 'timeout' : result.status === null ? 'launch' : 'other' : 'none' };
     assert.equal(result.status, 0, result.stderr); return result.stdout;
 }
 const record = "import{appendFileSync}from'node:fs';const log=x=>appendFileSync('trace',x+'\\n');";
@@ -60,6 +489,7 @@ function seedRoot() {
         assert.deepEqual(physicalSnapshot(staticSeed.root), staticSeed.files);
         return staticSeed;
     }
+    phase = 'fixture-write';
     const root = realpathSync.native(mkdtempSync(join(tmpdir(), 'governed-gate-seed-')));
     const put = (path: string, value: string) => { mkdirSync(dirname(join(root, path)), { recursive: true }); writeFileSync(join(root, path), value); };
     const git = (...args: string[]) => fixtureGit(root, ...args);
@@ -86,8 +516,10 @@ const body={schemaVersion:1,deploymentId:'synthetic-owned',runtime:{nodeVersion:
     staticSeed = { root, files: physicalSnapshot(root) }; return staticSeed;
 }
 function fixture() {
+    phase = 'fixture-write';
     const root = realpathSync.native(mkdtempSync(join(tmpdir(), 'governed-gate-')));
     const source = seedRoot(), seed = source.root;
+    phase = 'fixture-copy';
     for (const path of source.files.keys()) {
         const target = join(root, path); mkdirSync(dirname(target), { recursive: true });
         fs.copyFileSync(join(seed, path), target, fs.constants.COPYFILE_EXCL);
@@ -95,7 +527,7 @@ function fixture() {
         assert.equal(after.nlink, 1n); assert.notEqual(`${before.dev}:${before.ino}`, `${after.dev}:${after.ino}`);
     }
     assert.deepEqual(physicalSnapshot(root), source.files);
-    const put = (path: string, value: string) => { mkdirSync(dirname(join(root, path)), { recursive: true }); writeFileSync(join(root, path), value); };
+    const put = (path: string, value: string) => { phase = 'fixture-write'; mkdirSync(dirname(join(root, path)), { recursive: true }); writeFileSync(join(root, path), value); };
     const git = (...args: string[]) => fixtureGit(root, ...args);
     const commit = () => { git('add', '--', 'package.json', '.gitignore', 'src', 'tests', 'scripts', 'docs', 'memory', 'tsconfig.test.json'); git('-c', 'user.name=Owned Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '--quiet', '--allow-empty', '-m', 'owned fixture'); };
     for (const name of names) put(`dist-test/tests/${name}.test.js`, record + `import{test}from'node:test';test('${name}',()=>log('${name}'));`);
@@ -105,14 +537,17 @@ function fixture() {
     const trace = () => existsSync(join(root, 'trace')) ? readFileSync(join(root, 'trace'), 'utf8').trim().split('\n') : [];
     let outputFault: ((actual: string) => string) | undefined, protocolFault = '', faultStage = 5;
     let onEvent: ((event: any) => void) | undefined;
+    let onAdmission: (() => void) | undefined;
     let released = false, publicationAfterRelease = false;
     let lockIdentity: { dev: bigint; ino: bigint } | undefined, releaseAttempt: any;
     async function run(options: { timeoutMs?: number; signal?: AbortSignal; unlinkFault?: boolean; closeFault?: boolean } = {}) {
+        phase = 'gate';
         const originalSpawn = childProcess.spawn, write = process.stdout.write, errorWrite = process.stderr.write, unlink = fs.unlinkSync, close = fs.closeSync;
         let errorsBeforeRelease = '';
         process.stderr.write = function (chunk: any, ...args: any[]) { errorsBeforeRelease += String(chunk); return Reflect.apply(errorWrite, process.stderr, [chunk, ...args]); } as typeof errorWrite;
         const controller = new AbortController(), cancel = () => controller.abort();
         options.signal?.addEventListener('abort', cancel, { once: true }); if (options.signal?.aborted) cancel();
+        realmAbort.signal.addEventListener('abort', cancel, { once: true }); if (realmAbort.signal.aborted) cancel();
         const watchdog = setTimeout(cancel, 180000);
         let helpers = 0, ownedDescriptor: number | undefined;
         const open = fs.openSync;
@@ -128,13 +563,13 @@ function fixture() {
         childProcess.spawn = ((...args: Parameters<typeof originalSpawn>) => {
             const child = originalSpawn(...args);
             if (args[2]?.cwd !== root || !args[1]?.some(arg => arg.endsWith('v2-verified-read-job.ps1'))) return child;
-            const index = ++helpers, proof: any = { index, closed: false }; native.push(proof);
+            const index = ++helpers, proof: any = { index, closed: false }; native.push(proof); observedHelpers.push(proof);
             const out = child.stdout!, register = out.on; let observed = '', buffered = '', captured = '';
             register.call(out, 'data', (chunk: Buffer) => {
                 observed += chunk.toString(); let end;
-                while ((end = observed.indexOf('\n')) >= 0) { const line = observed.slice(0, end); observed = observed.slice(end + 1); const value = JSON.parse(line); if (value.kind === 'direct-exit') proof.direct = value; if (value.kind === 'closure') proof.closure = value; }
+                while ((end = observed.indexOf('\n')) >= 0) { const line = observed.slice(0, end); observed = observed.slice(end + 1); const value = JSON.parse(line); if (value.kind === 'ready') proof.ready = true; if (value.kind === 'started') { proof.started = true; onAdmission?.(); } if (value.kind === 'direct-exit') proof.direct = value; if (value.kind === 'closure') proof.closure = value; }
             });
-            child.once('close', (code, signal) => { proof.closed = code === 0 && signal === null; });
+            child.once('close', (code, signal) => { proof.closeObserved = true; proof.closeCode = code; proof.closed = code === 0 && signal === null; });
             if (index === faultStage && (outputFault || protocolFault)) {
                 out.on = ((event: any, listener: any) => {
                     if (event !== 'data') return Reflect.apply(register, out, [event, listener]);
@@ -158,14 +593,20 @@ function fixture() {
             return child;
         }) as typeof originalSpawn;
         syncBuiltinESMExports();
-        try { const value = await (await gate())({ root, timeoutMs: options.timeoutMs, signal: controller.signal }); return { ok: true, value }; }
-        catch (error) { assert.equal((error as Error).message, failure); return { ok: false, value: undefined }; }
-        finally { clearTimeout(watchdog); options.signal?.removeEventListener('abort', cancel); process.stdout.write = write; process.stderr.write = errorWrite; childProcess.spawn = originalSpawn; fs.unlinkSync = unlink; fs.closeSync = close; fs.openSync = open; syncBuiltinESMExports(); }
+        let execution: Promise<void> | undefined;
+        try {
+            execution = (await gate())({ root, timeoutMs: options.timeoutMs, signal: controller.signal });
+            pendingGates.add(execution);
+            const value = await execution; phase = 'body'; return { ok: true, value };
+        }
+        catch (error) { assert.equal((error as Error).message, failure); phase = 'body'; return { ok: false, value: undefined }; }
+        finally { if (execution) pendingGates.delete(execution); clearTimeout(watchdog); options.signal?.removeEventListener('abort', cancel); realmAbort.signal.removeEventListener('abort', cancel); process.stdout.write = write; process.stderr.write = errorWrite; childProcess.spawn = originalSpawn; fs.unlinkSync = unlink; fs.closeSync = close; fs.openSync = open; syncBuiltinESMExports(); }
     }
     return { root, seed, put, git, commit, events, native, trace, run,
         faultOutput(value: (actual: string) => string) { outputFault = value; },
         faultProtocol(value: string) { protocolFault = value; faultStage = 1; },
         observe(value: (event: any) => void) { onEvent = value; },
+        observeAdmission(value: () => void) { onAdmission = value; },
         publishedAfterRelease: () => publicationAfterRelease, releaseObservation: () => ({ lockIdentity, releaseAttempt }) };
 }
 function refused(f: ReturnType<typeof fixture>, result: { ok: boolean }) {
@@ -382,3 +823,22 @@ test('runtime executable raw identity change refuses before typecheck', { timeou
     try { refused(f, await f.run()); assert.deepEqual(f.trace(), ['runtime']); }
     finally { (fs as any).readFileSync = original; syncBuiltinESMExports(); }
 });
+
+if (isMainThread) {
+    const uninstall = installInterruptRouting();
+    after(() => { uninstall(); assert.equal(activePools.size, 0); });
+    registerIsolationGuards();
+    describe('isolated governed controls', { concurrency: 2 }, () => {
+        const pool = new ControlPool();
+        after(() => { assert.equal(pool.active, 0); });
+        for (const [index, control] of controls.entries()) {
+            nodeTest(control.name, async t => {
+                const result = await pool.run('control:' + index, control.timeout);
+                for (const diagnostic of result.diagnostics) t.diagnostic(diagnostic);
+                assert.equal(result.exitCode, 0); assert.ok(result.stdoutEnded && result.stderrEnded);
+            });
+        }
+    });
+} else {
+    await runRealm();
+}
