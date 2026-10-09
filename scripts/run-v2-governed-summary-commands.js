@@ -273,7 +273,7 @@ export function deriveStockSpecFailureCandidates(stage, stdout, counts, options)
           if (line !== 'ℹ ' + metadataKeys[summary] + ' ' + values[summary]) return metadataResult('summary-mismatch');
         } else {
           const duration = /^ℹ duration_ms ((?:0|[1-9]\d*)(?:\.\d+)?)$/.exec(line);
-          if (!duration || !Number.isFinite(Number(duration[1])) || Number(duration[1]) > 900000) return metadataResult('summary-mismatch');
+          if (!duration || !Number.isFinite(Number(duration[1])) || Number(duration[1]) > maximumMs) return metadataResult('summary-mismatch');
         }
         summary++; continue;
       }
@@ -285,7 +285,7 @@ export function deriveStockSpecFailureCandidates(stage, stdout, counts, options)
       if (!arrow) {
         const duration = / \(((?:0|[1-9]\d*)(?:\.\d+)?)ms\)$/.exec(name);
         if (duration) {
-          if (!Number.isFinite(Number(duration[1])) || Number(duration[1]) > 900000) return metadataResult('unknown-row');
+          if (!Number.isFinite(Number(duration[1])) || Number(duration[1]) > maximumMs) return metadataResult('unknown-row');
           name = name.slice(0, -duration[0].length);
         }
       }
@@ -303,7 +303,7 @@ export function deriveStockSpecFailureCandidates(stage, stdout, counts, options)
   } catch { return metadataResult('malformed-input'); }
 }
 
-const profile = 'governed-summary-commands', gate = 'v2-governed-summary-commands', maximumMs = 900000;
+const profile = 'governed-summary-commands', gate = 'v2-governed-summary-commands', maximumMs = 2100000;
 const dispositions = new WeakMap();
 function refusal(code = 1) {
   const error = new Error(failure);

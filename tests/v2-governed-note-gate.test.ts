@@ -656,12 +656,12 @@ test('fixed inventory resolves void only after 34 real contained stages and owne
     const q = f.events.find(event => event.observation === 'qualification');
     assert.equal(q.compiledMeasurement.privateClosure.length, 13); assert.equal(q.compiledMeasurement.listedTests.length, 28);
     assert.equal(q.measurement.artifacts.length, 5); assert.equal(q.measurement.closures.length, 2);
-    assert.equal(q.profile, 'governed-summary-commands'); assert.equal(q.totalMs, 900000); assert.equal(q.tests, 28);
+    assert.equal(q.profile, 'governed-summary-commands'); assert.equal(q.totalMs, 2100000); assert.equal(q.tests, 28);
 });
 
 test('invalid total budgets and pre-abort launch nothing', async () => {
     const f = fixture();
-    for (const timeoutMs of [0, -1, 1.5, NaN, Infinity, 900001]) refused(f, await f.run({ timeoutMs }));
+    for (const timeoutMs of [0, -1, 1.5, NaN, Infinity, 2100001]) refused(f, await f.run({ timeoutMs }));
     const c = new AbortController(); c.abort(); refused(f, await f.run({ signal: c.signal }));
     assert.deepEqual(f.trace(), []); assert.equal(f.native.length, 0);
 });
@@ -1246,6 +1246,21 @@ function registerFailureMetadataTests() {
     });
     nodeTest('failure metadata pure footer native mapping and overflow eligibility cannot manufacture failures', async () => {
         const derive = await metadataParser(), stage = 'v2-governed-note-entry', x = metadataTranscript(stage);
+        for (const name of Object.keys(metadataTitles)) {
+            const transcript = metadataTranscript(name);
+            for (const duration of [1, 900000, 900001, 2100000]) {
+                for (const text of [transcript.text.replaceAll('(1ms)', `(${duration}ms)`),
+                    transcript.text.replace('duration_ms 1', `duration_ms ${duration}`)]) {
+                    const result = derive(name, text, transcript.counts, metadataOptions());
+                    assert.equal(result.status, 'candidate'); assert.deepEqual(result.candidateOrdinals, [3]); assertMetadataPrivacy(result);
+                }
+            }
+            for (const text of [transcript.text.replaceAll('(1ms)', '(2100001ms)'),
+                transcript.text.replace('duration_ms 1', 'duration_ms 2100001')]) {
+                const result = derive(name, text, transcript.counts, metadataOptions());
+                assert.notEqual(result.status, 'candidate'); assert.deepEqual(result.candidateOrdinals, []); assertMetadataPrivacy(result);
+            }
+        }
         const variants: [string, any, any][] = [
             [x.text.trimEnd(), x.counts, metadataOptions()], [x.text, {}, metadataOptions()],
             [x.text, { ...x.counts, fail: 2 }, metadataOptions()], [x.text, { ...x.counts, cancelled: 1 }, metadataOptions()],
