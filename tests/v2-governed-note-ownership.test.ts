@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import test from "node:test";
+import test, { describe } from "node:test";
 import { createHash, randomUUID } from "node:crypto";
 import { cpSync, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -67,6 +67,21 @@ function harness(change: Partial<GovernedNoteRunOptionsV1> = {}) {
   const run=createGovernedNoteRunV1(options);
   return {run,options,owners,parentDirectory,get initialized(){return initialized;},get directory(){return directory;},get genesis(){assert.ok(genesis);return genesis;},async open(){const fixture=await allocate(run,{parentDirectory});const permit=await run.open(fixture);return {fixture,permit,owner:owners.at(-1)!};}};
 }
+class ManualScheduler implements ExecutorScheduler {
+  timers=new Map<object,{callback:()=>void;delay:number}>();created:number[]=[];
+  setTimeout(callback:()=>void,delay:number){const key={};this.created.push(delay);this.timers.set(key,{callback,delay});return key;}
+  clearTimeout(key:object){this.timers.delete(key);}
+  fire(delay:number){const pair=[...this.timers].find(([,timer])=>timer.delay===delay);assert.ok(pair);this.timers.delete(pair[0]);pair[1].callback();}
+}
+class ControlledWorker extends EventEmitter implements WorkerLike {
+  posts:WorkerRequest[]=[];terminations=0;
+  constructor(private readonly construction:GovernedNoteOwnerConstructionV1,private readonly genesis:FreshStartGenesis){super();}
+  postMessage(value:unknown){const request=value as WorkerRequest;this.posts.push(request);if(request.type==="open")queueMicrotask(()=>this.emit("message",{id:request.id,ok:true,data:{...encodeWorkerBindingAssertion(this.construction.context),executorId:randomUUID(),freshStart:{...request.freshStart,eventPosition:this.genesis.semanticPosition,eventHash:this.genesis.terminalHash}}}));}
+  async terminate(){this.terminations++;return 0;}
+}
+
+describe("governed note ownership", { concurrency: 1 }, () => {
+describe("independent ownership controls", { concurrency: 2 }, () => {
 
 test("governed identity worker selection refuses missing or mismatched current artifacts",t=>{
   const original=join(process.cwd(),"dist"),retainedInputs:string[]=[];
@@ -171,6 +186,8 @@ test("symlink parents, alias spelling and setup failure never mint an attachable
 test("returned escaped routes and replacement across async initialization are refused",{timeout:60000},async()=>{
   for(const fault of ["escape","replace"]) {const h=harness(),run=createGovernedNoteRunV1({...h.options,freshInitializer:{async initialize(i){const result=await h.options.freshInitializer.initialize(i);if(fault==="replace"){renameSync(i.freshDirectory,i.freshDirectory+".original");mkdirSync(i.freshDirectory);return result;}return {...result,context:{...result.context,binding:{...result.context.binding,storeRoute:{...result.context.binding.storeRoute,eventsPath:join(h.parentDirectory,"events.sqlite")}}}};}}});await assert.rejects(allocate(run,{parentDirectory:h.parentDirectory}),safe("GOVERNED_NOTE_UNAVAILABLE"));assert.equal(h.owners.length,0);}
 });
+});
+
 
 test("exclusive mkdir collision preserves existing contents without initializing or retrying",async t=>{
   const h=harness(),mkdir=fs.mkdirSync;let collisions=0,path="";
@@ -178,6 +195,8 @@ test("exclusive mkdir collision preserves existing contents without initializing
   syncBuiltinESMExports();
   try{await assert.rejects(allocate(h.run,{parentDirectory:h.parentDirectory}),safe("GOVERNED_NOTE_UNAVAILABLE"));assert.equal(collisions,1);assert.equal(h.initialized,0);assert.deepEqual(readdirSync(path),["sentinel"]);}finally{t.mock.restoreAll();syncBuiltinESMExports();}
 });
+
+describe("independent admission controls", { concurrency: 2 }, () => {
 test("invalid inputs and cross-run permits post nothing and do not consume admission",{timeout:20000},async()=>{
   const h=harness(),{permit,owner}=await h.open(),other=harness(),p=prepared();await assert.rejects(other.run.create(permit,p),safe("GOVERNED_NOTE_INPUT_INVALID"));
   await assert.rejects(h.run.create(permit,{...p,command:{...p.command,commandId:"invalid"}}),safe("GOVERNED_NOTE_INPUT_INVALID"));await assert.rejects(h.run.recover(permit,{...recovery(p),authorization:{} as never}),safe("GOVERNED_NOTE_INPUT_INVALID"));assert.equal(owner.creates,0);assert.equal(owner.recovers,0);assert.equal((await h.run.create(permit,p)).replay,false);await h.run.close(permit);
@@ -185,18 +204,6 @@ test("invalid inputs and cross-run permits post nothing and do not consume admis
 test("malformed create scope, ID and envelope disqualify the owner",{timeout:60000},async()=>{
   for(const fault of ["scope","ids","extra"]){const h=harness(),{permit,owner}=await h.open(),p=prepared();owner.createAction=async()=>{const value=receipt(owner.construction,p);if(fault==="scope")value.response.scope={...value.response.scope,sessionId:randomUUID() as never};if(fault==="ids")value.response.commandId=randomUUID();if(fault==="extra")(value.response as unknown as Record<string,unknown>).extra=true;return value;};await assert.rejects(h.run.create(permit,p),safe("GOVERNED_NOTE_OWNERSHIP_UNCERTAIN",ids(p)));await assert.rejects(h.run.reopen(permit),safe("GOVERNED_NOTE_UNAVAILABLE"));}
 });
-class ManualScheduler implements ExecutorScheduler {
-  timers=new Map<object,{callback:()=>void;delay:number}>();created:number[]=[];
-  setTimeout(callback:()=>void,delay:number){const key={};this.created.push(delay);this.timers.set(key,{callback,delay});return key;}
-  clearTimeout(key:object){this.timers.delete(key);}
-  fire(delay:number){const pair=[...this.timers].find(([,timer])=>timer.delay===delay);assert.ok(pair);this.timers.delete(pair[0]);pair[1].callback();}
-}
-class ControlledWorker extends EventEmitter implements WorkerLike {
-  posts:WorkerRequest[]=[];terminations=0;
-  constructor(private readonly construction:GovernedNoteOwnerConstructionV1,private readonly genesis:FreshStartGenesis){super();}
-  postMessage(value:unknown){const request=value as WorkerRequest;this.posts.push(request);if(request.type==="open")queueMicrotask(()=>this.emit("message",{id:request.id,ok:true,data:{...encodeWorkerBindingAssertion(this.construction.context),executorId:randomUUID(),freshStart:{...request.freshStart,eventPosition:this.genesis.semanticPosition,eventHash:this.genesis.terminalHash}}}));}
-  async terminate(){this.terminations++;return 0;}
-}
 test("R and C integer endpoints use injected scheduler observations without native waiting",{timeout:60000},async()=>{
   for(const endpoint of [1,2147483647])for(const operation of ["create","recover","close"]){
     const h=harness(),scheduler=new ManualScheduler();let executor!:ProjectStoreExecutor,worker!:ControlledWorker,constructions=0;
@@ -208,8 +215,11 @@ test("R and C integer endpoints use injected scheduler observations without nati
     await assert.rejects(run.reopen(permit),safe("GOVERNED_NOTE_UNAVAILABLE"));assert.equal(constructions,1);assert.equal(worker.terminations,1);assert.equal(worker.posts.filter(r=>r.type==="governed-note-create"||r.type==="governed-note-recover").length,operation==="close"?0:1);assert.ok(scheduler.created.every(delay=>delay===endpoint));assert.ok(existsSync(h.directory));
   }
 });
+});
+
 test("replacement during the first native spelling observation refuses before initializer",async t=>{
   let calls=0,swaps=0;const h=harness({freshInitializer:{async initialize(){calls++;throw new Error("should not initialize replacement");}}}),native=fs.realpathSync.native;
   t.mock.method(fs.realpathSync,"native",((path:string)=>{if(swaps===0&&path.startsWith(h.parentDirectory+sep)&&/^[0-9a-f-]{36}$/.test(path.slice(h.parentDirectory.length+1))){swaps++;renameSync(path,path+".original");mkdirSync(path);}return native(path);}) as typeof native);
   try{await assert.rejects(allocate(h.run,{parentDirectory:h.parentDirectory}),safe("GOVERNED_NOTE_UNAVAILABLE"));assert.equal(swaps,1);assert.equal(calls,0);}finally{t.mock.restoreAll();}
+});
 });
