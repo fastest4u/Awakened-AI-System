@@ -61,6 +61,13 @@ function identity(value: Record<string, unknown>): FreshStartIdentity {
   return { projectId: uuid(value.projectId) as ProjectId, vaultId: uuid(value.vaultId) as VaultId, storeId: uuid(value.storeId) as StoreId };
 }
 
+/** Internal shared fresh-start validation policy; contracts consumes these without a runtime back-reference. */
+export {
+  invalid as invalidFreshStartInput, record as exactFreshStartRecord,
+  uuid as freshStartUuid, hash as freshStartHash,
+  timestamp as freshStartTimestamp, identity as freshStartIdentity,
+};
+
 const GENESIS_KEYS = ["projectId", "vaultId", "storeId", "initializationId", "releaseId", "semanticPosition", "terminalHash", "projectionChecksums", "preparationIntentDigest", "actorFingerprint", "createdAt"];
 const GENESIS_V2_KEYS = [...GENESIS_KEYS, "genesisVersion", "projectionSchemaVersion"];
 const ENVELOPE_KEYS = ["genesisVersion", "projectionSchemaVersion", "projectionChecksums"];

@@ -1,6 +1,10 @@
 import type { ProjectId, StoreId, VaultId } from "../identity/contracts.js";
 import type { ProjectionNameV2, ProjectionNameV3 } from "../projections/checksum.js";
-import { FreshStartError } from "./genesis-codec.js";
+import {
+  invalidFreshStartInput as invalid, exactFreshStartRecord as record,
+  freshStartUuid as uuid, freshStartHash as hash,
+  freshStartTimestamp as timestamp, freshStartIdentity as identity,
+} from "./genesis-codec.js";
 export { FreshStartError, decodeFreshStartGenesis, type FreshStartErrorCode } from "./genesis-codec.js";
 
 export type FreshStartMode = "prepared" | "active" | "read-only-recovery" | "disabled";
@@ -55,39 +59,7 @@ export type FreshStartAutomaticStop = Readonly<{
   reasonCode: Extract<FreshStartAuthorization, { kind: "automatic-stop" }>["reasonCode"];
 }>;
 
-const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
-const HASH = /^[0-9a-f]{64}$/u;
-const TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u;
 export const FRESH_START_MAX_GENERATION = 9_223_372_036_854_775_807n;
-
-function invalid(): never { throw new FreshStartError("FRESH_START_INPUT_INVALID"); }
-function record(value: unknown, keys: readonly string[]): Record<string, unknown> {
-  try {
-    if (typeof value !== "object" || value === null || Array.isArray(value)) invalid();
-    const prototype = Object.getPrototypeOf(value) as unknown;
-    if (prototype !== Object.prototype && prototype !== null) invalid();
-    const actual = Reflect.ownKeys(value);
-    if (actual.length !== keys.length || actual.some((key) => typeof key !== "string" || !keys.includes(key))) invalid();
-    const output: Record<string, unknown> = {};
-    for (const key of keys) {
-      const descriptor = Object.getOwnPropertyDescriptor(value, key);
-      if (!descriptor || !descriptor.enumerable || !("value" in descriptor)) invalid();
-      output[key] = descriptor.value;
-    }
-    return output;
-  } catch {
-    return invalid();
-  }
-}
-function uuid(value: unknown): string { if (typeof value !== "string" || !UUID.test(value)) invalid(); return value; }
-function hash(value: unknown): string { if (typeof value !== "string" || !HASH.test(value)) invalid(); return value; }
-function timestamp(value: unknown): string {
-  if (typeof value !== "string" || !TIMESTAMP.test(value) || !Number.isFinite(Date.parse(value)) || new Date(value).toISOString() !== value) invalid();
-  return value;
-}
-function identity(value: Record<string, unknown>): FreshStartIdentity {
-  return { projectId: uuid(value.projectId) as ProjectId, vaultId: uuid(value.vaultId) as VaultId, storeId: uuid(value.storeId) as StoreId };
-}
 
 const RELEASE_KEYS = ["projectId", "vaultId", "storeId", "profileVersion", "releaseId", "buildIdentityHash", "schemaIdentityHash", "configurationHash", "capabilityManifestHash", "recoveryPolicyHash", "evidenceDigest", "createdAt"];
 
