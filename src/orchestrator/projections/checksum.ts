@@ -14,6 +14,11 @@ export const PROJECTION_NAMES = Object.freeze([
   "retrievalFeedback",
 ] as const);
 
+export const PROJECTION_NAMES_V2 = PROJECTION_NAMES;
+export const PROJECTION_NAMES_V3 = Object.freeze([...PROJECTION_NAMES_V2, "governedNotes"] as const);
+export type ProjectionNameV2 = (typeof PROJECTION_NAMES_V2)[number];
+export type ProjectionNameV3 = (typeof PROJECTION_NAMES_V3)[number];
+
 export type ProjectionName = (typeof PROJECTION_NAMES)[number];
 export type CanonicalProjectionValue = null | boolean | number | string;
 export type CanonicalProjectionRow = Readonly<Record<string, CanonicalProjectionValue>>;
@@ -79,14 +84,14 @@ export function sha256Utf8(value: string): string {
 }
 
 export function projectionCoreChecksum(
-  name: ProjectionName,
+  name: ProjectionNameV3,
   schemaVersion: number,
   projectId: string,
   terminalEventPosition: bigint,
   rows: readonly CanonicalProjectionRow[],
 ): string {
   if (
-    !isProjectionName(name)
+    !(isProjectionName(name) || (schemaVersion === 3 && name === "governedNotes"))
     || !Number.isSafeInteger(schemaVersion)
     || schemaVersion < 1
     || schemaVersion > 2_147_483_647

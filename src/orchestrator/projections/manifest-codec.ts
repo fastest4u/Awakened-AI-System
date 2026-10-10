@@ -3,7 +3,7 @@ import {
   isProjectionWorkspaceIdentity,
   type ProjectBinding,
 } from "./contracts.js";
-import { PROJECTION_NAMES, type ProjectionName } from "./checksum.js";
+import { PROJECTION_NAMES, type ProjectionName, type ProjectionNameV3 } from "./checksum.js";
 
 const HASH = /^[0-9a-f]{64}$/u;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
@@ -102,6 +102,11 @@ export interface ProjectionManifestV2 {
   readonly coreChecksums: Readonly<Record<ProjectionName, string>>;
   readonly createdAt: string;
 }
+
+export type ProjectionManifestV3 = Readonly<Omit<ProjectionManifestV2, "schemaVersion" | "coreChecksums"> & {
+  schemaVersion: 3;
+  coreChecksums: Readonly<Record<ProjectionNameV3, string>>;
+}>;
 
 export type ProjectionManifest = ProjectionManifestV1 | ProjectionManifestV2;
 

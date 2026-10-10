@@ -1,3 +1,9 @@
+import { types } from "node:util";
+import { decodeGovernedNoteSourcePayloadV2 } from "../governed-notes/codec.js";
+import { validateGovernedNotePairAny, governedNoteWitnessHash, serialGovernedNoteEvent } from "../governed-notes/pair-validation.js";
+import { responseHash } from "../crypto/event-hash.js";
+import type { GovernedNotePrior } from "../governed-notes/pair-validation.js";
+import type { ProjectionSourceDisposition, ProjectionEventV3, GovernedNoteProjectionRowV1 } from "./contracts.js";
 import type { StoredEvent } from "../contracts/event.js";
 import { assertGovernedNoteMember, isGovernedNoteEvent } from "../governed-notes/pair-validation.js";
 import { assertRetainedStoredEvent } from "../privacy/retained-evidence-codec.js";
@@ -1307,4 +1313,68 @@ export function decodeProjectionEventV1(event: StoredEvent): ProjectionEventDeco
     if (error instanceof Error && error.message === "INTEGRITY_FAILURE") throw error;
     return integrity();
   }
+}
+
+/** Decode canonical bytes and revalidate retained pair correspondence before folding. */
+export function decodeProjectionSourceV3(value: ProjectionSourceDisposition): Readonly<{
+  event: ProjectionEventV3 | null;
+  governedNote: GovernedNoteProjectionRowV1 | null;
+  sourceEventPosition: bigint;
+  binding: ProjectBinding;
+}> {
+  try {
+    if (types.isProxy(value)) return integrity();
+    const disposition = exactRecord(value, ["event", "governedNotePrior"]);
+    if (types.isProxy(disposition.event)) return integrity();
+    const envelope = decodeStoredEventEnvelope(disposition.event);
+    const stored = envelope.record as unknown as StoredEvent;
+    const reserved = isGovernedNoteEvent(stored);
+    let row: GovernedNoteProjectionRowV1 | null = null;
+    let projected: ProjectionEventV3 | null = null;
+    if (reserved) {
+      const source = validateKnownPayload(envelope);
+      if (types.isProxy(disposition.governedNotePrior)) return integrity();
+      const prior = exactRecord(disposition.governedNotePrior, ["witness", "events", "result", "commandHash", "responseHash"]);
+      const events = strictArray(prior.events, 2).map(event => {
+        if (types.isProxy(event)) return integrity();
+        return decodeStoredEventEnvelope(event).record as unknown as StoredEvent;
+      });
+      const witness = validateGovernedNotePairAny(events, prior.result as GovernedNotePrior["result"]);
+      if (canonicalJson(witness) !== canonicalJson(prior.witness)
+        || prior.commandHash !== governedNoteWitnessHash(witness)
+        || prior.responseHash !== responseHash(prior.result)
+        || !events.some(event => canonicalJson(serialGovernedNoteEvent(event)) === canonicalJson(serialGovernedNoteEvent(stored)))) return integrity();
+      if (stored.eventType !== "GovernedNoteCreated") {
+        if (witness.witnessVersion === 2) {
+          const payload = decodeGovernedNoteSourcePayloadV2(source.payload);
+          const item = payload.item;
+          // Select the body-free historical fields explicitly; the source remains schema4.
+          projected = Object.freeze({
+            kind: "governed-memory-source", ...baseProjection(source), sourceEventSchemaVersion: 4,
+            item: decodeGovernedItem({itemId:item.itemId, normalizedKey:item.normalizedKey,
+              status:item.status, confidence:item.confidence, verificationMethod:item.verificationMethod,
+              validFrom:item.validFrom, validTo:item.validTo, summary:item.summary, contentHash:item.contentHash,
+              conflictGroupId:item.conflictGroupId, supersedingItemId:item.supersedingItemId, anchor:item.anchor}),
+            followUps: payload.followUps, artifacts: payload.artifacts, entities: payload.entities,
+            aliases: payload.aliases, edges: payload.edges,
+          });
+          row = Object.freeze({projectId:source.binding.projectId, itemId:witness.recordId,
+            recordKind:witness.recordKind, format:"markdown", body:item.content.body,
+            bodyContentHash:item.content.contentHash, sourceEventPosition:source.eventPosition.toString()});
+        } else {
+          const decoded = decodeProjectionEvent(stored);
+          if (decoded.kind !== "projected") return integrity();
+          projected = decoded.event;
+          row = Object.freeze({projectId:source.binding.projectId, itemId:witness.recordId,
+            recordKind:witness.recordKind, format:null, body:null, bodyContentHash:null,
+            sourceEventPosition:source.eventPosition.toString()});
+        }
+      }
+    } else {
+      if (disposition.governedNotePrior !== null) return integrity();
+      const decoded = decodeProjectionEvent(stored);
+      projected = decoded.kind === "projected" ? decoded.event : null;
+    }
+    return Object.freeze({event:projected, governedNote:row, sourceEventPosition:envelope.eventPosition, binding:envelope.binding});
+  } catch { return integrity(); }
 }

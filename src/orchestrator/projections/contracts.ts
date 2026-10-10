@@ -1,4 +1,9 @@
 import type { Confidence } from "../contracts/event.js";
+import type { StoredEvent } from "../contracts/event.js";
+import type { GovernedNotePrior } from "../governed-notes/pair-validation.js";
+import type { GovernedNoteKind } from "../governed-notes/contracts.js";
+import { types } from "node:util";
+import { assertMarkdownNoteBodyV1, governedNoteBodyHash } from "../governed-notes/body-content.js";
 import type {
   BranchScopeId,
   ProjectId,
@@ -431,4 +436,107 @@ export interface ProjectionFoldState {
   readonly entityEdges: readonly EntityEdgeProjection[];
   readonly lexicalChunks: readonly LexicalChunkProjection[];
   readonly retrievalFeedback: readonly RetrievalFeedbackProjection[];
+}
+
+export type ProjectionSourceDisposition = Readonly<{
+  event: StoredEvent;
+  governedNotePrior: GovernedNotePrior | null;
+}>;
+
+export type GovernedMemorySourceProjectionEventV3 = Readonly<
+  Omit<GovernedMemorySourceProjectionEvent, "sourceEventSchemaVersion"> & {
+    sourceEventSchemaVersion: 4;
+  }
+>;
+export type ProjectionEventV3 = ProjectionEvent | GovernedMemorySourceProjectionEventV3;
+export type GovernedNoteProjectionRowV1 = Readonly<{
+  projectId: string;
+  itemId: string;
+  recordKind: GovernedNoteKind;
+  format: "markdown" | null;
+  body: string | null;
+  bodyContentHash: string | null;
+  sourceEventPosition: string;
+}>;
+export type ProjectionFoldStateV3 = Readonly<Omit<ProjectionFoldState, "schemaVersion"> & {
+  schemaVersion: 3;
+  governedNotes: readonly GovernedNoteProjectionRowV1[];
+}>;
+
+const GOVERNED_ROW_KEYS = ["projectId", "itemId", "recordKind", "format", "body", "bodyContentHash", "sourceEventPosition"] as const;
+const GOVERNED_ITEM_KEYS = ["projectId", "itemId", "normalizedKey", "verificationMethod", "sourceEventPosition"] as const;
+const GOVERNED_POSITION_MAX = 9_223_372_036_854_775_807n;
+const GOVERNED_KINDS = ["session-log", "insight", "mistake", "adr"] as const;
+function governedProjectionIntegrity(): never { throw new Error("INTEGRITY_FAILURE"); }
+
+function ownedFields(value: unknown, keys: readonly string[], exact: boolean): Record<string, unknown> {
+  if (typeof value !== "object" || value === null || types.isProxy(value) || Array.isArray(value)) return governedProjectionIntegrity();
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) return governedProjectionIntegrity();
+  if (exact && Reflect.ownKeys(value).length !== keys.length) return governedProjectionIntegrity();
+  const result: Record<string, unknown> = {};
+  for (const key of keys) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (!descriptor?.enumerable || !("value" in descriptor)) return governedProjectionIntegrity();
+    result[key] = descriptor.value;
+  }
+  return result;
+}
+function ownedRows(value: unknown): readonly unknown[] {
+  if (!Array.isArray(value) || types.isProxy(value) || Object.getPrototypeOf(value) !== Array.prototype
+    || value.length > 100_000 || Reflect.ownKeys(value).length !== value.length + 1) return governedProjectionIntegrity();
+  return Array.from({ length: value.length }, (_, index) => {
+    const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+    if (!descriptor?.enumerable || !("value" in descriptor)) return governedProjectionIntegrity();
+    return descriptor.value as unknown;
+  });
+}
+
+/** Pure image-side validation: no event-store lookup or writer dependency. */
+export function validateGovernedNoteProjectionRows(
+  canonicalItems: readonly Pick<CanonicalItemProjection, "projectId" | "itemId" | "normalizedKey" | "verificationMethod" | "sourceEventPosition">[],
+  input: readonly GovernedNoteProjectionRowV1[],
+  terminalEventPosition: bigint | null,
+): readonly GovernedNoteProjectionRowV1[] {
+  try {
+    if (terminalEventPosition !== null && (typeof terminalEventPosition !== "bigint" || terminalEventPosition < 0n || terminalEventPosition > GOVERNED_POSITION_MAX)) return governedProjectionIntegrity();
+    const items = new Map<string, Record<string, unknown>>();
+    for (const value of ownedRows(canonicalItems)) {
+      const item = ownedFields(value, GOVERNED_ITEM_KEYS, false);
+      if (!isProjectionProjectStoreIdentity(item.projectId) || typeof item.itemId !== "string"
+        || typeof item.normalizedKey !== "string" || typeof item.verificationMethod !== "string"
+        || typeof item.sourceEventPosition !== "bigint" || item.sourceEventPosition < 1n
+        || item.sourceEventPosition > GOVERNED_POSITION_MAX || terminalEventPosition === null
+        || item.sourceEventPosition > terminalEventPosition) return governedProjectionIntegrity();
+      const key = `${item.projectId}\0${item.itemId}`;
+      if (items.has(key)) return governedProjectionIntegrity();
+      items.set(key, item);
+      const reserved = item.normalizedKey.startsWith("governed-note/");
+      const marker = item.verificationMethod;
+      if (reserved !== (marker === "governed-note-unverified-v1" || marker === "governed-note-unverified-v2")
+        || (marker.startsWith("governed-note-") && !reserved)) return governedProjectionIntegrity();
+    }
+    const seen = new Set<string>();
+    const result = ownedRows(input).map(value => {
+      const row = ownedFields(value, GOVERNED_ROW_KEYS, true);
+      if (!isProjectionProjectStoreIdentity(row.projectId) || typeof row.itemId !== "string" || !PROJECTION_UUID_V4.test(row.itemId)
+        || !GOVERNED_KINDS.includes(row.recordKind as GovernedNoteKind)
+        || typeof row.sourceEventPosition !== "string" || !/^[1-9][0-9]{0,18}$/u.test(row.sourceEventPosition)) return governedProjectionIntegrity();
+      const key = `${row.projectId}\0${row.itemId}`, item = items.get(key);
+      if (seen.has(key) || item === undefined || row.sourceEventPosition !== String(item.sourceEventPosition)
+        || item.normalizedKey !== `governed-note/${String(row.recordKind)}/${row.itemId}`) return governedProjectionIntegrity();
+      seen.add(key);
+      if (item.verificationMethod === "governed-note-unverified-v1") {
+        if (row.format !== null || row.body !== null || row.bodyContentHash !== null) return governedProjectionIntegrity();
+      } else if (item.verificationMethod === "governed-note-unverified-v2") {
+        if (row.format !== "markdown" || typeof row.bodyContentHash !== "string" || !PROJECTION_SHA256.test(row.bodyContentHash)) return governedProjectionIntegrity();
+        assertMarkdownNoteBodyV1(row.body);
+        if (governedNoteBodyHash({ format: "markdown", body: row.body }) !== row.bodyContentHash) return governedProjectionIntegrity();
+      } else return governedProjectionIntegrity();
+      return Object.freeze(row) as GovernedNoteProjectionRowV1;
+    });
+    for (const [key, item] of items) if (String(item.normalizedKey).startsWith("governed-note/") && !seen.has(key)) return governedProjectionIntegrity();
+    const binary = (left: string, right: string) => left < right ? -1 : left > right ? 1 : 0;
+    return Object.freeze(result.sort((left, right) => binary(left.projectId, right.projectId) || binary(left.itemId, right.itemId)));
+  } catch { return governedProjectionIntegrity(); }
 }

@@ -1,3 +1,7 @@
+import type { ProjectionEventV3, GovernedMemorySourceProjectionEventV3, ProjectionSourceDisposition, ProjectionFoldStateV3, GovernedNoteProjectionRowV1 } from "./contracts.js";
+import { validateGovernedNoteProjectionRows } from "./contracts.js";
+export { validateGovernedNoteProjectionRows } from "./contracts.js";
+import { decodeProjectionSourceV3 } from "./source-event-codec.js";
 import {
   isProjectionProjectStoreIdentity,
   isProjectionWorkspaceIdentity,
@@ -431,7 +435,7 @@ function allowedInitial(status: ProjectionItemStatus): boolean {
   return status === "candidate" || status === "provisional" || status === "verified" || status === "conflicted";
 }
 
-function itemTransition(current: CanonicalItemProjection | undefined, event: MemorySourceProjectionEvent | GovernedMemorySourceProjectionEvent): void {
+function itemTransition(current: CanonicalItemProjection | undefined, event: MemorySourceProjectionEvent | GovernedMemorySourceProjectionEvent | GovernedMemorySourceProjectionEventV3): void {
   const item = event.kind === "memory-source" ? event : event.item;
   if (current === undefined && !allowedInitial(item.status)) return integrity();
   if (current !== undefined && (
@@ -732,7 +736,7 @@ export function foldProjectionEvent(state: ProjectionFoldState, event: Projectio
   }
 }
 
-export class ProjectionFoldAccumulator {
+class ProjectionFoldAccumulatorCore {
   #binding: ProjectBinding | null = null;
   #terminalEventPosition: bigint | null = null;
   readonly #sessionTree = new Map<string, SessionTreeProjection>();
@@ -750,15 +754,19 @@ export class ProjectionFoldAccumulator {
   readonly #checkpointChunks = new Map<string, Set<string>>();
   readonly #retrievalFeedback = new Map<string, RetrievalFeedbackProjection>();
 
-  append(value: ProjectionEvent): void {
-    const event = validateProjectionEvent(value);
+  append(event: ProjectionEventV3, independentGovernedStream = false): void {
     if (this.#binding !== null && !sameScope(this.#binding, event.binding)) return integrity();
     if (this.#terminalEventPosition !== null && event.sourceEventPosition <= this.#terminalEventPosition) {
       return integrity();
     }
     this.#binding ??= event.binding;
     if (event.kind !== "session-lifecycle" && event.kind !== "checkpoint") {
-      this.#advanceMaterialEventStream(event);
+      if (independentGovernedStream) {
+        if (event.kind !== "governed-memory-source") return integrity();
+        const session = event.binding.sessionId === null ? undefined : this.#sessionTree.get(event.binding.sessionId);
+        // The authenticated note pair owns its own stream; it cannot advance lifecycle versions.
+        if (session !== undefined && session.lifecycleState !== "open") return integrity();
+      } else this.#advanceMaterialEventStream(event);
     }
     if (event.kind === "session-lifecycle") this.#appendLifecycle(event);
     else if (event.kind === "checkpoint") this.#appendCheckpoint(event);
@@ -790,7 +798,7 @@ export class ProjectionFoldAccumulator {
     if (!replacing && size >= MAX_ROWS) return integrity();
   }
 
-  #advanceMaterialEventStream(event: Exclude<ProjectionEvent, SessionLifecycleProjectionEvent | CheckpointProjectionEvent>): void {
+  #advanceMaterialEventStream(event: Exclude<ProjectionEventV3, SessionLifecycleProjectionEvent | CheckpointProjectionEvent>): void {
     const sessionId = event.binding.sessionId;
     if (sessionId === null) return;
     const session = this.#sessionTree.get(sessionId);
@@ -931,7 +939,7 @@ export class ProjectionFoldAccumulator {
     }));
   }
 
-  #appendGoverned(event: GovernedMemorySourceProjectionEvent): void {
+  #appendGoverned(event: GovernedMemorySourceProjectionEvent | GovernedMemorySourceProjectionEventV3): void {
     const current = this.#canonicalItems.get(event.item.itemId);
     itemTransition(current, event);
     const owner = this.#normalizedKeyOwners.get(event.item.normalizedKey);
@@ -1205,5 +1213,36 @@ export class LegacyProjectionFoldAccumulator {
       sourceEventPosition: event.sourceEventPosition,
       anchor: null,
     }));
+  }
+}
+
+/** Historical callers retain the exact schema2 event validator. */
+export class ProjectionFoldAccumulator extends ProjectionFoldAccumulatorCore {
+  override append(value: ProjectionEvent): void { super.append(validateProjectionEvent(value)); }
+}
+
+export class ProjectionFoldAccumulatorV3 {
+  readonly #core = new ProjectionFoldAccumulatorCore();
+  readonly #governedNotes = new Map<string, GovernedNoteProjectionRowV1>();
+  #lastSourcePosition: bigint | null = null;
+  #binding: ProjectBinding | null = null;
+
+  append(source: ProjectionSourceDisposition): void {
+    const decoded = decodeProjectionSourceV3(source);
+    if (this.#lastSourcePosition !== null && decoded.sourceEventPosition <= this.#lastSourcePosition) return integrity();
+    if (this.#binding !== null && !sameScope(this.#binding, decoded.binding)) return integrity();
+    const row = decoded.governedNote;
+    const key = row === null ? null : `${row.projectId}\0${row.itemId}`;
+    if (key !== null && (this.#governedNotes.has(key) || this.#governedNotes.size >= MAX_ROWS)) return integrity();
+    if (decoded.event !== null) this.#core.append(decoded.event, row !== null);
+    if (key !== null && row !== null) this.#governedNotes.set(key, row);
+    this.#binding ??= decoded.binding;
+    this.#lastSourcePosition = decoded.sourceEventPosition;
+  }
+
+  finish(): ProjectionFoldStateV3 {
+    const rich = this.#core.finish();
+    const governedNotes = validateGovernedNoteProjectionRows(rich.canonicalItems, [...this.#governedNotes.values()], rich.terminalEventPosition);
+    return Object.freeze({...rich, schemaVersion:3, governedNotes});
   }
 }

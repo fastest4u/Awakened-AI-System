@@ -1,6 +1,6 @@
 import type { ReadonlyJsonValue, StoredEvent } from "../contracts/event.js";
 import { assertRetainedStoredEvent } from "../privacy/retained-evidence-codec.js";
-import { assertStoredGovernedNoteCorrespondence } from "../governed-notes/repository.js";
+import { assertStoredGovernedNoteCorrespondenceAny } from "../governed-notes/repository.js";
 import {
   authenticateStoredEvent,
   type StoredEventChainCursor,
@@ -15,6 +15,7 @@ import {
   isProjectionProjectStoreIdentity,
   isProjectionWorkspaceIdentity,
   type ProjectBinding,
+  type ProjectionSourceDisposition,
 } from "./contracts.js";
 
 const DEFAULT_BUSY_TIMEOUT_MS = 5_000;
@@ -54,6 +55,14 @@ export interface ProjectionEventSnapshot {
   readonly terminalEventHash: string;
   events(): Iterable<StoredEvent>;
   close(): void;
+}
+
+export interface ProjectionEventSnapshotV3 extends ProjectionEventSnapshot {
+  dispositions(): Iterable<ProjectionSourceDisposition>;
+}
+
+export interface ProjectionEventReaderV3 extends ProjectionEventReader {
+  openCommittedSnapshotV3(binding: ProjectBinding): Promise<ProjectionEventSnapshotV3>;
 }
 
 export interface ProjectionEventReader {
@@ -321,7 +330,7 @@ export function replayCommittedProjectionEvents(
   }
 }
 
-export class SqliteProjectionEventReader implements ProjectionEventReader {
+export class SqliteProjectionEventReader implements ProjectionEventReaderV3 {
   readonly #driver: SqliteDriver;
   readonly #eventStorePath: string;
   readonly #busyTimeoutMs: number;
@@ -330,6 +339,13 @@ export class SqliteProjectionEventReader implements ProjectionEventReader {
     this.#driver = options.driver;
     this.#eventStorePath = options.eventStorePath;
     this.#busyTimeoutMs = options.busyTimeoutMs ?? DEFAULT_BUSY_TIMEOUT_MS;
+  }
+
+  async openCommittedSnapshotV3(bindingValue: ProjectBinding): Promise<ProjectionEventSnapshotV3> {
+    return openBoundedProjectionEventSnapshot(bindingValue, {
+      driver: this.#driver, eventStorePath: this.#eventStorePath, busyTimeoutMs: this.#busyTimeoutMs,
+      maxEvents: MAX_PROJECTION_SOURCE_EVENTS, maxAggregateBytes: MAX_PROJECTION_SOURCE_BYTES,
+    });
   }
 
   async openCommittedSnapshot(bindingValue: ProjectBinding): Promise<ProjectionEventSnapshot> {
@@ -349,7 +365,7 @@ interface BoundedProjectionSnapshotOptions extends CommittedProjectionSnapshotOp
 function openBoundedProjectionEventSnapshot(
   bindingValue: ProjectBinding,
   options: BoundedProjectionSnapshotOptions,
-): ProjectionEventSnapshot {
+): ProjectionEventSnapshotV3 {
   const binding = validateBinding(bindingValue);
   const terminalCeiling = options.terminalEventPosition;
   if (
@@ -435,29 +451,28 @@ function openBoundedProjectionEventSnapshot(
     };
     let streamRequested = false;
     let streamComplete = false;
-    return Object.freeze({
-      binding,
-      eventCount: bounds.eventCount,
-      aggregateBytes: bounds.aggregateBytes,
-      terminalEventPosition,
-      terminalEventHash,
-      events(): Iterable<StoredEvent> {
+    const dispositions = (): Iterable<ProjectionSourceDisposition> => {
         if (released || streamRequested) return integrity();
         streamRequested = true;
-        return (function* authenticatedEvents(): IterableIterator<StoredEvent> {
+        return (function* authenticatedEvents(): IterableIterator<ProjectionSourceDisposition> {
           let completed = false;
           let cursor: StoredEventChainCursor = {
             expectedPosition: 1n,
             previousEventHash: GENESIS_GLOBAL_HASH,
           };
           try {
+            if (released) return integrity();
             for (const row of rows.iterate({ $terminalEventPosition: terminalEventPosition })) {
               if (released) return integrity();
               const authenticated = authenticateStoredEvent(storedEvent(row), cursor);
-              assertStoredGovernedNoteCorrespondence(connection, authenticated.event);
+              const governedNotePrior = assertStoredGovernedNoteCorrespondenceAny(connection, authenticated.event);
               cursor = authenticated.nextCursor;
               if (!sameStore(authenticated.event, binding)) return integrity();
-              if (sameBinding(authenticated.event, binding)) yield authenticated.event;
+              if (sameBinding(authenticated.event, binding)) {
+                yield Object.freeze({event: authenticated.event, governedNotePrior});
+                // Check before resuming SQLite's iterator after a caller closes the snapshot.
+                if (released) return integrity();
+              }
             }
             if (
               cursor.expectedPosition !== terminalEventPosition + 1n
@@ -470,6 +485,15 @@ function openBoundedProjectionEventSnapshot(
               try { release(false); } catch { /* preserve stream failure */ }
             }
           }
+        })();
+    };
+    return Object.freeze({
+      binding, eventCount: bounds.eventCount, aggregateBytes: bounds.aggregateBytes,
+      terminalEventPosition, terminalEventHash, dispositions,
+      events(): Iterable<StoredEvent> {
+        const sources = dispositions();
+        return (function* (): IterableIterator<StoredEvent> {
+          for (const source of sources) yield source.event;
         })();
       },
       close(): void {
@@ -502,4 +526,24 @@ export function openCommittedProjectionEventSnapshot(
     maxEvents: MAX_PROJECTION_SOURCE_EVENTS,
     maxAggregateBytes: MAX_PROJECTION_SOURCE_BYTES,
   });
+}
+
+/** Consume authenticated dispositions inside the same bounded read transaction. */
+export function replayCommittedProjectionSources(
+  binding: ProjectBinding,
+  options: CommittedProjectionReplayOptions,
+  consume: (source: ProjectionSourceDisposition) => void,
+): CommittedProjectionReplayResult {
+  if (typeof consume !== "function" || typeof options.terminalEventPosition !== "bigint"
+    || options.terminalEventPosition < 0n || options.terminalEventPosition > SQLITE_INT64_MAX) return integrity();
+  const snapshot = openBoundedProjectionEventSnapshot(binding, {
+    ...options,
+    maxEvents: boundedPositiveInteger(options.maxEvents, MAX_INTEGRITY_REPLAY_EVENTS, MAX_INTEGRITY_REPLAY_EVENTS),
+    maxAggregateBytes: boundedPositiveInteger(options.maxAggregateBytes, MAX_INTEGRITY_REPLAY_BYTES, MAX_INTEGRITY_REPLAY_BYTES),
+  });
+  try {
+    for (const source of snapshot.dispositions()) consume(source);
+    return Object.freeze({eventCount:snapshot.eventCount, aggregateBytes:snapshot.aggregateBytes,
+      terminalEventPosition:snapshot.terminalEventPosition, terminalEventHash:snapshot.terminalEventHash});
+  } finally { snapshot.close(); }
 }

@@ -471,3 +471,28 @@ export function createProjectionSchema(connection: SqliteConnection): void {
     throw error;
   }
 }
+
+/** Independent profile; historical SQL and the default constructor remain schema2. */
+export const PROJECTION_SCHEMA_SQL_V3 = PROJECTION_SCHEMA_SQL_V2
+  .replace("schema_version = 2", "schema_version = 3")
+  .replace("VALUES (1, 2)", "VALUES (1, 3)")
+  .replace("'lexicalChunks', 'retrievalFeedback'", "'lexicalChunks', 'retrievalFeedback', 'governedNotes'") + `
+  CREATE TABLE governed_notes (
+    project_id TEXT NOT NULL,
+    item_id TEXT NOT NULL,
+    record_kind TEXT NOT NULL CHECK (record_kind IN ('session-log','insight','mistake','adr')),
+    format TEXT,
+    body TEXT,
+    body_content_hash TEXT,
+    source_event_position INTEGER NOT NULL CHECK (source_event_position > 0),
+    PRIMARY KEY (project_id, item_id),
+    FOREIGN KEY (project_id, item_id) REFERENCES canonical_items(project_id, item_id),
+    CHECK (
+      (format IS NULL AND body IS NULL AND body_content_hash IS NULL)
+      OR
+      (format IS NOT NULL AND format = 'markdown' AND body IS NOT NULL
+       AND body_content_hash IS NOT NULL AND length(body_content_hash) = 64
+       AND body_content_hash NOT GLOB '*[^0-9a-f]*')
+    )
+  ) STRICT;
+`;
