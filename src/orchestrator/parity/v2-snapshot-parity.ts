@@ -427,6 +427,7 @@ function validatedParityTransaction<T>(
 
 /** Each request receives only a metadata facade; the V2 adapter retains its original private-image lease. */
 export function createV2ParityRetrievalBridge(original: V2ProjectionReaderLease): Readonly<{ service: InternalRetrievalService; close(): void }> {
+  if (original.manifest.schemaVersion !== 2) failure();
   let closed = false;
   const originals = new WeakMap<ProjectionReaderLease, V2ProjectionReaderLease>();
   const adapter = new V2SqliteRetrievalCandidateRepository();

@@ -9,19 +9,19 @@ import {
 import { basename, isAbsolute, join, normalize, resolve } from "node:path";
 
 import { LifecycleError } from "../lifecycle/errors.js";
-import type { BuiltProjectionGeneration, StagedProjectionGeneration } from "./builder.js";
+import type { BuiltProjectionGeneration, StagedProjectionGeneration, StagedProjectionGenerationV3 } from "./builder.js";
 import type { ProjectBinding } from "./contracts.js";
-import type { ProjectionEventReader, ProjectionEventSnapshot } from "./event-reader.js";
+import type { ProjectionEventReader, ProjectionEventSnapshot, ProjectionEventSnapshotV3 } from "./event-reader.js";
 import {
   assertProjectionSidecarsAbsent,
   acquireProjectionManifestPublicationLease,
   parseProjectionManifest,
-  parseProjectionManifestV2,
+  parseProjectionManifestV2, parseRichProjectionManifest,
   PROJECTION_MANIFEST_FILENAME,
   publishProjectionManifest,
   verifyProjectionPublicationPaths,
   type ProjectionManifestV1,
-  type ProjectionManifestV2,
+  type ProjectionManifestV2, type ProjectionManifestV3,
   type ProjectionManifestPublicationFaultBoundary,
   type ProjectionPathInspection,
 } from "./manifest.js";
@@ -31,7 +31,7 @@ import {
   toRetirementImage,
   V2ReconciliationJournal,
 } from "./reconciliation-journal.js";
-import { assertUnpublishedProjectionV2Image } from "./integrity.js";
+import { assertUnpublishedProjectionV2Image, assertUnpublishedProjectionV3Image } from "./integrity.js";
 import {
   ProjectionLeaseUnavailableError,
   ProjectionReaderLeaseRegistry,
@@ -52,10 +52,10 @@ import {
 
 const MAX_GENERATION = 2_147_483_647;
 const GENERATION_FILE = /^projections-1-([1-9][0-9]{0,9})\.sqlite$/u;
-const V2_GENERATION_FILE = /^projections-2-([1-9][0-9]{0,9})\.sqlite$/u;
-const V2_RETIRED_FILE = /^\.projections-2-retired-[0-9a-f]{32}\.sqlite$/u;
-const V2_LEGACY_QUARANTINE_FILE = /^\.projections-2-quarantine-[0-9a-f]{32}\.sqlite$/u;
-const V2_RECONCILIATION_SIDECAR = /^(?:projections-2-[1-9][0-9]{0,9}|\.projections-2-(?:retired|quarantine)-[0-9a-f]{32})\.sqlite-(?:wal|shm)$/u;
+const V2_GENERATION_FILE = /^projections-[23]-([1-9][0-9]{0,9})\.sqlite$/u;
+const V2_RETIRED_FILE = /^\.projections-[23]-retired-[0-9a-f]{32}\.sqlite$/u;
+const V2_LEGACY_QUARANTINE_FILE = /^\.projections-[23]-quarantine-[0-9a-f]{32}\.sqlite$/u;
+const V2_RECONCILIATION_SIDECAR = /^(?:projections-[23]-[1-9][0-9]{0,9}|\.projections-[23]-(?:retired|quarantine)-[0-9a-f]{32})\.sqlite-(?:wal|shm)$/u;
 
 export interface PublishedProjectionGeneration extends BuiltProjectionGeneration {
   readonly directoryIdentity: ProjectionDirectoryIdentity;
@@ -76,12 +76,20 @@ export interface PublishedProjectionGenerationV2 {
   readonly directoryIdentity: ProjectionDirectoryIdentity;
 }
 
+export type PublishedProjectionGenerationV3 = Omit<PublishedProjectionGenerationV2, "manifest"> & { readonly manifest: ProjectionManifestV3 };
+type RichPublished = Omit<PublishedProjectionGenerationV2,"manifest"> & {readonly manifest:ProjectionManifestV2 | ProjectionManifestV3};
+type RichStaged = Omit<StagedProjectionGeneration,"manifest"> & {readonly manifest:ProjectionManifestV2 | ProjectionManifestV3};
+
 interface V2ReconciliationEntry {
-  readonly current: PublishedProjectionGenerationV2 | null;
+  readonly current: RichPublished | null;
   readonly highestObservedGeneration: number;
 }
 
 export interface V2ProjectionBuildCoordinatorOptions {
+  readonly schema3?: Readonly<{
+    eventReader: { openCommittedSnapshotV3(binding: ProjectBinding): Promise<ProjectionEventSnapshotV3> };
+    builder: { buildV3(snapshot: ProjectionEventSnapshotV3, generation: number): Promise<StagedProjectionGenerationV3> };
+  }>;
   readonly eventReader: ProjectionEventReader;
   readonly builder: V2ProjectionGenerationBuilder;
   readonly projectionDirectory: string;
@@ -542,6 +550,7 @@ export class DefaultProjectionBuildCoordinator implements ProjectionBuildCoordin
  * method, so production V1 routing cannot consume a V2 generation.
  */
 export class V2ProjectionBuildCoordinator {
+  readonly #schema3: V2ProjectionBuildCoordinatorOptions["schema3"];
   readonly #eventReader: ProjectionEventReader;
   readonly #builder: V2ProjectionGenerationBuilder;
   readonly #projectionDirectory: string;
@@ -556,6 +565,7 @@ export class V2ProjectionBuildCoordinator {
   readonly #projectTails = new Map<string, Promise<void>>();
 
   constructor(options: V2ProjectionBuildCoordinatorOptions) {
+    this.#schema3 = options.schema3;
     this.#eventReader = options.eventReader;
     this.#builder = options.builder;
     this.#projectionDirectory = canonicalDirectory(options.projectionDirectory);
@@ -571,11 +581,16 @@ export class V2ProjectionBuildCoordinator {
     this.#assertProjectionDirectorySafe();
   }
 
-  async ensurePublished(
-    binding: ProjectBinding,
-    requiredEventPosition: bigint,
-    deadlineMs: number,
-  ): Promise<PublishedProjectionGenerationV2> {
+  async ensurePublished(binding: ProjectBinding, requiredEventPosition: bigint, deadlineMs: number): Promise<PublishedProjectionGenerationV2> {
+    return this.#ensureProfile(2, binding, requiredEventPosition, deadlineMs) as Promise<PublishedProjectionGenerationV2>;
+  }
+
+  async ensurePublishedV3(binding: ProjectBinding, requiredEventPosition: bigint, deadlineMs: number): Promise<PublishedProjectionGenerationV3> {
+    if (!this.#schema3) throw new Error("PROJECTION_REQUEST_INVALID");
+    return this.#ensureProfile(3, binding, requiredEventPosition, deadlineMs) as Promise<PublishedProjectionGenerationV3>;
+  }
+
+  async #ensureProfile(profile: 2 | 3, binding: ProjectBinding, requiredEventPosition: bigint, deadlineMs: number): Promise<RichPublished> {
     if (
       typeof requiredEventPosition !== "bigint"
       || requiredEventPosition < 0n
@@ -591,6 +606,7 @@ export class V2ProjectionBuildCoordinator {
         throw new Error("PROJECTION_PATH_INVALID");
       }
       let retainLock = true;
+      let primary: unknown;
       try {
         const reconciled = this.#reconcileEntry(
           binding,
@@ -609,20 +625,24 @@ export class V2ProjectionBuildCoordinator {
         // publication ambiguity poisons its nested manifest attempt itself.
         retainLock = false;
         this.#assertDeadline(expiresAt, requiredEventPosition, current);
-        if (current !== null && BigInt(current.manifest.terminalEventPosition) >= requiredEventPosition) {
+        if (current !== null && current.manifest.schemaVersion === profile && BigInt(current.manifest.terminalEventPosition) >= requiredEventPosition) {
           return current;
         }
         this.#cleanupKnownTemps();
-        const snapshot = await this.#eventReader.openCommittedSnapshot(binding);
+        const snapshot = profile === 3 ? await this.#schema3!.eventReader.openCommittedSnapshotV3(binding) : await this.#eventReader.openCommittedSnapshot(binding);
         try {
           this.#assertDeadline(expiresAt, requiredEventPosition, current);
+          if (snapshot.terminalEventPosition < requiredEventPosition) throw new ProjectionLagError(requiredEventPosition, snapshot.terminalEventPosition);
           const generationFloor = Math.max(
           reconciled.highestObservedGeneration,
           current?.manifest.highestObservedGeneration ?? 0,
           current?.manifest.generation ?? 0,
           );
-          const staged = await this.#builder.buildV2(snapshot, this.#nextGeneration(generationFloor));
-          const stagedManifest = parseProjectionManifestV2({
+          const staged = profile === 3
+            ? await this.#schema3!.builder.buildV3(snapshot as ProjectionEventSnapshotV3, this.#nextGeneration(generationFloor))
+            : await this.#builder.buildV2(snapshot, this.#nextGeneration(generationFloor));
+          if (staged.manifest.schemaVersion !== profile) throw new Error("PROJECTION_PUBLICATION_INVALID");
+          const stagedManifest = parseRichProjectionManifest({
             ...staged.manifest,
             highestObservedGeneration: Math.max(generationFloor, staged.manifest.generation),
           }, binding);
@@ -667,20 +687,35 @@ export class V2ProjectionBuildCoordinator {
           const published = this.#loadPublishedLocked(binding, identity);
           if (
             published === null
+            || published.manifest.schemaVersion !== profile
             || published.manifest.generation !== stagedForPublication.manifest.generation
             || published.manifest.databaseSha256 !== stagedForPublication.manifest.databaseSha256
           ) throw new Error("PROJECTION_PUBLICATION_INVALID");
           return published;
+        } catch (error) {
+          primary = error;
+          throw error;
         } finally {
-          snapshot.close();
+          try { snapshot.close(); } catch (error) { if (primary === undefined) throw error; }
         }
+      } catch (error) {
+        primary = error;
+        throw error;
       } finally {
-        lease.release(retainLock);
+        try { lease.release(retainLock); } catch (error) { if (primary === undefined) throw error; }
       }
     });
   }
 
-  async leasePublishedForEvaluation(binding: ProjectBinding): Promise<V2ProjectionReaderLease> {
+  async leasePublishedForEvaluation(binding: ProjectBinding): Promise<V2ProjectionReaderLease & {readonly manifest:ProjectionManifestV2}> {
+    return this.#leasePublishedForEvaluation(binding, 2) as Promise<V2ProjectionReaderLease & {readonly manifest:ProjectionManifestV2}>;
+  }
+
+  async leasePublishedV3ForEvaluation(binding: ProjectBinding): Promise<V2ProjectionReaderLease & {readonly manifest:ProjectionManifestV3}> {
+    return this.#leasePublishedForEvaluation(binding, 3) as Promise<V2ProjectionReaderLease & {readonly manifest:ProjectionManifestV3}>;
+  }
+
+  async #leasePublishedForEvaluation(binding: ProjectBinding, profile: 2 | 3): Promise<V2ProjectionReaderLease> {
     return this.#serialized(binding.projectId, async () => {
       const identity = this.#ensureProjectionDirectory();
       const publicationLease = acquireProjectionManifestPublicationLease(this.#projectionDirectory);
@@ -696,7 +731,10 @@ export class V2ProjectionBuildCoordinator {
           throw new Error("PROJECTION_PATH_INVALID");
         }
         const published = this.#loadPublishedLocked(binding, identity);
-        if (published === null) throw new V2ProjectionLeaseUnavailableError();
+        if (published === null || published.manifest.schemaVersion !== profile) {
+          retainLock = false;
+          throw new V2ProjectionLeaseUnavailableError();
+        }
         const image = filesystemStableProjectionDirectoryOperations.readGenerationImage(
           this.#projectionDirectory,
           identity,
@@ -724,7 +762,7 @@ export class V2ProjectionBuildCoordinator {
     });
   }
 
-  #loadPublished(binding: ProjectBinding): PublishedProjectionGenerationV2 | null {
+  #loadPublished(binding: ProjectBinding): RichPublished | null {
     if (!this.#assertProjectionDirectorySafe()) return null;
     this.#assertManifestPublicationUnlocked();
     const manifestPath = join(this.#projectionDirectory, PROJECTION_MANIFEST_FILENAME);
@@ -734,7 +772,7 @@ export class V2ProjectionBuildCoordinator {
       if (this.#readManifestBytes(manifestPath) === null) return null;
       throw new LifecycleError("MATERIALIZATION_CONFLICT");
     }
-    const manifest = parseProjectionManifestV2(JSON.parse(bytes) as unknown, binding);
+    const manifest = parseRichProjectionManifest(JSON.parse(bytes) as unknown, binding);
     const paths = verifyProjectionPublicationPaths(
       this.#projectionDirectory,
       manifest.databaseFile,
@@ -765,7 +803,7 @@ export class V2ProjectionBuildCoordinator {
   #loadPublishedLocked(
     binding: ProjectBinding,
     identity: ProjectionDirectoryIdentity,
-  ): PublishedProjectionGenerationV2 | null {
+  ): RichPublished | null {
     if (!this.#assertProjectionDirectorySafe() || !sameProjectionDirectoryIdentity(
       identity,
       this.#requiredDirectoryIdentity(),
@@ -776,7 +814,7 @@ export class V2ProjectionBuildCoordinator {
     );
     if (snapshot.state === "missing") return null;
     const bytes = Buffer.from(snapshot.bytesBase64, "base64").toString("utf8");
-    const manifest = parseProjectionManifestV2(JSON.parse(bytes) as unknown, binding);
+    const manifest = parseRichProjectionManifest(JSON.parse(bytes) as unknown, binding);
     const paths = verifyProjectionPublicationPaths(
       this.#projectionDirectory,
       manifest.databaseFile,
@@ -812,7 +850,7 @@ export class V2ProjectionBuildCoordinator {
 
   #reconcileEntry(
     binding: ProjectBinding,
-    current: PublishedProjectionGenerationV2 | null,
+    current: RichPublished | null,
     identity: ProjectionDirectoryIdentity,
     lockToken: string,
   ): V2ReconciliationEntry {
@@ -837,14 +875,14 @@ export class V2ProjectionBuildCoordinator {
 
   #persistObservedGeneration(
     binding: ProjectBinding,
-    current: PublishedProjectionGenerationV2 | null,
+    current: RichPublished | null,
     highestObservedGeneration: number,
     identity: ProjectionDirectoryIdentity,
-  ): PublishedProjectionGenerationV2 | null {
+  ): RichPublished | null {
     if (current === null || highestObservedGeneration <= current.manifest.highestObservedGeneration) {
       return current;
     }
-    const manifest = parseProjectionManifestV2({
+    const manifest = parseRichProjectionManifest({
       ...current.manifest,
       highestObservedGeneration,
     }, binding);
@@ -860,7 +898,7 @@ export class V2ProjectionBuildCoordinator {
     return published;
   }
 
-  #verifyStaged(binding: ProjectBinding, staged: StagedProjectionGeneration): StableProjectionGenerationIdentity {
+  #verifyStaged(binding: ProjectBinding, staged: RichStaged): StableProjectionGenerationIdentity {
     if (
       !this.#assertProjectionDirectorySafe()
       || resolve(staged.projectionDirectory) !== resolve(this.#projectionDirectory)
@@ -868,12 +906,13 @@ export class V2ProjectionBuildCoordinator {
     ) {
       throw new Error("PROJECTION_PATH_INVALID");
     }
-    const manifest = parseProjectionManifestV2(staged.manifest, binding);
+    const manifest = parseRichProjectionManifest(staged.manifest, binding);
     const temporaryFilename = basename(staged.temporaryDatabasePath);
     if (
       resolve(join(this.#projectionDirectory, temporaryFilename)) !== resolve(staged.temporaryDatabasePath)
-      || !/^\.projections-2-[1-9][0-9]{0,9}-[0-9a-f]{32}\.sqlite\.tmp$/u.test(temporaryFilename)
-      || manifest.databaseFile !== `projections-2-${manifest.generation}.sqlite`
+      || !/^\.projections-[23]-[1-9][0-9]{0,9}-[0-9a-f]{32}\.sqlite\.tmp$/u.test(temporaryFilename)
+      || manifest.databaseFile !== `projections-${manifest.schemaVersion}-${manifest.generation}.sqlite`
+      || !temporaryFilename.startsWith(`.projections-${manifest.schemaVersion}-${manifest.generation}-`)
     ) throw new Error("PROJECTION_PATH_INVALID");
     if (!this.#assertProjectionDirectorySafe() || !sameProjectionDirectoryIdentity(
       staged.directoryIdentity,
@@ -897,7 +936,7 @@ export class V2ProjectionBuildCoordinator {
   }
 
   #reconcileUnpublished(
-    active: PublishedProjectionGenerationV2 | null,
+    active: RichPublished | null,
     identity: ProjectionDirectoryIdentity,
     lockToken: string,
     binding: ProjectBinding,
@@ -923,6 +962,7 @@ export class V2ProjectionBuildCoordinator {
       if (
         finalMatch === null
         || Number(finalMatch[1]) !== record.generation
+        || record.retiredFilename.split("-")[1] !== record.finalFilename.split("-")[1]
         || intentFinalFilenames.has(record.finalFilename)
         || active?.manifest.databaseFile === record.finalFilename
         || leased.has(record.finalFilename)
@@ -1080,7 +1120,7 @@ export class V2ProjectionBuildCoordinator {
         filename,
         binding,
       );
-      const retiredFilename = `.projections-2-retired-${randomBytes(16).toString("hex")}.sqlite`;
+      const retiredFilename = `.projections-${filename.split("-")[1]}-retired-${randomBytes(16).toString("hex")}.sqlite`;
       const intent = this.#reconciliationJournal.beginRetirement(
         this.#projectionDirectory,
         identity,
@@ -1136,7 +1176,8 @@ export class V2ProjectionBuildCoordinator {
 
   #assertUnpublishedV2Candidate(bytes: Uint8Array, filename: string, binding: ProjectBinding): void {
     try {
-      assertUnpublishedProjectionV2Image(bytes, filename, binding);
+      if (filename.startsWith("projections-3-")) assertUnpublishedProjectionV3Image(bytes, filename, binding);
+      else assertUnpublishedProjectionV2Image(bytes, filename, binding);
     } catch (error) {
       if (error instanceof Error && error.message === "PROJECTION_PUBLICATION_RECOVERY_REQUIRED") throw error;
       throw new Error("PROJECTION_PUBLICATION_RECOVERY_REQUIRED", { cause: error });
@@ -1243,7 +1284,7 @@ export class V2ProjectionBuildCoordinator {
   #assertDeadline(
     expiresAt: number,
     required: bigint,
-    current: PublishedProjectionGenerationV2 | null,
+    current: RichPublished | null,
   ): void {
     if (this.#now() >= expiresAt) {
       throw new ProjectionLagError(required, current === null ? 0n : BigInt(current.manifest.terminalEventPosition));

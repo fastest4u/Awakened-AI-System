@@ -23,7 +23,7 @@ export function deserializableImage(bytes: Uint8Array): Uint8Array {
   return result;
 }
 
-/** Opens a detached immutable SQLite image without consulting a filesystem path. */
+/** Opens a detached immutable SQLite image of its actual profile without consulting a filesystem path. */
 export function openImmutableProjectionImage(
   bytes: Uint8Array,
   busyTimeoutMs = DEFAULT_BUSY_TIMEOUT_MS,

@@ -1,3 +1,4 @@
+// Historical schema1 runtime remains separate from private rich schema2/3 publication ownership.
 import type { ProjectionBuildCoordinator } from "../projections/coordinator.js";
 import type {
   ProjectionLeaseProvider,

@@ -1,3 +1,4 @@
+import { statement, canonicalValue, schemaRows, sameRecords, ftsConfigRows, scalarCount, assertReferences, assertSqliteIntegrity, assertFtsSemantics, persistedCoreChecksums, readUnpublishedCoreRows, TABLES, ENTITY_TABLES, type ProjectionRowsV3, type ProjectionTable, assertCapturedProjectionV3Image, readCapturedProjectionV3Rows } from "./captured-image-v3.js";
 import { createHash } from "node:crypto";
 import {
   closeSync,
@@ -20,29 +21,29 @@ import { isPrimarySqliteBusy } from "../storage/event-append-transaction.js";
 import type { SqliteDriver, SqliteConnection, SqliteRow } from "../storage/sqlite-driver.js";
 import { authenticateStoredEvent, type StoredEventChainCursor } from "../integrity/stored-event-authenticator.js";
 import { canonicalJson } from "../serialization/canonical-json.js";
-import { readVerifiedLegacyProjectionConnection, type BuiltProjectionGeneration } from "./builder.js";
+import { foldProjectionSnapshotV3, readVerifiedLegacyProjectionConnection, type BuiltProjectionGeneration } from "./builder.js";
 import {
   PROJECTION_NAMES,
   projectionCoreChecksum,
   type CanonicalProjectionRow,
   type ProjectionName,
 } from "./checksum.js";
-import type { ProjectBinding, ProjectionFoldState } from "./contracts.js";
+import type { ProjectBinding, ProjectionFoldState, ProjectionFoldStateV3, GovernedNoteProjectionRowV1, ProjectionSourceDisposition } from "./contracts.js";
 import {
-  replayCommittedProjectionEvents,
+  replayCommittedProjectionEvents, replayCommittedProjectionSources,
   type CommittedProjectionReplayResult,
-  type ProjectionEventSnapshot,
+  type ProjectionEventSnapshot, type ProjectionEventSnapshotV3,
   MAX_PROJECTION_SOURCE_EVENTS,
   MAX_PROJECTION_SOURCE_BYTES,
 } from "./event-reader.js";
-import { ProjectionFoldAccumulator } from "./folds.js";
+import { ProjectionFoldAccumulator, ProjectionFoldAccumulatorV3 } from "./folds.js";
 import {
   assertProjectionSidecarsAbsent,
   filesystemProjectionPathInspection,
-  parseProjectionManifestV2,
+  parseProjectionManifestV2, parseProjectionManifestV3, parseRichProjectionManifest,
   parseProjectionManifest,
   verifyProjectionPublicationPaths,
-  type ProjectionManifestV2,
+  type ProjectionManifestV2, type ProjectionManifestV3,
   type ProjectionNameV1,
   type ProjectionPathInspection,
 } from "./manifest.js";
@@ -91,7 +92,8 @@ export type VerifiedCanonicalProjectionSnapshot = Readonly<{
   binding: ProjectBinding; terminalEventPosition: bigint; terminalEventHash: string;
 }> & (Readonly<{ schemaVersion: 1; coreChecksums: Readonly<Record<ProjectionNameV1, string>>;
   rows: Readonly<Record<ProjectionNameV1, readonly CanonicalProjectionRow[]>> }>
-  | Readonly<{ schemaVersion: 2; coreChecksums: Readonly<Record<ProjectionName, string>>; rows: ProjectionRows }>);
+  | Readonly<{ schemaVersion: 2; coreChecksums: Readonly<Record<ProjectionName, string>>; rows: ProjectionRows }>
+  | Readonly<{ schemaVersion: 3; coreChecksums: ProjectionManifestV3["coreChecksums"]; rows: ProjectionRowsV3 }>);
 
 export function readVerifiedCanonicalProjectionSnapshot(
   binding: ProjectBinding, manifestValue: unknown,
@@ -103,13 +105,6 @@ type ExpectedProjectionRows = Readonly<
   Record<ProjectionName, ReadonlyMap<string, CanonicalProjectionRow>>
 >;
 
-interface ProjectionTable {
-  readonly table: string;
-  readonly columns: readonly string[];
-  readonly keyColumns: readonly string[];
-  readonly order: string;
-  readonly canonicalRowId?: boolean;
-}
 
 interface ProjectionGenerationIdentity {
   readonly canonicalPath: string;
@@ -130,68 +125,12 @@ interface PinnedGenerationInspection {
   close(): void;
 }
 
-const TABLES = Object.freeze({
-  sessionTree: Object.freeze({
-    table: "session_tree",
-    columns: Object.freeze(["project_id", "session_id", "root_session_id", "parent_session_id", "lifecycle_state", "owner_generation", "opened_event_position", "closed_event_position", "latest_checkpoint_id", "latest_checkpoint_event_position", "source_event_id", "source_event_position", "anchor"]),
-    keyColumns: Object.freeze(["project_id", "session_id"]),
-    order: "project_id, session_id",
-  }),
-  sessionCheckpoints: Object.freeze({
-    table: "session_checkpoints",
-    columns: Object.freeze(["project_id", "session_id", "checkpoint_id", "checkpoint_version", "base_event_position", "source_event_id", "source_event_position", "occurred_at", "task_summary", "anchor"]),
-    keyColumns: Object.freeze(["project_id", "checkpoint_id"]),
-    order: "project_id, session_id, source_event_position, checkpoint_id",
-  }),
-  canonicalItems: Object.freeze({
-    table: "canonical_items",
-    columns: Object.freeze(["project_id", "session_id", "item_id", "normalized_key", "conflict_group_id", "superseding_item_id", "status", "confidence", "verification_method", "valid_from", "valid_to", "summary", "content_hash", "known_from_event_position", "source_event_id", "source_event_position", "anchor"]),
-    keyColumns: Object.freeze(["project_id", "item_id"]),
-    order: "project_id, item_id",
-  }),
-  tasksFollowups: Object.freeze({
-    table: "tasks_followups",
-    columns: Object.freeze(["project_id", "session_id", "follow_up_id", "status", "summary", "confidence", "source_event_id", "source_event_position", "anchor"]),
-    keyColumns: Object.freeze(["project_id", "follow_up_id"]),
-    order: "project_id, follow_up_id",
-  }),
-  artifactsFiles: Object.freeze({
-    table: "artifacts_files",
-    columns: Object.freeze(["project_id", "session_id", "artifact_id", "path", "summary", "action", "content_hash", "branch_ref", "confidence", "symbol", "commit_hash", "heading", "source_event_id", "source_event_position", "anchor"]),
-    keyColumns: Object.freeze(["project_id", "session_id", "artifact_id"]),
-    order: "project_id, session_id, artifact_id",
-  }),
-  lexicalChunks: Object.freeze({
-    table: "lexical_chunks",
-    columns: Object.freeze(["project_id", "chunk_id", "item_id", "session_id", "section", "normalized_key", "text", "source_event_id", "source_event_position", "anchor"]),
-    keyColumns: Object.freeze(["project_id", "chunk_id"]),
-    order: "project_id, chunk_id",
-    canonicalRowId: true,
-  }),
-  retrievalFeedback: Object.freeze({
-    table: "retrieval_feedback",
-    columns: Object.freeze(["project_id", "feedback_id", "item_id", "outcome", "usefulness", "source_item_event_position", "source_event_id", "source_event_position", "anchor"]),
-    keyColumns: Object.freeze(["project_id", "feedback_id"]),
-    order: "project_id, feedback_id",
-  }),
-} as const satisfies Record<Exclude<ProjectionName, "entityGraph">, ProjectionTable>);
 
-const ENTITY_TABLES = Object.freeze([
-  Object.freeze({ relation: "node", table: "entity_nodes", columns: Object.freeze(["project_id", "entity_id", "normalized_name", "entity_type", "valid_from", "valid_to", "source_event_id", "source_event_position", "anchor"]), key: "entity_id", order: "project_id, entity_id" }),
-  Object.freeze({ relation: "alias", table: "entity_aliases", columns: Object.freeze(["project_id", "alias_id", "entity_id", "normalized_alias", "valid_from", "valid_to", "source_event_id", "source_event_position", "anchor"]), key: "alias_id", order: "project_id, alias_id" }),
-  Object.freeze({ relation: "edge", table: "entity_edges", columns: Object.freeze(["project_id", "edge_id", "source_entity_id", "target_entity_id", "edge_type", "valid_from", "valid_to", "source_event_id", "source_event_position", "anchor"]), key: "edge_id", order: "project_id, edge_id" }),
-] as const);
-
-const INTEGER_NUMBER_COLUMNS = new Set(["checkpoint_version", "owner_generation", "usefulness"]);
 function integrity(): never {
   throw new LifecycleError("INTEGRITY_FAILURE");
 }
 
-function statement(database: DatabaseSync, sql: string): StatementSync {
-  const result = database.prepare(sql);
-  result.setReadBigInts(true);
-  return result;
-}
+
 
 function normalizedPath(path: string): string {
   const value = resolve(path);
@@ -376,7 +315,7 @@ function expectedMap<T>(
   convert: (row: T) => CanonicalProjectionRow,
 ): ReadonlyMap<string, CanonicalProjectionRow> {
   const result = new Map<string, CanonicalProjectionRow>();
-  const definition: ProjectionTable = TABLES[name];
+  const definition = TABLES[name];
   for (const sourceRow of source) {
     const row = Object.freeze(convert(sourceRow));
     const key = projectionRowKey(definition, row);
@@ -405,7 +344,7 @@ function expectedEntityMap(rows: readonly CanonicalProjectionRow[]): ReadonlyMap
   return result;
 }
 
-function rowsFromState(state: ProjectionFoldState): ExpectedProjectionRows {
+function rowsFromState(state: ProjectionFoldState | ProjectionFoldStateV3): ExpectedProjectionRows {
   return Object.freeze({
     sessionTree: expectedMap("sessionTree", state.sessionTree, (row) => ({
       project_id: row.projectId,
@@ -551,23 +490,7 @@ function replay(
   return rowsFromState(accumulator.finish());
 }
 
-function canonicalValue(value: unknown, column: string): CanonicalProjectionRow[string] {
-  if (value === null) return null;
-  if (typeof value === "string") {
-    if (Buffer.byteLength(value, "utf8") > MAX_VALUE_BYTES) return integrity();
-    return value;
-  }
-  if (typeof value === "bigint") {
-    if (INTEGER_NUMBER_COLUMNS.has(column)) {
-      if (value < BigInt(Number.MIN_SAFE_INTEGER) || value > BigInt(Number.MAX_SAFE_INTEGER)) {
-        return integrity();
-      }
-      return Number(value);
-    }
-    return value.toString();
-  }
-  return integrity();
-}
+
 
 function sameRow(
   actual: CanonicalProjectionRow,
@@ -586,6 +509,7 @@ function readExactRows(
   projectId: string,
   terminalEventPosition: bigint,
   manifestChecksums: Readonly<Record<ProjectionName, string>>,
+  schemaVersion: 2 | 3 = 2,
 ): ProjectionRows {
   const result = {} as Record<ProjectionName, readonly CanonicalProjectionRow[]>;
   let totalBytes = 0;
@@ -618,7 +542,7 @@ function readExactRows(
       }
       if (graphRows.length !== expectedRows.entityGraph.size || seen.size !== expectedRows.entityGraph.size) return integrity();
       const frozenGraph = Object.freeze(graphRows);
-      if (projectionCoreChecksum(name, PROJECTION_SCHEMA_VERSION, projectId, terminalEventPosition, frozenGraph) !== manifestChecksums[name]) {
+      if (projectionCoreChecksum(name, schemaVersion, projectId, terminalEventPosition, frozenGraph) !== manifestChecksums[name]) {
         return integrity();
       }
       result[name] = frozenGraph;
@@ -662,7 +586,7 @@ function readExactRows(
     const frozen = Object.freeze(rows);
     const checksum = projectionCoreChecksum(
       name,
-      PROJECTION_SCHEMA_VERSION,
+      schemaVersion,
       projectId,
       terminalEventPosition,
       frozen,
@@ -673,45 +597,11 @@ function readExactRows(
   return Object.freeze(result);
 }
 
-function schemaRows(database: DatabaseSync): readonly Readonly<Record<string, unknown>>[] {
-  const rows: Readonly<Record<string, unknown>>[] = [];
-  for (const row of statement(database, `
-    SELECT type, name, tbl_name, sql
-    FROM sqlite_schema
-    ORDER BY type, name, tbl_name
-  `).iterate()) {
-    if (rows.length >= 128) return integrity();
-    rows.push(Object.freeze({
-      type: row.type,
-      name: row.name,
-      tbl_name: row.tbl_name,
-      sql: row.sql,
-    }));
-  }
-  return Object.freeze(rows);
-}
 
-function sameRecords(
-  actual: readonly Readonly<Record<string, unknown>>[],
-  expected: readonly Readonly<Record<string, unknown>>[],
-  columns: readonly string[],
-): boolean {
-  if (actual.length !== expected.length) return false;
-  return actual.every((row, index) => columns.every(
-    (column) => row[column] === expected[index]?.[column],
-  ));
-}
 
-function ftsConfigRows(database: DatabaseSync): readonly Readonly<Record<string, unknown>>[] {
-  const rows: Readonly<Record<string, unknown>>[] = [];
-  for (const row of statement(database, `
-    SELECT k, v FROM lexical_chunks_fts_config ORDER BY k
-  `).iterate()) {
-    if (rows.length >= 16) return integrity();
-    rows.push(Object.freeze({ k: row.k, v: row.v }));
-  }
-  return Object.freeze(rows);
-}
+
+
+
 
 function assertCanonicalSchema(database: DatabaseSync, version: 1 | 2 = 2, binding?: ProjectBinding): void {
   const reference = new DatabaseSync(":memory:", {
@@ -765,171 +655,13 @@ function assertMetadata(
   ) return integrity();
 }
 
-function scalarCount(database: DatabaseSync, sql: string): bigint {
-  const value = statement(database, sql).get()?.n;
-  if (typeof value !== "bigint" || value < 0n) return integrity();
-  return value;
-}
 
-function assertReferences(database: DatabaseSync): void {
-  if (
-    scalarCount(database, `
-      SELECT count(*) AS n FROM canonical_items AS item
-      LEFT JOIN canonical_items AS target
-        ON target.project_id = item.project_id AND target.item_id = item.superseding_item_id
-      WHERE item.superseding_item_id IS NOT NULL AND target.item_id IS NULL
-    `) !== 0n
-    ||
-    scalarCount(database, `
-      SELECT count(*) AS n FROM retrieval_feedback AS feedback
-      LEFT JOIN canonical_items AS item
-        ON item.project_id = feedback.project_id AND item.item_id = feedback.item_id
-      WHERE item.item_id IS NULL
-    `) !== 0n
-    || scalarCount(database, `
-      SELECT count(*) AS n FROM lexical_chunks AS chunk
-      LEFT JOIN canonical_items AS item
-        ON item.project_id = chunk.project_id AND item.item_id = chunk.item_id
-      WHERE chunk.item_id IS NOT NULL
-        AND (item.item_id IS NULL OR NOT (chunk.session_id IS item.session_id))
-    `) !== 0n
-    || scalarCount(database, `
-      SELECT count(*) AS n FROM tasks_followups AS follow_up
-      LEFT JOIN session_tree AS session
-        ON session.project_id = follow_up.project_id AND session.session_id = follow_up.session_id
-      WHERE session.session_id IS NULL
-    `) !== 0n
-    || scalarCount(database, `
-      SELECT count(*) AS n FROM artifacts_files AS artifact
-      LEFT JOIN session_tree AS session
-        ON session.project_id = artifact.project_id AND session.session_id = artifact.session_id
-      WHERE session.session_id IS NULL
-    `) !== 0n
-    || scalarCount(database, `
-      SELECT count(*) AS n FROM entity_aliases AS alias
-      LEFT JOIN entity_nodes AS entity
-        ON entity.project_id = alias.project_id AND entity.entity_id = alias.entity_id
-      WHERE entity.entity_id IS NULL
-    `) !== 0n
-    || scalarCount(database, `
-      SELECT count(*) AS n FROM entity_edges AS edge
-      LEFT JOIN entity_nodes AS source
-        ON source.project_id = edge.project_id AND source.entity_id = edge.source_entity_id
-      LEFT JOIN entity_nodes AS target
-        ON target.project_id = edge.project_id AND target.entity_id = edge.target_entity_id
-      WHERE source.entity_id IS NULL OR target.entity_id IS NULL
-    `) !== 0n
-  ) return integrity();
-}
 
-function assertSqliteIntegrity(database: DatabaseSync): void {
-  const integrityRows = statement(database, "PRAGMA integrity_check(1)").iterate();
-  const first = integrityRows.next();
-  if (first.done || first.value.integrity_check !== "ok" || !integrityRows.next().done) {
-    return integrity();
-  }
-  if (!statement(database, "PRAGMA foreign_key_check").iterate().next().done) return integrity();
-}
 
-function assertFtsSemantics(
-  database: DatabaseSync,
-  lexicalRows: readonly CanonicalProjectionRow[],
-): void {
-  const reference = new DatabaseSync(":memory:", {
-    enableForeignKeyConstraints: true,
-    enableDoubleQuotedStringLiterals: false,
-    allowExtension: false,
-    allowBareNamedParameters: false,
-    allowUnknownNamedParameters: false,
-    defensive: true,
-  });
-  try {
-    reference.enableDefensive(true);
-    reference.exec(`
-      CREATE VIRTUAL TABLE expected_fts USING fts5(
-        normalized_key,
-        text,
-        tokenize = 'unicode61 remove_diacritics 2'
-      );
-      CREATE VIRTUAL TABLE expected_vocab USING fts5vocab(
-        expected_fts,
-        instance
-      );
-      PRAGMA trusted_schema = OFF;
-    `);
-    const insert = reference.prepare(`
-      INSERT INTO expected_fts(rowid, normalized_key, text) VALUES (?, ?, ?)
-    `);
-    for (let index = 0; index < lexicalRows.length; index += 1) {
-      const row = lexicalRows[index]!;
-      insert.run(index + 1, row.normalized_key as string, row.text as string);
-    }
-    const actual = statement(database, `
-      SELECT term, doc, col, offset FROM temp.actual_vocab
-      ORDER BY term, doc, col, offset
-    `).iterate();
-    const expected = statement(reference, `
-      SELECT term, doc, col, offset FROM expected_vocab
-      ORDER BY term, doc, col, offset
-    `).iterate();
-    while (true) {
-      const left = actual.next();
-      const right = expected.next();
-      if (left.done || right.done) {
-        if (left.done !== right.done) return integrity();
-        break;
-      }
-      for (const column of ["term", "doc", "col", "offset"] as const) {
-        if (left.value[column] !== right.value[column]) return integrity();
-      }
-    }
-    // Vocab authenticates the semantic term/posting content represented by the
-    // data/idx segment layout. The data id=1 averages record, every per-document
-    // size record, and config are additionally rank-sensitive and must match the
-    // independently populated canonical index byte-for-byte. The data id=10
-    // structure record is intentionally not byte-compared because equivalent
-    // segment histories have different physical encodings.
-    const shadows = [
-      Object.freeze({ suffix: "data", columns: Object.freeze(["id", "block"]), where: "WHERE id = 1", order: "id" }),
-      Object.freeze({ suffix: "docsize", columns: Object.freeze(["id", "sz"]), where: "", order: "id" }),
-      Object.freeze({ suffix: "config", columns: Object.freeze(["k", "v"]), where: "", order: "k" }),
-    ] as const;
-    for (const shadow of shadows) {
-      const columns = shadow.columns.join(", ");
-      const actualRows = statement(database, `
-        SELECT ${columns} FROM lexical_chunks_fts_${shadow.suffix}
-        ${shadow.where} ORDER BY ${shadow.order}
-      `).iterate();
-      const expectedRows = statement(reference, `
-        SELECT ${columns} FROM expected_fts_${shadow.suffix}
-        ${shadow.where} ORDER BY ${shadow.order}
-      `).iterate();
-      let count = 0;
-      while (true) {
-        const actualRow = actualRows.next();
-        const expectedRow = expectedRows.next();
-        if (actualRow.done || expectedRow.done) {
-          if (actualRow.done !== expectedRow.done) return integrity();
-          break;
-        }
-        if (count >= MAX_ROWS * 4) return integrity();
-        for (const column of shadow.columns) {
-          const actualValue = actualRow.value[column];
-          const expectedValue = expectedRow.value[column];
-          if (actualValue instanceof Uint8Array && expectedValue instanceof Uint8Array) {
-            if (
-              actualValue.byteLength !== expectedValue.byteLength
-              || !Buffer.from(actualValue).equals(Buffer.from(expectedValue))
-            ) return integrity();
-          } else if (actualValue !== expectedValue) return integrity();
-        }
-        count += 1;
-      }
-    }
-  } finally {
-    reference.close();
-  }
-}
+
+
+
+
 
 function assertUnpublishedV2Metadata(
   database: DatabaseSync,
@@ -965,73 +697,9 @@ function assertUnpublishedV2Metadata(
   return terminalEventPosition;
 }
 
-function persistedCoreChecksums(database: DatabaseSync): Readonly<Record<ProjectionName, string>> {
-  const result = {} as Record<ProjectionName, string>;
-  const seen = new Set<string>();
-  for (const row of statement(database, `
-    SELECT projection_name, checksum FROM projection_core_checksums ORDER BY projection_name
-  `).iterate()) {
-    if (
-      typeof row.projection_name !== "string"
-      || typeof row.checksum !== "string"
-      || !HASH.test(row.checksum)
-      || seen.has(row.projection_name)
-      || !PROJECTION_NAMES.includes(row.projection_name as ProjectionName)
-    ) return integrity();
-    seen.add(row.projection_name);
-    result[row.projection_name as ProjectionName] = row.checksum;
-  }
-  if (seen.size !== PROJECTION_NAMES.length) return integrity();
-  return Object.freeze(result);
-}
 
-function readUnpublishedCoreRows(database: DatabaseSync): ProjectionRows {
-  const result = {} as Record<ProjectionName, readonly CanonicalProjectionRow[]>;
-  let totalBytes = 0;
-  for (const name of PROJECTION_NAMES) {
-    if (name === "entityGraph") {
-      const rows: CanonicalProjectionRow[] = [];
-      for (const entity of ENTITY_TABLES) {
-        for (const raw of statement(database, `
-          SELECT ${entity.columns.join(", ")} FROM ${entity.table} ORDER BY ${entity.order}
-        `).iterate()) {
-          if (rows.length >= MAX_ROWS) return integrity();
-          const row: Record<string, CanonicalProjectionRow[string]> = { relation: entity.relation };
-          for (const column of entity.columns) {
-            if (!(column in raw)) return integrity();
-            row[column] = canonicalValue(raw[column], column);
-            totalBytes += Buffer.byteLength(JSON.stringify(row[column]), "utf8");
-            if (totalBytes > MAX_CANONICAL_BYTES) return integrity();
-          }
-          rows.push(Object.freeze(row));
-        }
-      }
-      result[name] = Object.freeze(rows);
-      continue;
-    }
-    const definition: ProjectionTable = TABLES[name];
-    const selected = definition.canonicalRowId
-      ? ["row_id", ...definition.columns]
-      : definition.columns;
-    const rows: CanonicalProjectionRow[] = [];
-    for (const raw of statement(database, `
-      SELECT ${selected.join(", ")} FROM ${definition.table} ORDER BY ${definition.order}
-    `).iterate()) {
-      if (rows.length >= MAX_ROWS) return integrity();
-      if (definition.canonicalRowId && raw.row_id !== BigInt(rows.length + 1)) return integrity();
-      const row: Record<string, CanonicalProjectionRow[string]> = {};
-      for (const column of definition.columns) {
-        if (!(column in raw)) return integrity();
-        row[column] = canonicalValue(raw[column], column);
-        totalBytes += Buffer.byteLength(JSON.stringify(row[column]), "utf8");
-        if (totalBytes > MAX_CANONICAL_BYTES) return integrity();
-      }
-      rows.push(Object.freeze(row));
-    }
-    result[name] = Object.freeze(rows);
-  }
-  return Object.freeze(result);
-}
+
+
 
 /**
  * Validates an unpublished V2 generation from immutable bytes before any
@@ -1073,17 +741,41 @@ export function assertUnpublishedProjectionV2Image(
   }
 }
 
+/** Reconciles schema3 under its own exact profile, using only owned captured bytes. */
+export function assertUnpublishedProjectionV3Image(bytes: Uint8Array, filename: string, binding: ProjectBinding): void {
+  let database: DatabaseSync | undefined;
+  try {
+    const match = /^projections-3-([1-9][0-9]{0,9})\.sqlite$/u.exec(filename);
+    if (!match || bytes.byteLength > 64 * 1024 * 1024) return integrity();
+    database = openImmutableProjectionImage(bytes);
+    const metadata = statement(database, "SELECT terminal_event_position, terminal_event_hash, created_at FROM projection_metadata").get();
+    if (!metadata) return integrity();
+    const checksums: Record<string,string> = {};
+    for (const row of statement(database, "SELECT projection_name,checksum FROM projection_core_checksums").iterate()) {
+      if (typeof row.projection_name !== "string" || typeof row.checksum !== "string" || Object.hasOwn(checksums,row.projection_name)) return integrity();
+      checksums[row.projection_name] = row.checksum;
+    }
+    const manifest = parseProjectionManifestV3({ schemaVersion:3, ...binding, sessionId:null, generation:Number(match[1]),
+      highestObservedGeneration:Number(match[1]), terminalEventPosition:String(metadata.terminal_event_position),
+      terminalEventHash:metadata.terminal_event_hash, databaseFile:filename, databaseSha256:createHash("sha256").update(bytes).digest("hex"),
+      coreChecksums:checksums, createdAt:metadata.created_at },binding);
+    assertCapturedProjectionV3Image(database,manifest);
+  } catch { return integrity(); }
+  finally { database?.close(); }
+}
+
 function inspectGeneration(
   path: string,
   binding: ProjectBinding,
-  manifest: ProjectionManifestV2,
+  manifest: ProjectionManifestV2 | ProjectionManifestV3,
   expectedRows: ExpectedProjectionRows,
   busyTimeoutMs: number,
   directoryIdentity: ProjectionDirectoryIdentity,
   pathInspection: ProjectionPathInspection,
   faultInjector?: ProjectionIntegrityFaultInjector,
-): ProjectionRows {
-  let verifiedRows: ProjectionRows | undefined;
+  governedRows?: readonly GovernedNoteProjectionRowV1[],
+): ProjectionRows | ProjectionRowsV3 {
+  let verifiedRows: ProjectionRows | ProjectionRowsV3 | undefined;
   assertProjectionSidecarsAbsent(path, pathInspection);
   const generationIdentity = captureGenerationIdentity(path);
   if (!sameProjectionDirectoryIdentity(
@@ -1109,8 +801,8 @@ function inspectGeneration(
       ) return integrity();
       pinnedImage.assertUnchanged();
       database.exec("PRAGMA trusted_schema = OFF; BEGIN");
-      assertCanonicalSchema(database, 2, binding);
-      assertMetadata(database, binding, manifest);
+      if (manifest.schemaVersion === 3) assertCapturedProjectionV3Image(database, manifest);
+      else { assertCanonicalSchema(database, 2, binding); assertMetadata(database, binding, manifest); }
       assertSqliteIntegrity(database);
       const rows = readExactRows(
         database,
@@ -1118,6 +810,7 @@ function inspectGeneration(
         binding.projectId,
         BigInt(manifest.terminalEventPosition),
         manifest.coreChecksums,
+        manifest.schemaVersion,
       );
       assertReferences(database);
       assertFtsSemantics(database, rows.lexicalChunks);
@@ -1131,7 +824,11 @@ function inspectGeneration(
       ) return integrity();
       pinnedImage.assertUnchanged();
       database.exec("COMMIT");
-      verifiedRows = rows;
+      if (manifest.schemaVersion === 3) {
+        const captured = readCapturedProjectionV3Rows(database);
+        if (!governedRows || canonicalJson(captured.governedNotes) !== canonicalJson(governedRows)) return integrity();
+        verifiedRows = captured;
+      } else verifiedRows = rows;
     } catch (error) {
       try { database.exec("ROLLBACK"); } catch { /* preserve integrity failure */ }
       throw error;
@@ -1219,9 +916,30 @@ export class ProjectionIntegrityService {
     return Object.freeze({ status: "passed", terminalEventPosition: String(verified.terminalEventPosition) });
   }
 
+  #readCommittedSnapshotV3(binding: ProjectBinding, manifest: ProjectionManifestV3, snapshot: ProjectionEventSnapshot): VerifiedCanonicalProjectionSnapshot {
+    if (["projectId", "vaultId", "storeId", "workspaceId", "branchScopeId", "branchRef", "sessionId"].some(key =>
+      snapshot.binding[key as keyof ProjectBinding] !== binding[key as keyof ProjectBinding])
+      || snapshot.terminalEventPosition !== BigInt(manifest.terminalEventPosition)
+      || snapshot.terminalEventHash !== manifest.terminalEventHash) return integrity();
+    const state = foldProjectionSnapshotV3(snapshot as ProjectionEventSnapshotV3, this.#options.maxReplayEvents, this.#options.maxReplayBytes);
+    return this.#inspectV3State(binding, manifest, state);
+  }
+
+  #inspectV3State(binding: ProjectBinding, manifest: ProjectionManifestV3, state: ProjectionFoldStateV3): VerifiedCanonicalProjectionSnapshot {
+    const directory = captureProjectionDirectoryIdentity(this.#options.projectionDirectory);
+    const inspection = this.#options.pathInspection ?? filesystemProjectionPathInspection;
+    const paths = verifyProjectionPublicationPaths(this.#options.projectionDirectory, manifest.databaseFile, inspection);
+    if (BigInt(captureGenerationIdentity(paths.databasePath).size) > 64n * 1024n * 1024n) return integrity();
+    const rows = inspectGeneration(paths.databasePath, binding, manifest, rowsFromState(state),
+      this.#options.busyTimeoutMs ?? DEFAULT_BUSY_TIMEOUT_MS, directory, inspection, this.#options.faultInjector, state.governedNotes) as ProjectionRowsV3;
+    return Object.freeze({ schemaVersion: 3, binding: Object.freeze({ ...binding }), rows, coreChecksums: manifest.coreChecksums,
+      terminalEventPosition: BigInt(manifest.terminalEventPosition), terminalEventHash: manifest.terminalEventHash });
+  }
+
   #readCommittedSnapshot(binding: ProjectBinding, manifestValue: unknown, snapshot: ProjectionEventSnapshot): VerifiedCanonicalProjectionSnapshot {
     try {
-      const manifest = parseProjectionManifestV2(manifestValue, binding);
+      const manifest = parseRichProjectionManifest(manifestValue, binding);
+      if (manifest.schemaVersion === 3) return this.#readCommittedSnapshotV3(binding, manifest, snapshot);
       const accumulator = new ProjectionFoldAccumulator();
       authenticateProjectionSnapshot(snapshot, binding, manifest, this.#options, source => {
         const decoded = decodeProjectionEvent(source);
@@ -1250,7 +968,7 @@ export class ProjectionIntegrityService {
     const descriptor = typeof manifestValue === "object" && manifestValue !== null
       ? Object.getOwnPropertyDescriptor(manifestValue, "schemaVersion") : undefined;
     if (!descriptor || !("value" in descriptor)) return integrity();
-    if (descriptor.value === 2) return this.#readCommittedSnapshot(binding, manifestValue, snapshot);
+    if (descriptor.value === 2 || descriptor.value === 3) return this.#readCommittedSnapshot(binding, manifestValue, snapshot);
     const manifest = parseProjectionManifest(manifestValue, binding);
     const events: StoredEvent[] = [];
     authenticateProjectionSnapshot(snapshot, binding, manifest, this.#options, source => events.push(source));
@@ -1329,7 +1047,16 @@ export class ProjectionIntegrityService {
   verify(binding: ProjectBinding, manifestValue: unknown): ProjectionIntegrityReport {
     try {
       // Parse and reject non-V2 metadata before any directory or generation-byte inspection.
-      const manifest = parseProjectionManifestV2(manifestValue, binding);
+      const manifest = parseRichProjectionManifest(manifestValue, binding);
+      if (manifest.schemaVersion === 3) {
+        const accumulator = new ProjectionFoldAccumulatorV3();
+        const replayed = replayCommittedProjectionSources(binding, { driver:this.#options.driver, eventStorePath:this.#options.eventStorePath,
+          busyTimeoutMs:this.#options.busyTimeoutMs, terminalEventPosition:BigInt(manifest.terminalEventPosition),
+          maxEvents:this.#options.maxReplayEvents, maxAggregateBytes:this.#options.maxReplayBytes }, source => accumulator.append(source));
+        if (replayed.terminalEventHash !== manifest.terminalEventHash) return integrity();
+        this.#inspectV3State(binding,manifest,accumulator.finish());
+        return Object.freeze({status:"passed",terminalEventPosition:manifest.terminalEventPosition});
+      }
       const directoryIdentity = captureProjectionDirectoryIdentity(
         this.#options.projectionDirectory,
       );

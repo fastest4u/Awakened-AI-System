@@ -108,7 +108,7 @@ export type ProjectionManifestV3 = Readonly<Omit<ProjectionManifestV2, "schemaVe
   coreChecksums: Readonly<Record<ProjectionNameV3, string>>;
 }>;
 
-export type ProjectionManifest = ProjectionManifestV1 | ProjectionManifestV2;
+export type ProjectionManifest = ProjectionManifestV1 | ProjectionManifestV2 | ProjectionManifestV3;
 
 function invalid(): never {
   throw new TypeError("PROJECTION_MANIFEST_INVALID");
@@ -336,5 +336,6 @@ export function parseProjectionManifestForPublication(
   if (schemaVersion === undefined || !("value" in schemaVersion)) invalid();
   if (schemaVersion.value === 1) return parseProjectionManifest(value, expectedBinding);
   if (schemaVersion.value === 2) return parseProjectionManifestV2(value, expectedBinding);
+  if (schemaVersion.value === 3) return parseProjectionManifestV3(value, expectedBinding);
   return invalid();
 }

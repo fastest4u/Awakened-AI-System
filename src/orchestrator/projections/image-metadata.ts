@@ -1,7 +1,7 @@
 import type { DatabaseSync } from "node:sqlite";
-import type { ProjectionManifestV1, ProjectionManifestV2 } from "./manifest-codec.js";
+import type { ProjectionManifestV1, ProjectionManifestV2, ProjectionManifestV3 } from "./manifest-codec.js";
 
-type Manifest = ProjectionManifestV1 | ProjectionManifestV2;
+type Manifest = ProjectionManifestV1 | ProjectionManifestV2 | ProjectionManifestV3;
 export type ProjectionImageMetadata = Readonly<Pick<Manifest,
   "schemaVersion" | "projectId" | "vaultId" | "storeId" | "workspaceId" | "branchScopeId" | "branchRef"
   | "sessionId" | "generation" | "terminalEventPosition" | "terminalEventHash">>;

@@ -36,8 +36,8 @@ const LOCK_NAME = ${JSON.stringify(PROJECTION_MANIFEST_PUBLICATION_LOCK_FILENAME
 const RECONCILIATION_JOURNAL_NAME = ${JSON.stringify(PROJECTION_RECONCILIATION_JOURNAL_FILENAME)};
 const RECONCILIATION_JOURNAL_TEMP_NAME = ".projection-reconciliation-v2.json.tmp";
 const TOKEN = /^[0-9a-f]{32}$/u;
-const V2_GENERATION = /^projections-2-([1-9][0-9]{0,9})\.sqlite$/u;
-const V2_RETIRED = /^\.projections-2-retired-([0-9a-f]{32})\.sqlite$/u;
+const V2_GENERATION = /^projections-[23]-([1-9][0-9]{0,9})\.sqlite$/u;
+const V2_RETIRED = /^\.projections-[23]-retired-([0-9a-f]{32})\.sqlite$/u;
 const normalized = (path) => {
   const value = resolve(path);
   return process.platform === "win32" ? value.toLowerCase() : value;
@@ -270,6 +270,7 @@ const exactRetirement = (value) => {
       || !V2_GENERATION.test(value.finalFilename)
       || Number(V2_GENERATION.exec(value.finalFilename)[1]) !== value.generation
       || typeof value.retiredFilename !== "string" || !V2_RETIRED.test(value.retiredFilename)
+      || value.finalFilename.split("-")[1] !== value.retiredFilename.split("-")[1]
     ) invalid();
     return {
       state: "intent",
@@ -374,7 +375,7 @@ const transactionNames = (attemptToken) => ({
 try {
   assertDirectory();
   if (operation === "cleanup") {
-    const generationTemp = /^\.projections-[12]-[1-9][0-9]{0,9}(?:-[0-9a-f]{32})?\.sqlite\.tmp(?:-(?:wal|shm))?$/u;
+    const generationTemp = /^\.projections-[123]-[1-9][0-9]{0,9}(?:-[0-9a-f]{32})?\.sqlite\.tmp(?:-(?:wal|shm))?$/u;
     for (const name of readdirSync(".")) {
       if (name !== ".projection-manifest.json.tmp" && !generationTemp.test(name)) continue;
       const entry = lstatSync(name);
@@ -389,7 +390,7 @@ try {
     if (
       typeof filename !== "string"
       || basename(filename) !== filename
-      || !/^projections-[12]-[1-9][0-9]{0,9}\.sqlite$/u.test(filename)
+      || !/^projections-[123]-[1-9][0-9]{0,9}\.sqlite$/u.test(filename)
     ) invalid();
     if (sidecarPresent(filename)) integrity();
     try {
@@ -475,7 +476,7 @@ try {
     assertLock(assertToken(lockToken));
     if (typeof filename !== "string" || !V2_GENERATION.test(filename)) invalid();
     if (sidecarPresent(filename)) integrity();
-    const image = captureFileIdentity(filename, MAX_GENERATION_BYTES);
+    const image = captureFileIdentity(filename, filename.startsWith("projections-3-") ? 64 * 1024 * 1024 : MAX_GENERATION_BYTES);
     assertLock(lockToken);
     process.stdout.write(JSON.stringify({
       filename,
@@ -491,7 +492,7 @@ try {
     assertLock(assertToken(lockToken));
     if (
       typeof filename !== "string" || !V2_GENERATION.test(filename)
-      || typeof retiredFilename !== "string" || !V2_RETIRED.test(retiredFilename)
+      || typeof retiredFilename !== "string" || !V2_RETIRED.test(retiredFilename) || filename.split("-")[1] !== retiredFilename.split("-")[1]
     ) invalid();
     try {
       lstatSync(retiredFilename);
@@ -542,9 +543,10 @@ try {
     assertLock(assertToken(lockToken));
     if (
       typeof temporaryFilename !== "string"
-      || !/^\.projections-2-[1-9][0-9]{0,9}-[0-9a-f]{32}\.sqlite\.tmp$/u.test(temporaryFilename)
+      || !/^\.projections-[23]-[1-9][0-9]{0,9}-[0-9a-f]{32}\.sqlite\.tmp$/u.test(temporaryFilename)
       || typeof finalFilename !== "string"
-      || !/^projections-2-[1-9][0-9]{0,9}\.sqlite$/u.test(finalFilename)
+      || !/^projections-[23]-[1-9][0-9]{0,9}\.sqlite$/u.test(finalFilename)
+      || !temporaryFilename.startsWith("." + finalFilename.slice(0, -7) + "-")
     ) invalid();
     const temporary = captureFileIdentity(temporaryFilename, MAX_GENERATION_BYTES);
     if (
@@ -1150,7 +1152,7 @@ function decodeGenerationImage(value: string): StableProjectionGenerationImage {
   if (
     Reflect.ownKeys(source).length !== 7
     || typeof source.filename !== "string"
-    || !/^projections-2-[1-9][0-9]{0,9}\.sqlite$/u.test(source.filename)
+    || !/^projections-[23]-[1-9][0-9]{0,9}\.sqlite$/u.test(source.filename)
     || typeof source.bytesBase64 !== "string"
   ) return invalid();
   const identity = decodeGenerationIdentity(JSON.stringify({
@@ -1160,6 +1162,7 @@ function decodeGenerationImage(value: string): StableProjectionGenerationImage {
     ctimeNs: source.ctimeNs,
     sha256: source.sha256,
   }), source.filename);
+  if (source.filename.startsWith("projections-3-") && BigInt(identity.size) > 64n * 1024n * 1024n) return invalid();
   const bytes = Buffer.from(source.bytesBase64, "base64");
   if (
     bytes.toString("base64") !== source.bytesBase64
@@ -1181,7 +1184,7 @@ function decodeRetiredGeneration(value: string): StableProjectionGenerationIdent
   if (
     Reflect.ownKeys(source).length !== 6
     || typeof source.filename !== "string"
-    || !/^\.projections-2-retired-[0-9a-f]{32}\.sqlite$/u.test(source.filename)
+    || !/^\.projections-[23]-retired-[0-9a-f]{32}\.sqlite$/u.test(source.filename)
   ) return invalid();
   return decodeGenerationIdentity(JSON.stringify({
     device: source.device,
@@ -1231,7 +1234,7 @@ function decodeRetirementRecord(value: unknown): V2RetirementIntent | V2RetiredG
   if (
     !validRetirementGeneration(source.generation)
     || typeof source.retiredFilename !== "string"
-    || !/^\.projections-2-retired-[0-9a-f]{32}\.sqlite$/u.test(source.retiredFilename)
+    || !/^\.projections-[23]-retired-[0-9a-f]{32}\.sqlite$/u.test(source.retiredFilename)
   ) return invalid();
   const generation = source.generation;
   const image = decodeRetirementImage(source.image);
@@ -1239,8 +1242,9 @@ function decodeRetirementRecord(value: unknown): V2RetirementIntent | V2RetiredG
     if (
       !exactRecordKeys(source, ["state", "generation", "finalFilename", "retiredFilename", "image"])
       || typeof source.finalFilename !== "string"
-      || !/^projections-2-[1-9][0-9]{0,9}\.sqlite$/u.test(source.finalFilename)
-      || Number(/^projections-2-([1-9][0-9]{0,9})\.sqlite$/u.exec(source.finalFilename)?.[1]) !== generation
+      || !/^projections-[23]-[1-9][0-9]{0,9}\.sqlite$/u.test(source.finalFilename)
+      || Number(/^projections-[23]-([1-9][0-9]{0,9})\.sqlite$/u.exec(source.finalFilename)?.[1]) !== generation
+      || source.finalFilename.split("-")[1] !== String(source.retiredFilename).split("-")[1]
     ) return invalid();
     return Object.freeze({
       state: "intent",
@@ -1456,8 +1460,9 @@ StableProjectionDirectoryOperations = Object.freeze({
     expected: StableProjectionGenerationIdentity,
     retiredFilename: string,
   ): StableProjectionGenerationIdentity {
-    if (!/^projections-2-[1-9][0-9]{0,9}\.sqlite$/u.test(expected.filename)) return invalid();
-    if (!/^\.projections-2-retired-[0-9a-f]{32}\.sqlite$/u.test(retiredFilename)) return invalid();
+    if (!/^projections-[23]-[1-9][0-9]{0,9}\.sqlite$/u.test(expected.filename)
+      || expected.filename.split("-")[1] !== retiredFilename.split("-")[1]) return invalid();
+    if (!/^\.projections-[23]-retired-[0-9a-f]{32}\.sqlite$/u.test(retiredFilename)) return invalid();
     const result = runStableMutation("retire-generation", directory, identity, [
       lockToken,
       expected.filename,
@@ -1476,7 +1481,7 @@ StableProjectionDirectoryOperations = Object.freeze({
     lockToken: string,
     retiredFilename: string,
   ): StableProjectionGenerationIdentity | null {
-    if (!/^\.projections-2-retired-[0-9a-f]{32}\.sqlite$/u.test(retiredFilename)) return invalid();
+    if (!/^\.projections-[23]-retired-[0-9a-f]{32}\.sqlite$/u.test(retiredFilename)) return invalid();
     const result = runStableMutation(
       "capture-retired-generation",
       directory,

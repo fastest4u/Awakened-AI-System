@@ -182,7 +182,7 @@ export function verifyProjectionPublicationPaths(
 ): VerifiedProjectionPublicationPaths {
   if (
     typeof databaseFile !== "string"
-    || !/^projections-[12]-[1-9][0-9]{0,9}\.sqlite$/u.test(databaseFile)
+    || !/^projections-[123]-[1-9][0-9]{0,9}\.sqlite$/u.test(databaseFile)
   ) pathInvalid();
   const directory = safeProjectionDirectory(projectionDirectory, inspection);
   const databasePath = join(directory, databaseFile);
@@ -205,7 +205,7 @@ function unpublishedProjectionManifestPaths(
 ): VerifiedProjectionPublicationPaths {
   if (
     typeof databaseFile !== "string"
-    || !/^projections-[12]-[1-9][0-9]{0,9}\.sqlite$/u.test(databaseFile)
+    || !/^projections-[123]-[1-9][0-9]{0,9}\.sqlite$/u.test(databaseFile)
   ) pathInvalid();
   const directory = safeProjectionDirectory(projectionDirectory, inspection);
   const databasePath = join(directory, databaseFile);

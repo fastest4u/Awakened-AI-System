@@ -545,7 +545,7 @@ export class V2ShadowProjectionPublisher {
           busyTimeoutMs: Math.min(5000, operation.remaining()), now: () => { operation.check(); return manifest.createdAt; } }),
         now: () => { operation.check(); return now(); } }).ensurePublished(binding, BigInt(manifest.terminalEventPosition), operation.remaining());
       operation.check();
-      if (v2.manifest.terminalEventPosition !== manifest.terminalEventPosition || v2.manifest.terminalEventHash !== manifest.terminalEventHash
+      if (v2.manifest.schemaVersion !== 2 || v2.manifest.terminalEventPosition !== manifest.terminalEventPosition || v2.manifest.terminalEventHash !== manifest.terminalEventHash
         || BINDING_FIELDS.some(key => v2.manifest[key] !== binding[key]) || v2.manifest.createdAt !== manifest.createdAt) failure();
       const pending = this.#options.faultInjector?.hit("before-v2-integrity", v2.databasePath);
       if (pending !== undefined) await pending;

@@ -1,3 +1,4 @@
+// Historical parity differences compare schema1 against frozen schema2, never schema3.
 import { createHash } from "node:crypto";
 import { types as utilTypes } from "node:util";
 import { ShadowMigrationError } from "../migration/v2-shadow-migration.contracts.js";

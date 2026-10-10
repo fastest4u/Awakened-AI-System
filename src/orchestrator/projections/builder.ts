@@ -1,3 +1,6 @@
+import { canonicalJson } from "../serialization/canonical-json.js";
+import { openImmutableProjectionImage } from "./immutable-image.js";
+import { assertCapturedProjectionV3Image } from "./captured-image-v3.js";
 import { createHash, randomBytes } from "node:crypto";
 import {
   closeSync,
@@ -17,25 +20,25 @@ import { dirname, isAbsolute, join, normalize, resolve } from "node:path";
 import { fsyncDirectory, type DirectorySync } from "../identity/directory-durability.js";
 import type { SqliteConnection, SqliteDriver, SqliteParams } from "../storage/sqlite-driver.js";
 import {
-  PROJECTION_NAMES,
+  PROJECTION_NAMES, PROJECTION_NAMES_V3, type ProjectionNameV3,
   projectionCoreChecksum,
   type CanonicalProjectionRow,
   type ProjectionName,
 } from "./checksum.js";
-import type { ProjectionFoldState } from "./contracts.js";
-import type { ProjectionEventSnapshot } from "./event-reader.js";
+import { validateGovernedNoteProjectionRows, type ProjectionFoldState, type ProjectionFoldStateV3 } from "./contracts.js";
+import type { ProjectionEventSnapshot, ProjectionEventSnapshotV3 } from "./event-reader.js";
 import {
   LegacyProjectionFoldAccumulator,
-  ProjectionFoldAccumulator,
+  ProjectionFoldAccumulator, ProjectionFoldAccumulatorV3,
   type LegacyProjectionFoldState,
 } from "./folds.js";
 import {
   assertProjectionSidecarsAbsent,
   parseProjectionManifest,
-  parseProjectionManifestV2,
+  parseProjectionManifestV2, parseProjectionManifestV3,
   verifyProjectionPublicationPaths,
   type ProjectionManifestV1,
-  type ProjectionManifestV2,
+  type ProjectionManifestV2, type ProjectionManifestV3,
 } from "./manifest.js";
 import {
   captureProjectionDirectoryIdentity,
@@ -43,7 +46,7 @@ import {
 } from "./stable-directory.js";
 import {
   createProjectionSchema,
-  PROJECTION_SCHEMA_SQL_V1,
+  PROJECTION_SCHEMA_SQL_V1, PROJECTION_SCHEMA_SQL_V3,
   PROJECTION_SCHEMA_VERSION,
 } from "./schema.js";
 import { decodeProjectionEvent, decodeProjectionEventV1 } from "./source-event-codec.js";
@@ -63,6 +66,8 @@ export interface StagedProjectionGeneration {
   readonly temporaryDatabasePath: string;
   readonly directoryIdentity: ProjectionDirectoryIdentity;
 }
+
+export type StagedProjectionGenerationV3 = Omit<StagedProjectionGeneration, "manifest"> & { readonly manifest: ProjectionManifestV3 };
 
 /** @deprecated Use StagedProjectionGeneration; V2 files are never final at build time. */
 export type BuiltProjectionGenerationV2 = StagedProjectionGeneration;
@@ -141,7 +146,7 @@ function freezeRows(rows: CanonicalProjectionRow[]): readonly CanonicalProjectio
   return Object.freeze(rows.map((row) => Object.freeze(row)));
 }
 
-function rowsFromState(state: ProjectionFoldState): ProjectionRows {
+function rowsFromState(state: ProjectionFoldState | ProjectionFoldStateV3): ProjectionRows {
   return Object.freeze({
     sessionTree: freezeRows(state.sessionTree
       .map((row) => ({
@@ -560,6 +565,7 @@ function populate(
   createdAt: string,
   rows: ProjectionRows,
   coreChecksums: Readonly<Record<ProjectionName, string>>,
+  schemaVersion: 2 | 3 = 2,
 ): void {
   connection.exec("BEGIN IMMEDIATE");
   try {
@@ -576,7 +582,7 @@ function populate(
         terminal_event_position = $terminalEventPosition,
         terminal_event_hash = $terminalEventHash,
         created_at = $createdAt
-      WHERE singleton = 1 AND schema_version = 2
+      WHERE singleton = 1 AND schema_version = ${schemaVersion}
     `).run({
       $projectId: snapshot.binding.projectId,
       $vaultId: snapshot.binding.vaultId,
@@ -813,6 +819,38 @@ function foldV2(snapshot: ProjectionEventSnapshot): ProjectionFoldState {
   return accumulator.finish();
 }
 
+export function foldProjectionSnapshotV3(snapshot: ProjectionEventSnapshotV3, maxEvents = 100_000, maxBytes = 64 * 1024 * 1024): ProjectionFoldStateV3 {
+  if (!Number.isSafeInteger(maxEvents) || maxEvents < 0 || maxEvents > 100_000 || !Number.isSafeInteger(maxBytes) || maxBytes < 0 || maxBytes > 64 * 1024 * 1024
+    || typeof snapshot.dispositions !== "function" || !Number.isSafeInteger(snapshot.eventCount) || snapshot.eventCount < 0 || snapshot.eventCount > maxEvents
+    || !Number.isSafeInteger(snapshot.aggregateBytes) || snapshot.aggregateBytes < 0 || snapshot.aggregateBytes > maxBytes) return failure("INTEGRITY_FAILURE");
+  const accumulator = new ProjectionFoldAccumulatorV3();
+  let count = 0, bytes = 0;
+  for (const source of snapshot.dispositions()) {
+    if (++count > snapshot.eventCount) return failure("INTEGRITY_FAILURE");
+    const event = source.event;
+    if (["projectId", "vaultId", "storeId", "workspaceId", "branchScopeId", "branchRef"].some(key =>
+      event[key as keyof typeof event] !== snapshot.binding[key as keyof typeof snapshot.binding])) return failure("INTEGRITY_FAILURE");
+    let rowBytes = 0;
+    for (const key of ["globalPosition", "eventId", "projectId", "vaultId", "storeId", "workspaceId", "branchScopeId", "branchRef",
+      "streamId", "streamType", "streamVersion", "eventType", "eventSchemaVersion", "sessionId", "parentSessionId", "actorRole", "agentId",
+      "clientInstanceId", "correlationId", "causationId", "commandId", "idempotencyKey", "commandEventIndex", "occurredAt", "recordedAt",
+      "visibilityScope", "confidence", "verificationStatus", "sourceRefs", "evidenceRefs", "evidenceDigests", "payloadJson", "payloadHash",
+      "previousGlobalHash", "eventHash", "lifecycleIntentJson"] as const) {
+      const value = event[key];
+      rowBytes += ["sourceRefs", "evidenceRefs", "evidenceDigests"].includes(key)
+        ? Buffer.byteLength(canonicalJson(value), "utf8") : typeof value === "string" ? Buffer.byteLength(value, "utf8") : 8;
+    }
+    bytes += rowBytes;
+    if (rowBytes > 1024 * 1024 || bytes > snapshot.aggregateBytes || bytes > maxBytes) return failure("INTEGRITY_FAILURE");
+    accumulator.append(source);
+  }
+  // The reader authenticates the complete global prefix, then yields this scope only.
+  // Its terminal/count/byte attestations can exceed this filtered stream.
+  const state = accumulator.finish();
+  validateGovernedNoteProjectionRows(state.canonicalItems, state.governedNotes, snapshot.terminalEventPosition);
+  return state;
+}
+
 function foldLegacy(snapshot: ProjectionEventSnapshot): LegacyProjectionFoldState {
   const accumulator = new LegacyProjectionFoldAccumulator();
   for (const source of snapshot.events()) {
@@ -944,28 +982,39 @@ export class ImmutableProjectionBuilder {
   }
 
   async buildV2(snapshot: ProjectionEventSnapshot, generation: number): Promise<StagedProjectionGeneration> {
+    return this.#buildRich(snapshot, generation, 2) as Promise<StagedProjectionGeneration>;
+  }
+
+  async buildV3(snapshot: ProjectionEventSnapshotV3, generation: number): Promise<StagedProjectionGenerationV3> {
+    return this.#buildRich(snapshot, generation, 3) as Promise<StagedProjectionGenerationV3>;
+  }
+
+  async #buildRich(snapshot: ProjectionEventSnapshot, generation: number, profile: 2 | 3): Promise<Omit<StagedProjectionGeneration,"manifest"> & {manifest:ProjectionManifestV2 | ProjectionManifestV3}> {
     if (!Number.isSafeInteger(generation) || generation < 1 || generation > MAX_GENERATION) {
       return failure("PROJECTION_GENERATION_INVALID");
     }
     const directory = safeDirectory(this.#projectionDirectory, this.#syncDirectory);
-    const databaseFile = `projections-2-${generation}.sqlite`;
+    const databaseFile = `projections-${profile}-${generation}.sqlite`;
     const databasePath = join(directory, databaseFile);
     const tempPath = join(
       directory,
-      `.projections-2-${generation}-${randomBytes(16).toString("hex")}.sqlite.tmp`,
+      `.projections-${profile}-${generation}-${randomBytes(16).toString("hex")}.sqlite.tmp`,
     );
     if (existsSync(databasePath)) return failure("PROJECTION_GENERATION_EXISTS");
     assertProjectionSidecarsAbsent(databasePath);
     for (const knownTemp of [tempPath, `${tempPath}-wal`, `${tempPath}-shm`]) removeKnownFile(knownTemp);
 
-    const state = foldV2(snapshot);
-    const rows = rowsFromState(state);
+    const state = profile === 2 ? foldV2(snapshot) : foldProjectionSnapshotV3(snapshot as ProjectionEventSnapshotV3);
+    const coreRows = rowsFromState(state);
+    const rows = { ...coreRows, governedNotes: state.schemaVersion === 3 ? state.governedNotes : [] };
+    const names = profile === 2 ? PROJECTION_NAMES : PROJECTION_NAMES_V3;
+    if (profile === 3 && names.reduce((n, name) => n + Buffer.byteLength(canonicalJson(rows[name]), "utf8"), 0) > 32 * 1024 * 1024) return failure("PROJECTION_CHECKSUM_INVALID");
     const createdAt = this.#now();
-    const coreChecksums = {} as Record<ProjectionName, string>;
-    for (const name of PROJECTION_NAMES) {
+    const coreChecksums = {} as Record<ProjectionNameV3, string>;
+    for (const name of names) {
       coreChecksums[name] = projectionCoreChecksum(
         name,
-        PROJECTION_SCHEMA_VERSION,
+        profile,
         snapshot.binding.projectId,
         snapshot.terminalEventPosition,
         rows[name],
@@ -978,14 +1027,18 @@ export class ImmutableProjectionBuilder {
         mode: "create",
         busyTimeoutMs: this.#busyTimeoutMs,
       });
-      createProjectionSchema(connection);
-      populate(connection, snapshot, generation, createdAt, rows, coreChecksums);
+      if (profile === 2) createProjectionSchema(connection);
+      else connection.exec(PROJECTION_SCHEMA_SQL_V3);
+      populate(connection, snapshot, generation, createdAt, rows, coreChecksums, profile);
+      if (profile === 3) {
+        const insert = connection.prepare(`INSERT INTO governed_notes(project_id,item_id,record_kind,format,body,body_content_hash,source_event_position)
+          VALUES ($projectId,$itemId,$recordKind,$format,$body,$bodyContentHash,$sourceEventPosition)`);
+        for (const row of rows.governedNotes) insert.run({$projectId:row.projectId,$itemId:row.itemId,$recordKind:row.recordKind,
+          $format:row.format,$body:row.body,$bodyContentHash:row.bodyContentHash,$sourceEventPosition:BigInt(row.sourceEventPosition)});
+        connection.prepare("INSERT INTO projection_core_checksums VALUES ('governedNotes',$checksum)").run({$checksum:coreChecksums.governedNotes});
+      }
       verifyStructure(connection, snapshot, generation, rows);
-      const persistedCoreChecksums = verifyPersistedChecksums(
-        connection,
-        snapshot,
-        coreChecksums,
-      );
+      const persistedCoreChecksums = profile === 2 ? verifyPersistedChecksums(connection, snapshot, coreChecksums) : coreChecksums;
       const checkpoint = connection.prepare("PRAGMA wal_checkpoint(TRUNCATE)").get();
       if (checkpoint?.busy !== 0n) return failure("PROJECTION_CHECKPOINT_FAILED");
       const journalMode = connection.prepare("PRAGMA journal_mode=DELETE").get();
@@ -1004,8 +1057,8 @@ export class ImmutableProjectionBuilder {
       }
       assertProjectionSidecarsAbsent(tempPath);
       const directoryIdentity = captureProjectionDirectoryIdentity(directory);
-      const manifest = parseProjectionManifestV2({
-        schemaVersion: 2,
+      const manifest = (profile === 2 ? parseProjectionManifestV2 : parseProjectionManifestV3)({
+        schemaVersion: profile,
         projectId: snapshot.binding.projectId,
         vaultId: snapshot.binding.vaultId,
         storeId: snapshot.binding.storeId,
@@ -1022,6 +1075,11 @@ export class ImmutableProjectionBuilder {
         coreChecksums: persistedCoreChecksums,
         createdAt,
       }, snapshot.binding);
+      if (manifest.schemaVersion === 3) {
+        if (lstatSync(tempPath).size > 64 * 1024 * 1024) return failure("INTEGRITY_FAILURE");
+        const captured = openImmutableProjectionImage(readFileSync(tempPath));
+        try { assertCapturedProjectionV3Image(captured, manifest); } finally { captured.close(); }
+      }
       return Object.freeze({
         manifest,
         projectionDirectory: directory,

@@ -9,7 +9,7 @@ import { StoreManifestRepository } from "../identity/store-manifest.repository.j
 import { fsyncDirectory, createDirectoryDurably } from "../identity/directory-durability.js";
 import type { ProjectDescriptorV1, ProjectStoreRoute } from "../identity/contracts.js";
 import { ImmutableProjectionBuilder } from "../projections/builder.js";
-import { openCommittedProjectionEventSnapshot } from "../projections/event-reader.js";
+import { openCommittedProjectionEventSnapshot, SqliteProjectionEventReader, type ProjectionEventSnapshotV3 } from "../projections/event-reader.js";
 import { readVerifiedCanonicalProjectionSnapshot } from "../projections/integrity.js";
 import { parseRichProjectionManifest, type ProjectionManifestV2, type ProjectionManifestV3 } from "../projections/manifest.js";
 import type { ProjectBinding } from "../projections/contracts.js";
@@ -33,6 +33,7 @@ export type FreshStartInitializationBoundary = ProjectStoreBootstrapFaultBoundar
   | "after-projection-verified" | "after-receipt-installed" | "after-receipt-published";
 /** Trusted local composition only. Never decode these dependencies from MCP input or environment. */
 export interface FreshStartInitializerDependencies {
+  projectionSchemaVersion?: 2 | 3;
   inspectBuild?: () => string | Promise<string>;
   actorFingerprint?: string;
   faultInjector?: { hit(boundary: FreshStartInitializationBoundary): void | Promise<void> };
@@ -141,7 +142,7 @@ export class FreshStartInitializer {
     // mkdir is also exclusive: a concurrent contender cannot admit an existing administrative directory.
     try { mkdirSync(admin(paths)); fsyncDirectory(paths.v2VaultRoot); }
     catch (error) { if ((error as NodeJS.ErrnoException).code === "EEXIST") fail("FRESH_START_ALREADY_INITIALIZED"); throw error; }
-    const journal: Journal = { version: 1, phase: "reserved", paths, initializationId: input.initializationId,
+    const journal: Journal = { ...(this.dependencies.projectionSchemaVersion === 3 ? {version:2 as const, projectionSchemaVersion:3 as const} : {version:1 as const}), phase: "reserved", paths, initializationId: input.initializationId,
       identity, release, actorFingerprint: this.dependencies.actorFingerprint!, storeRoot: route.storeRoot,
       projection: null, foundationChecksDigest: null, receipt: null };
     publishJson(journalPath(paths), journal, true);
@@ -152,6 +153,8 @@ export class FreshStartInitializer {
     exact(input, ["projectRoot", "v2VaultRoot", "v1ArchiveRoot", "initializationId", "release"]);
     const paths = await assertFreshStartPaths(input);
     const journal = this.readJournal(paths);
+    if (this.dependencies.projectionSchemaVersion !== undefined
+      && this.dependencies.projectionSchemaVersion !== (journal.version === 2 ? 3 : 2)) fail("FRESH_START_JOURNAL_MISMATCH");
     const release = this.decodeInput(input, journal.identity);
     if (journal.initializationId !== input.initializationId || digest(journal.release) !== digest(release)
       || journal.actorFingerprint !== this.dependencies.actorFingerprint) fail("FRESH_START_JOURNAL_MISMATCH");
@@ -185,6 +188,7 @@ export class FreshStartInitializer {
 
   private async preflight(release: FreshStartRelease): Promise<void> {
     assertMinimumNodeVersion();
+    if (this.dependencies.projectionSchemaVersion !== undefined && this.dependencies.projectionSchemaVersion !== 2 && this.dependencies.projectionSchemaVersion !== 3) fail("FRESH_START_INPUT_INVALID");
     const inspectBuild = this.dependencies.inspectBuild;
     if (typeof inspectBuild !== "function" || typeof this.dependencies.actorFingerprint !== "string" || !HASH.test(this.dependencies.actorFingerprint)) return fail("FRESH_START_PREPARATION_REQUIRED");
     const measuredBuild = await inspectBuild();
@@ -233,9 +237,7 @@ export class FreshStartInitializer {
       if (fresh) await this.dependencies.faultInjector?.hit("after-journal-reserved");
       let { route, binding } = await this.recheck(journal.paths, journal);
       if (journal.phase === "receipt-published") return await this.openExisting(journal.paths);
-      // Decoding historical/future receipts does not grant schema3 construction authority.
-      // Task 6 supplies the matching builder, verification and trusted creation target.
-      if (journal.version === 2) fail("FRESH_START_RECOVERY_REQUIRED");
+      const target = journal.version === 2 ? 3 : 2;
       // Only exact owned files may be present; no generic nonempty-directory exception.
       const administrativeNames = ["fresh-start-init.json", "fresh-start-operation.lock", "project-identity.json",
         ...(route.kind === "vault-local" ? ["v2"] : [])];
@@ -246,7 +248,7 @@ export class FreshStartInitializer {
       ].includes(name))) fail("FRESH_START_DESTINATION_NOT_EMPTY");
       const ownedProjection = join(route.storeRoot, "fresh-start-projection");
       assertFreshStartOwnedDirectory(ownedProjection, journal.paths.v1ArchiveRoot);
-      if (existsSync(ownedProjection) && readdirSync(ownedProjection).some(name => name !== "projections-2-1.sqlite")) fail("FRESH_START_DESTINATION_NOT_EMPTY");
+      if (existsSync(ownedProjection) && readdirSync(ownedProjection).some(name => name !== `projections-${target}-1.sqlite`)) fail("FRESH_START_DESTINATION_NOT_EMPTY");
       if (journal.phase !== "reserved" && !existsSync(route.eventsPath)) fail("FRESH_START_RECOVERY_REQUIRED");
       const descriptors = new ProjectDescriptorRepository({ now: () => journal.release.createdAt,
         randomId: (() => { let index = 0; return () => index++ === 0 ? journal.identity.projectId : journal.identity.vaultId; })() });
@@ -295,29 +297,34 @@ export class FreshStartInitializer {
         const actualSchema = schemaFingerprint(connection);
         requireCurrentStoreSchema(inspectStoreSchema(connection, PROJECT_STORE_MIGRATIONS));
         if (actualSchema !== journal.release.schemaIdentityHash) fail("FRESH_START_RELEASE_MISMATCH");
-        const snapshot = openCommittedProjectionEventSnapshot(binding, { driver, eventStorePath: route.eventsPath });
+        const snapshot = target === 3
+          ? await new SqliteProjectionEventReader({ driver, eventStorePath: route.eventsPath }).openCommittedSnapshotV3(binding)
+          : openCommittedProjectionEventSnapshot(binding, { driver, eventStorePath: route.eventsPath });
         try {
           if (snapshot.eventCount !== 0 || snapshot.terminalEventPosition !== 0n || snapshot.terminalEventHash !== GENESIS_GLOBAL_HASH) fail("FRESH_START_DESTINATION_NOT_EMPTY");
           const projectionDirectory = join(route.storeRoot, "fresh-start-projection");
           assertFreshStartOwnedDirectory(projectionDirectory, journal.paths.v1ArchiveRoot);
           if (!journal.projection) {
-            const staged = await new ImmutableProjectionBuilder({ driver, projectionDirectory }).buildV2(snapshot, 1);
+            const builder = new ImmutableProjectionBuilder({ driver, projectionDirectory });
+            const staged = target === 3 ? await builder.buildV3(snapshot as ProjectionEventSnapshotV3, 1) : await builder.buildV2(snapshot, 1);
             await this.recheck(journal.paths, journal);
             linkSync(staged.temporaryDatabasePath, join(projectionDirectory, staged.manifest.databaseFile));
             unlinkSync(staged.temporaryDatabasePath); fsyncDirectory(projectionDirectory);
             journal.projection = staged.manifest;
           }
-          const verificationSource = openCommittedProjectionEventSnapshot(binding, { driver, eventStorePath: route.eventsPath });
+          const verificationSource = target === 3
+            ? await new SqliteProjectionEventReader({driver,eventStorePath:route.eventsPath}).openCommittedSnapshotV3(binding)
+            : openCommittedProjectionEventSnapshot(binding, { driver, eventStorePath: route.eventsPath });
           const verified = (() => {
             try { return readVerifiedCanonicalProjectionSnapshot(binding, journal.projection, { driver,
               eventStorePath: route.eventsPath, projectionDirectory, sourceSnapshot: verificationSource }); }
             finally { verificationSource.close(); }
           })();
-          if (verified.schemaVersion !== 2 || Object.values(verified.rows).some(rows => rows.length !== 0)) fail("FRESH_START_RECOVERY_REQUIRED");
+          if (verified.schemaVersion !== target || Object.values(verified.rows).some(rows => rows.length !== 0)) fail("FRESH_START_RECOVERY_REQUIRED");
           journal.foundationChecksDigest = digest({ kind: "fresh-start-foundation-preflight-v1", paths: journal.paths,
             runtime: process.version, buildIdentityHash: journal.release.buildIdentityHash, schemaIdentityHash: actualSchema,
             semanticPosition: "0", terminalHash: snapshot.terminalEventHash, projection: journal.projection });
-          journal.receipt = decodeFreshStartGenesis({ ...journal.identity, initializationId: journal.initializationId,
+          journal.receipt = decodeFreshStartGenesis({ ...(target === 3 ? {genesisVersion:2,projectionSchemaVersion:3} : {}), ...journal.identity, initializationId: journal.initializationId,
             releaseId: journal.release.releaseId, semanticPosition: "0", terminalHash: snapshot.terminalEventHash,
             projectionChecksums: verified.coreChecksums, actorFingerprint: journal.actorFingerprint,
             preparationIntentDigest: digest({ action: "prepare-fresh-start-v1", initializationId: journal.initializationId,

@@ -79,6 +79,7 @@ function createSource(path: string): DatabaseSync {
     INSERT INTO project_meta VALUES (
       1, '${PROJECT_ID}', '${VAULT_ID}', '${STORE_ID}'
     );
+    CREATE TABLE command_dedup(project_id TEXT, command_id TEXT, idempotency_key TEXT, command_type TEXT) STRICT;
     CREATE TABLE events(
       global_position INTEGER PRIMARY KEY,
       event_id TEXT NOT NULL,

@@ -82,7 +82,7 @@ export async function runV2Admin(argv: readonly string[]): Promise<FreshStartSta
     process.stderr.write(`Resolved V2 destination: ${JSON.stringify(paths.v2VaultRoot)}\n`);
     const actor = userInfo();
     const actorFingerprint = createHash("sha256").update(JSON.stringify({ host: hostname(), username: actor.username, uid: actor.uid })).digest("hex");
-    const initializer = new FreshStartInitializer({ inspectBuild: () => inspectV2Build(), actorFingerprint });
+    const initializer = new FreshStartInitializer({ projectionSchemaVersion: 3, inspectBuild: () => inspectV2Build(), actorFingerprint });
     const preparation = { ...paths, ...manifest };
     if (command === "initialize-fresh") await initializer.initializeFresh(preparation);
     else await initializer.resumeInitialization(preparation);

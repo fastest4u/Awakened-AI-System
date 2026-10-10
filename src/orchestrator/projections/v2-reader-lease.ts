@@ -1,9 +1,12 @@
+import type { ProjectBinding } from "./contracts.js";
 import { createHash } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 
 import { LifecycleError } from "../lifecycle/errors.js";
 import { openImmutableProjectionImage } from "./immutable-image.js";
-import type { ProjectionManifestV2 } from "./manifest.js";
+import { parseRichProjectionManifest, type ProjectionManifestV2, type ProjectionManifestV3 } from "./manifest-codec.js";
+import { assertCapturedProjectionV3Image } from "./captured-image-v3.js";
+type RichManifest = ProjectionManifestV2 | ProjectionManifestV3;
 import type {
   StableProjectionGenerationImage,
   StableProjectionGenerationIdentity,
@@ -16,13 +19,13 @@ export interface VerifiedV2ProjectionImage {
 }
 
 export interface V2ProjectionReaderLease {
-  readonly manifest: ProjectionManifestV2;
+  readonly manifest: RichManifest;
   readonly database: DatabaseSync;
   close(): void;
 }
 
 export interface LeasableV2ProjectionGeneration {
-  readonly manifest: ProjectionManifestV2;
+  readonly manifest: RichManifest;
   readonly image: StableProjectionGenerationImage;
 }
 
@@ -39,25 +42,8 @@ function integrity(): never {
   throw new LifecycleError("INTEGRITY_FAILURE");
 }
 
-function snapshotManifest(manifest: ProjectionManifestV2): ProjectionManifestV2 {
-  return Object.freeze({
-    schemaVersion: manifest.schemaVersion,
-    projectId: manifest.projectId,
-    vaultId: manifest.vaultId,
-    storeId: manifest.storeId,
-    workspaceId: manifest.workspaceId,
-    branchScopeId: manifest.branchScopeId,
-    branchRef: manifest.branchRef,
-    sessionId: manifest.sessionId,
-    generation: manifest.generation,
-    highestObservedGeneration: manifest.highestObservedGeneration,
-    terminalEventPosition: manifest.terminalEventPosition,
-    terminalEventHash: manifest.terminalEventHash,
-    databaseFile: manifest.databaseFile,
-    databaseSha256: manifest.databaseSha256,
-    coreChecksums: Object.freeze({ ...manifest.coreChecksums }),
-    createdAt: manifest.createdAt,
-  });
+function snapshotManifest(manifest: RichManifest): RichManifest {
+  return parseRichProjectionManifest(manifest, Object.fromEntries(["projectId", "vaultId", "storeId", "workspaceId", "branchScopeId", "branchRef", "sessionId"].map(key => [key, Object.getOwnPropertyDescriptor(manifest, key)?.value])) as unknown as ProjectBinding);
 }
 
 function snapshotImageIdentity(
@@ -82,7 +68,7 @@ function snapshotImage(image: StableProjectionGenerationImage): StableProjection
 function openVerifiedV2ProjectionImageSnapshot(
   identity: StableProjectionGenerationIdentity,
   bytes: Uint8Array,
-  manifest: ProjectionManifestV2,
+  manifest: RichManifest,
   busyTimeoutMs?: number,
 ): VerifiedV2ProjectionImage {
   let database: DatabaseSync | undefined;
@@ -93,6 +79,7 @@ function openVerifiedV2ProjectionImageSnapshot(
       || createHash("sha256").update(bytes).digest("hex") !== manifest.databaseSha256
     ) return integrity();
     database = openImmutableProjectionImage(bytes, busyTimeoutMs);
+    if (manifest.schemaVersion === 3) assertCapturedProjectionV3Image(database, manifest);
     const openedDatabase = database;
     let closed = false;
     return Object.freeze({
@@ -113,11 +100,12 @@ function openVerifiedV2ProjectionImageSnapshot(
 /** Opens a verified detached V2 generation image without retaining a pathname. */
 export function openVerifiedV2ProjectionImage(
   image: StableProjectionGenerationImage,
-  manifest: ProjectionManifestV2,
+  manifest: RichManifest,
   busyTimeoutMs?: number,
 ): VerifiedV2ProjectionImage {
   try {
     const identity = snapshotImageIdentity(image.identity);
+    if (manifest.schemaVersion === 3 && image.bytes.byteLength > 64 * 1024 * 1024) return integrity();
     const bytes = Uint8Array.from(image.bytes);
     return openVerifiedV2ProjectionImageSnapshot(
       identity,
@@ -134,10 +122,11 @@ export class V2ProjectionReaderLeaseRegistry {
   readonly #activeFilenames = new Map<string, number>();
 
   acquire(generation: LeasableV2ProjectionGeneration): V2ProjectionReaderLease {
-    let manifest: ProjectionManifestV2;
+    let manifest: RichManifest;
     let stableImage: StableProjectionGenerationImage;
     try {
       manifest = snapshotManifest(generation.manifest);
+      if (manifest.schemaVersion === 3 && generation.image.bytes.byteLength > 64 * 1024 * 1024) return integrity();
       stableImage = snapshotImage(generation.image);
     } catch {
       return integrity();

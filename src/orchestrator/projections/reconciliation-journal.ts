@@ -1,3 +1,4 @@
+// The historical V2 journal namespace owns one generation floor for rich profiles 2 and 3.
 import {
   filesystemStableProjectionDirectoryOperations,
   type ProjectionDirectoryIdentity,
