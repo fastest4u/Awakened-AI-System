@@ -22,6 +22,8 @@ import {
   type ValidatedInternalRetrievalRequest,
 } from "./contracts.js";
 import { isEligible } from "./eligibility.js";
+import type { GovernedNoteProjectionRowV1 } from "../projections/contracts.js";
+import { assertMarkdownNoteBodyV1, governedNoteBodyHash } from "../governed-notes/body-content.js";
 
 type SqliteParameter = null | number | bigint | string | Uint8Array;
 type Row = Record<string, unknown>;
@@ -951,6 +953,44 @@ export function getCanonicalFromProjectionDatabase(
       if (eligibleConflictMemberCount < 1) return projectionInvalid();
     }
     return Object.freeze({ item, eligibleConflictMemberCount });
+  } catch (error) {
+    if (error instanceof InternalRetrievalError) throw error;
+    return projectionInvalid();
+  }
+}
+
+/** One parameterized primary-key lookup on the caller's same captured schema3 image.
+ * The caller must additionally validate this row against the selected private canonical marker/key. */
+export function getGovernedNoteFromProjectionDatabase(
+  database: DatabaseSync, manifest: ProjectionManifestV3, projectId: string, itemId: string,
+): GovernedNoteProjectionRowV1 | null {
+  try {
+    if (manifest.schemaVersion !== 3) return projectionInvalid();
+    verifyMetadata(database, manifest);
+    const rows = preparedRows(database, `
+      SELECT project_id, item_id, record_kind, format, body, body_content_hash, source_event_position
+      FROM governed_notes
+      WHERE project_id = $projectId COLLATE BINARY AND item_id = $itemId COLLATE BINARY
+      LIMIT 1
+    `, { $projectId: projectId, $itemId: itemId });
+    if (rows.length === 0) return null;
+    if (rows.length !== 1) return projectionInvalid();
+    const source = rows[0]!, recordKind = stringValue(source, "record_kind"), format = nullableString(source, "format");
+    const body = nullableString(source, "body"), bodyContentHash = nullableString(source, "body_content_hash");
+    const position = bigintValue(source, "source_event_position");
+    if (stringValue(source, "project_id") !== projectId || stringValue(source, "item_id") !== itemId
+      || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u.test(itemId)
+      || !["session-log", "insight", "mistake", "adr"].includes(recordKind)
+      || position < 1n || position > BigInt(manifest.terminalEventPosition)) return projectionInvalid();
+    if (format === null) {
+      if (body !== null || bodyContentHash !== null) return projectionInvalid();
+    } else {
+      if (format !== "markdown" || bodyContentHash === null) return projectionInvalid();
+      assertMarkdownNoteBodyV1(body);
+      if (governedNoteBodyHash({ format, body }) !== bodyContentHash) return projectionInvalid();
+    }
+    return Object.freeze({ projectId, itemId, recordKind, format, body, bodyContentHash,
+      sourceEventPosition: position.toString() }) as GovernedNoteProjectionRowV1;
   } catch (error) {
     if (error instanceof InternalRetrievalError) throw error;
     return projectionInvalid();
