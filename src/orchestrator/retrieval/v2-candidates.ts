@@ -1,4 +1,4 @@
-import { parseProjectionManifestV2 } from "../projections/manifest-codec.js";
+import { parseRichProjectionManifest } from "../projections/manifest-codec.js";
 import type { V2ProjectionReaderLease } from "../projections/v2-reader-lease.js";
 import { collectEligibleFromProjectionDatabase } from "./database-core.js";
 import {
@@ -13,7 +13,7 @@ export class V2SqliteRetrievalCandidateRepository {
     input: InternalRetrievalRequest,
   ): RetrievalCandidateCollection {
     try {
-      const manifest = parseProjectionManifestV2(lease.manifest, input.binding);
+      const manifest = parseRichProjectionManifest(lease.manifest, input.binding);
       return collectEligibleFromProjectionDatabase(lease.database, manifest, input);
     } catch (error) {
       if (error instanceof InternalRetrievalError) throw error;

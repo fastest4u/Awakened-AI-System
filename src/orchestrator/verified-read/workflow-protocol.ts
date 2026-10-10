@@ -127,7 +127,7 @@ export function assertNativeWorkflowMatchesRequest(content: NativeWorkflowResult
   if (result.operation !== "build-context-pack" && items.length > ((parameters as NativePageParameters).limit ?? 5)) invalid();
   if (result.operation !== "build-context-pack" && result.nextCursor !== null) {
     const cursor = decodeWorkflowCursor(result.nextCursor);
-    assertWorkflowCursorMatches(cursor, { version: 1, operation: result.operation, schemaVersion: 2,
+    assertWorkflowCursorMatches(cursor, { version: 1, operation: result.operation, schemaVersion: cursor.schemaVersion,
       selectionHash: createWorkflowSelectionHash(result.operation, binding, expected as NativeSelectionScope, parameters),
       projectionGeneration: receipt.projectionGeneration, projectionEventPosition: receipt.projectionEventPosition, imageSha256: receipt.imageSha256 });
     const last = items.at(-1);

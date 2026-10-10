@@ -1,5 +1,5 @@
 import type { DatabaseSync } from "node:sqlite";
-import type { ProjectionManifestV2 } from "../projections/manifest-codec.js";
+import type { ProjectionManifestV2, ProjectionManifestV3 } from "../projections/manifest-codec.js";
 import {
   InternalRetrievalError,
   type RetrievalConflictGroup, type RetrievalEligibilityContext,
@@ -32,11 +32,11 @@ function fail(code: "INTEGRITY_FAILURE" | "PROJECTION_SCOPE_MISMATCH" | "WORKER_
   throw Object.assign(new Error(code), { code });
 }
 
-/** Pure query/selection on the caller's already captured, verified schema-2 image.
+/** Pure query/selection on the caller's already captured, verified schema-2 or schema-3 image.
  * Candidates are private and remain unaccepted until the read owner revalidates/closes. */
 export function queryNativeContent(
   database: DatabaseSync,
-  manifest: ProjectionManifestV2,
+  manifest: ProjectionManifestV2 | ProjectionManifestV3,
   context: NativeQueryContext,
 ): NativeQueryCandidate {
   const started = performance.now();
@@ -56,7 +56,7 @@ export function queryNativeContent(
   const checkDeadline = () => { if (performance.now() >= deadline) fail("WORKER_TIMEOUT"); };
   try {
     if (!Number.isSafeInteger(context.remainingMs) || context.remainingMs < 0
-      || context.remainingMs > request.budgetMs || manifest.schemaVersion !== 2) return fail("INTEGRITY_FAILURE");
+      || context.remainingMs > request.budgetMs || (manifest.schemaVersion !== 2 && manifest.schemaVersion !== 3)) return fail("INTEGRITY_FAILURE");
     checkDeadline();
     const binding = context.binding.projectionBinding;
     const receipt = decodeVerifiedReadReceipt(context.receipt);

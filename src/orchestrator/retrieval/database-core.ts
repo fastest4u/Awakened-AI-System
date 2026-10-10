@@ -4,7 +4,7 @@ import type { DatabaseSync } from "node:sqlite";
 import type { Confidence } from "../contracts/event.js";
 import type { ProjectId } from "../identity/contracts.js";
 import type { ProjectionItemStatus } from "../projections/contracts.js";
-import type { ProjectionManifestV1, ProjectionManifestV2 } from "../projections/manifest-codec.js";
+import type { ProjectionManifestV1, ProjectionManifestV2, ProjectionManifestV3 } from "../projections/manifest-codec.js";
 import { ProjectionImageMetadataError, readProjectionImageMetadata } from "../projections/image-metadata.js";
 import {
   InternalRetrievalError,
@@ -25,7 +25,8 @@ import { isEligible } from "./eligibility.js";
 
 type SqliteParameter = null | number | bigint | string | Uint8Array;
 type Row = Record<string, unknown>;
-export type RetrievalProjectionManifest = ProjectionManifestV1 | ProjectionManifestV2;
+type RichProjectionManifest = ProjectionManifestV2 | ProjectionManifestV3;
+export type RetrievalProjectionManifest = ProjectionManifestV1 | RichProjectionManifest;
 
 interface ChannelSelection {
   readonly items: readonly RetrievalItem[];
@@ -384,7 +385,7 @@ function aliasSelection(
   request: ValidatedInternalRetrievalRequest,
   parameters: Readonly<Record<string, SqliteParameter>>,
 ): ChannelSelection {
-  if (manifest.schemaVersion === 2) {
+  if (manifest.schemaVersion === 2 || manifest.schemaVersion === 3) {
     return Object.freeze({ items: Object.freeze([]), dropped: 0, overflow: false });
   }
   const rows = preparedRows(database, `
@@ -530,7 +531,7 @@ function checkpointSelection(
   request: ValidatedInternalRetrievalRequest,
   parameters: Readonly<Record<string, SqliteParameter>>,
 ): ChannelSelection {
-  const rows = manifest.schemaVersion === 2
+  const rows = manifest.schemaVersion === 2 || manifest.schemaVersion === 3
     ? preparedRows(database, `
     SELECT project_id, session_id, checkpoint_id, task_summary, source_event_position,
            'high' AS confidence
@@ -915,10 +916,11 @@ export type CanonicalLookup = Readonly<{
 /** Exact, case-sensitive ID lookup. Never interprets an ID as a search key. */
 export function getCanonicalFromProjectionDatabase(
   database: DatabaseSync,
-  manifest: ProjectionManifestV2,
+  manifest: RichProjectionManifest,
   context: CanonicalLookupContext,
 ): CanonicalLookup {
   try {
+    if (manifest.schemaVersion !== 2 && manifest.schemaVersion !== 3) return projectionInvalid();
     verifyMetadata(database, manifest);
     const terminalPosition = BigInt(manifest.terminalEventPosition);
     const parameters = { ...eligibilityParameters(context, terminalPosition), $id: context.id };
@@ -965,8 +967,8 @@ function pageScalar(value: unknown): value is string {
     && !/[\u0000-\u001f\u007f]/u.test(value)
     && [...value].every(character => { const point = character.codePointAt(0)!; return point < 0xd800 || point > 0xdfff; });
 }
-function verifyPageContext(database: DatabaseSync, manifest: ProjectionManifestV2, context: ProjectionPageContext, byPosition: boolean): bigint {
-  if (manifest.schemaVersion !== 2) return projectionInvalid();
+function verifyPageContext(database: DatabaseSync, manifest: RichProjectionManifest, context: ProjectionPageContext, byPosition: boolean): bigint {
+  if (manifest.schemaVersion !== 2 && manifest.schemaVersion !== 3) return projectionInvalid();
   verifyMetadata(database,manifest);
   const terminal = BigInt(manifest.terminalEventPosition);
   if (terminal < 0n || terminal > PAGE_MAX_POSITION) return projectionInvalid();
@@ -986,7 +988,7 @@ function verifyPageItem(item: RetrievalItem, terminal: bigint, context: Retrieva
     || item.sourceEventPosition > PAGE_MAX_POSITION || !isEligible(item,context,context.binding)) return projectionInvalid();
 }
 /** SQL applies scope/time eligibility before the fixed keyset and limit-plus-one lookahead. */
-export function collectCanonicalPageFromProjectionDatabase(database: DatabaseSync, manifest: ProjectionManifestV2,
+export function collectCanonicalPageFromProjectionDatabase(database: DatabaseSync, manifest: RichProjectionManifest,
   context: ProjectionPageContext & Readonly<{ order: "id" | "event" }>): ProjectionCanonicalPage {
   try {
     if (context.order !== "id" && context.order !== "event") throw new InternalRetrievalError("RETRIEVAL_REQUEST_INVALID");
@@ -1020,7 +1022,7 @@ export function collectCanonicalPageFromProjectionDatabase(database: DatabaseSyn
   } catch(error) { if (error instanceof InternalRetrievalError) throw error; return projectionInvalid(); }
 }
 /** Query-free supplementation/radar; a null session still prepares the complete table contract. */
-export function collectFollowUpPageFromProjectionDatabase(database: DatabaseSync, manifest: ProjectionManifestV2,
+export function collectFollowUpPageFromProjectionDatabase(database: DatabaseSync, manifest: RichProjectionManifest,
   context: ProjectionPageContext): ProjectionFollowUpPage {
   try {
     const terminal=verifyPageContext(database,manifest,context,true);

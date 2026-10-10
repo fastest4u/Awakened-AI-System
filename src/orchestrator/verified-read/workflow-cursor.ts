@@ -20,7 +20,7 @@ function cursorData(value: unknown): NativeWorkflowCursor {
   if (Buffer.byteLength(canonicalJson(data), "utf8") > 2048) invalid();
   const source = data as Record<string, unknown>;
   if (Object.keys(source).length !== KEYS.length || KEYS.some(key => !Object.hasOwn(source, key))) invalid();
-  if (source.version !== 1 || source.schemaVersion !== 2
+  if (source.version !== 1 || (source.schemaVersion !== 2 && source.schemaVersion !== 3)
     || !["list-canonical-records", "recent-canonical-records", "follow-up-radar"].includes(source.operation as string)
     || typeof source.selectionHash !== "string" || !/^[0-9a-f]{64}$/u.test(source.selectionHash)
     || typeof source.imageSha256 !== "string" || !/^[0-9a-f]{64}$/u.test(source.imageSha256)

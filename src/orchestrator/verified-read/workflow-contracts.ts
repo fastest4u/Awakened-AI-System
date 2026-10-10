@@ -9,7 +9,7 @@ export type RecentCanonicalRecordsRequest = ContentReadBase & Readonly<{ operati
 export type FollowUpRadarRequest = ContentReadBase & Readonly<{ operation: "follow-up-radar"; parameters: NativePageParameters }>;
 export type BuildContextPackRequest = ContentReadBase & Readonly<{ operation: "build-context-pack"; parameters: NativeContentFilters & Readonly<{ query: string }> }>;
 export type NativeWorkflowRequest = ListCanonicalRecordsRequest | RecentCanonicalRecordsRequest | FollowUpRadarRequest | BuildContextPackRequest;
-export type NativeWorkflowCursor = Readonly<{ version: 1; operation: NativePagedOperation; selectionHash: string; schemaVersion: 2;
+export type NativeWorkflowCursor = Readonly<{ version: 1; operation: NativePagedOperation; selectionHash: string; schemaVersion: 2 | 3;
   projectionGeneration: number; projectionEventPosition: string; imageSha256: string; lastId: string; lastEventPosition: string | null }>;
 export type WorkflowCursorBinding = Readonly<Omit<NativeWorkflowCursor, "lastId" | "lastEventPosition">>;
 export type NativeCanonicalPageEntry = Readonly<{ item: NativeContentItem; conflict: NativeGetConflict | null }>;

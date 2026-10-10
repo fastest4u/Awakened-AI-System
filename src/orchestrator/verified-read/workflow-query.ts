@@ -1,5 +1,5 @@
 import type { DatabaseSync } from "node:sqlite";
-import type { ProjectionManifestV2 } from "../projections/manifest-codec.js";
+import type { ProjectionManifestV2, ProjectionManifestV3 } from "../projections/manifest-codec.js";
 import type { RetrievalEligibilityContext } from "../retrieval/contracts.js";
 import { collectCanonicalPageFromProjectionDatabase, collectFollowUpPageFromProjectionDatabase,
   type ProjectionCanonicalPage, type ProjectionFollowUpPage, type ProjectionPageKey } from "../retrieval/database-core.js";
@@ -15,9 +15,10 @@ export type NativeWorkflowCandidate =
   | Readonly<{ operation: "follow-up-radar"; selectionScope: NativeSelectionScope; cursorBinding: WorkflowCursorBinding; page: ProjectionFollowUpPage }>
   | Readonly<{ operation: "build-context-pack"; selectionScope: NativeSelectionScope; ranked: NativeRankedQuery; followUps: ProjectionFollowUpPage }>;
 /** Only database primitives: no pathname, parent query, provider, or image lease. */
-export function queryNativeWorkflow(database: DatabaseSync, manifest: ProjectionManifestV2, context: NativeWorkflowQueryContext): NativeWorkflowCandidate {
+export function queryNativeWorkflow(database: DatabaseSync, manifest: ProjectionManifestV2 | ProjectionManifestV3, context: NativeWorkflowQueryContext): NativeWorkflowCandidate {
   const deadline=performance.now()+context.remainingMs;
   const checkDeadline=()=>{if(performance.now()>=deadline)throw Object.assign(new Error("WORKER_TIMEOUT"),{code:"WORKER_TIMEOUT"});};
+  if(manifest.schemaVersion!==2&&manifest.schemaVersion!==3)throw Object.assign(new Error("INTEGRITY_FAILURE"),{code:"INTEGRITY_FAILURE"});
   checkDeadline();
   const {request,selectionScope,eligibility}=context;
   if(request.operation==="build-context-pack") {
@@ -30,7 +31,7 @@ export function queryNativeWorkflow(database: DatabaseSync, manifest: Projection
   }
   const cursorBinding:WorkflowCursorBinding=Object.freeze({version:1,operation:request.operation,
     selectionHash:createWorkflowSelectionHash(request.operation,context.binding,selectionScope,request.parameters),
-    schemaVersion:2,projectionGeneration:manifest.generation,projectionEventPosition:manifest.terminalEventPosition,imageSha256:manifest.databaseSha256});
+    schemaVersion:manifest.schemaVersion,projectionGeneration:manifest.generation,projectionEventPosition:manifest.terminalEventPosition,imageSha256:manifest.databaseSha256});
   let after:ProjectionPageKey|null=null;
   if(request.parameters.cursor!==undefined) {
     const cursor=decodeWorkflowCursor(request.parameters.cursor);
