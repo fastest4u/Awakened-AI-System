@@ -1,4 +1,5 @@
 import type { NativeCanonicalPageResult, NativeRadarResult, NativeContextResult } from "./workflow-contracts.js";
+import type { GetFullNoteRequest, NativeFullNoteResultV1, FullNoteVerifiedReadReceiptV1, FullNoteReadSuccessBaseV1 } from "./full-note-contracts.js";
 import type { FreshStartRelease } from "../fresh-start/contracts.js";
 import type { ProjectBinding } from "../projections/contracts.js";
 import type { ProjectionDirectoryIdentity } from "../projections/stable-directory.js";
@@ -82,6 +83,15 @@ export type ReadReply =
   | Readonly<{ version: 3; ids: ReadMessageIds; kind: "failure"; failure: VerifiedReadFailure }>;
 export type ReadTerminalReply = Extract<ReadReply, { kind: "success" | "failure" }>;
 export type ReadCancel = Readonly<{ version: 3; ids: ReadMessageIds; kind: "cancel" }>;
+export type FullNoteReadBootstrapV1 = Readonly<{ version: 4; ids: ReadMessageIds; binding: VerifiedReadBinding;
+  request: GetFullNoteRequest; lockToken: string; remainingMs: number }>;
+export type FullNoteReadCancelV1 = Readonly<{ version: 4; ids: ReadMessageIds; kind: "cancel" }>;
+export type FullNoteReadReplyV1 =
+  | Readonly<{ version: 4; ids: ReadMessageIds; kind: "stage"; phase: ReadPhase; observedProjectionPosition: string | null }>
+  | (FullNoteReadSuccessBaseV1 & Readonly<{ content: NativeFullNoteResultV1 }>)
+  | Readonly<{ version: 4; ids: ReadMessageIds; kind: "failure"; failure: VerifiedReadFailure }>;
+export type FullNoteReadTerminalReplyV1 = Extract<FullNoteReadReplyV1, { kind: "success" | "failure" }>;
+export type VerifiedFullNoteReadResultV1 = Readonly<{ receipt: FullNoteVerifiedReadReceiptV1; content: NativeFullNoteResultV1 }>;
 export type CleanupBootstrap = Readonly<{
   version: 1; ids: ReadMessageIds; directory: ProjectionDirectoryIdentity;
   lockToken: string; expectedBuildHash: string; remainingMs: number;

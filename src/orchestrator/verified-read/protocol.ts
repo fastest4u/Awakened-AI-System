@@ -1,4 +1,5 @@
 import { decodeFreshStartRelease, FreshStartError } from "../fresh-start/contracts.js";
+import { types } from "node:util";
 import { isProjectionProjectStoreIdentity, type ProjectBinding } from "../projections/contracts.js";
 import type { ProjectionDirectoryIdentity } from "../projections/stable-directory.js";
 import { copyBoundedProtocolData as bounded, encodedProtocolBytes } from "./wire-data.js";
@@ -23,6 +24,45 @@ const CODES: readonly VerifiedReadFailureCode[] = [
   "WORKER_PROTOCOL_ERROR", "WORKER_UNAVAILABLE", "V2_CONTENT_RESULT_TOO_LARGE", "V2_CONTENT_CURSOR_STALE",
 ];
 function invalid(): never { throw new FreshStartError("FRESH_START_INPUT_INVALID"); }
+
+/** Shallow descriptor-only admission. Never walks an item or body to select a transport budget. */
+function envelopeRecord(value: unknown): Record<string, unknown> {
+  if (!value || typeof value !== "object" || types.isProxy(value) || Array.isArray(value)) invalid();
+  const prototype: unknown = Object.getPrototypeOf(value);
+  if (prototype !== null && prototype !== Object.prototype) invalid();
+  const keys = Reflect.ownKeys(value);
+  if (keys.length > 32 || keys.some(key => typeof key !== "string")) invalid();
+  const owned: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
+  for (const key of keys as string[]) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (!descriptor?.enumerable || !("value" in descriptor)) invalid();
+    owned[key] = descriptor.value;
+  }
+  return owned;
+}
+export function readEnvelopeVersion(value: unknown): unknown { return envelopeRecord(value).version; }
+/** A retained family and, at an owner boundary, its exact IDs authorize subsequent copying. */
+export function assertReadReplyEnvelope(value: unknown, expectedVersion: 3 | 4, expectedIds?: ReadMessageIds): void {
+  const source = envelopeRecord(value);
+  if (source.version !== expectedVersion) invalid();
+  const identity = ids(envelopeRecord(source.ids));
+  if (expectedIds && (identity.requestId !== expectedIds.requestId || identity.attemptId !== expectedIds.attemptId || identity.laneEpoch !== expectedIds.laneEpoch)) invalid();
+  if (source.kind === "stage") { record(source, ["version", "ids", "kind", "phase", "observedProjectionPosition"]); return; }
+  if (source.kind === "failure") { record(source, ["version", "ids", "kind", "failure"]); return; }
+  if (source.kind !== "success") invalid();
+  const receipt = envelopeRecord(source.receipt);
+  const operation = receipt.operation;
+  record(source, expectedVersion === 3 && operation === "verify-published-view"
+    ? ["version", "ids", "kind", "receipt", "fence", "closed"] : ["version", "ids", "kind", "receipt", "fence", "closed", "content"]);
+  if (expectedVersion === 4) {
+    if (operation !== "get-full-note" || receipt.projectionSchemaVersion !== 3) invalid();
+    const content = record(envelopeRecord(source.content), ["operation", "noteBoundsVersion", "selectionScope", "item", "conflict"]);
+    if (content.operation !== "get-full-note" || content.noteBoundsVersion !== "v2-full-note-bounds-1") invalid();
+  } else {
+    if (!["verify-published-view", "search-projected-content", "get-canonical-record", "list-canonical-records", "recent-canonical-records", "follow-up-radar", "build-context-pack"].includes(operation as string)) invalid();
+    if (operation !== "verify-published-view" && envelopeRecord(source.content).operation !== operation) invalid();
+  }
+}
 
 function record(value: unknown, keys: readonly string[]): Record<string, unknown> {
   if (typeof value !== "object" || value === null || Array.isArray(value)) invalid();

@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import { createCwdProjectionReadCore } from "../projections/stable-directory-read-core.js";
-import { parseProjectionManifestV2, type ProjectionManifestV2 } from "../projections/manifest-codec.js";
+import { parseRichProjectionManifest, type ProjectionManifestV2, type ProjectionManifestV3 } from "../projections/manifest-codec.js";
 import { openImmutableProjectionImage } from "../projections/immutable-image.js";
 import { readProjectionImageMetadata } from "../projections/image-metadata.js";
 import { assertBoundSqliteConnectionIdentity, NodeSqliteDriver } from "../storage/node-sqlite-driver.js";
@@ -9,8 +9,15 @@ import type { SqliteConnection } from "../storage/sqlite-driver.js";
 import { SqliteVerifiedReadAdmission } from "./admission.js";
 import type { ReadBootstrap, ReadPhase, ReadReply, ReadSuccessBase, ReadTerminalReply, VerifiedReadReceipt } from "./contracts.js";
 import { decodeReadBootstrap, decodeReadReply, decodeVerifiedReadReceipt, verifiedReadFailure } from "./protocol.js";
+import { assertCapturedProjectionV3Image } from "../projections/captured-image-v3.js";
+import type { FullNoteReadBootstrapV1, FullNoteReadReplyV1, FullNoteReadTerminalReplyV1 } from "./contracts.js";
+import { decodeFullNoteReadBootstrap, decodeFullNoteReadReply, decodeFullNoteVerifiedReadReceipt } from "./full-note-protocol.js";
+import { queryNativeFullNote } from "./full-note-query.js";
+import { buildNativeFullNoteResult } from "./full-note-result.js";
+import type { FullNoteReadSuccessBaseV1 } from "./full-note-contracts.js";
 import { queryNativeContent } from "./content-query.js";
 import { buildNativeContentResult } from "./content-result.js";
+import type { NativeContentResult } from "./content-contracts.js";
 
 /** Fixed owner closures only. Never transported in bootstrap, argv or environment. */
 export interface VerifiedReadChildDependencies {
@@ -22,10 +29,31 @@ export interface VerifiedReadChildDependencies {
 }
 function fail(code: string): never { throw new Error(code); }
 
-/** Reads the already published verified image; never builds or repairs publication. */
+export interface FullNoteVerifiedReadChildDependencies extends Omit<VerifiedReadChildDependencies, "emitStage"> {
+  emitStage(reply: Extract<FullNoteReadReplyV1, { kind: "stage" }>): void;
+}
+type OwnedBootstrap = ReadBootstrap | FullNoteReadBootstrapV1;
+type OwnedTerminal = ReadTerminalReply | FullNoteReadTerminalReplyV1;
+type SharedDependencies = Omit<VerifiedReadChildDependencies, "emitStage"> & {
+  emitStage(reply: Extract<ReadReply | FullNoteReadReplyV1, { kind: "stage" }>): void;
+};
+/** Both families use this one allocation, lock, deadline and closure state machine. */
 export async function executeVerifiedRead(bootstrap: ReadBootstrap, dependencies: VerifiedReadChildDependencies): Promise<ReadTerminalReply> {
-  const started = dependencies.now();
-  const input = decodeReadBootstrap(bootstrap);
+  const started = dependencies.now(), input = decodeReadBootstrap(bootstrap);
+  const reply = await executeOwnedRead(input, { ...dependencies, emitStage(stage) {
+    if (stage.version !== 3) fail("WORKER_PROTOCOL_ERROR"); dependencies.emitStage(stage);
+  } }, started);
+  if (reply.version !== 3) fail("WORKER_PROTOCOL_ERROR"); return reply;
+}
+export async function executeFullNoteVerifiedRead(bootstrap: FullNoteReadBootstrapV1, dependencies: FullNoteVerifiedReadChildDependencies): Promise<FullNoteReadTerminalReplyV1> {
+  const started = dependencies.now(), input = decodeFullNoteReadBootstrap(bootstrap);
+  const reply = await executeOwnedRead(input, { ...dependencies, emitStage(stage) {
+    if (stage.version !== 4) fail("WORKER_PROTOCOL_ERROR"); dependencies.emitStage(stage);
+  } }, started);
+  if (reply.version !== 4) fail("WORKER_PROTOCOL_ERROR"); return reply;
+}
+/** Reads the already published verified image; never builds or repairs publication. */
+async function executeOwnedRead(input: OwnedBootstrap, dependencies: SharedDependencies, started: number): Promise<OwnedTerminal> {
   const deadline = started + input.remainingMs;
   let reader: SqliteConnection | undefined;
   let image: DatabaseSync | undefined;
@@ -45,7 +73,7 @@ export async function executeVerifiedRead(bootstrap: ReadBootstrap, dependencies
     return Math.max(0, Math.floor(budget));
   };
   const stage = (phase: ReadPhase, observedProjectionPosition: string | null = null): void => {
-    checkpoint(); dependencies.emitStage(Object.freeze({ version: 3, ids: input.ids, kind: "stage", phase, observedProjectionPosition }));
+    checkpoint(); dependencies.emitStage(Object.freeze({ version: input.version, ids: input.ids, kind: "stage", phase, observedProjectionPosition }));
     checkpoint();
   };
   const closeImage = (): void => {
@@ -65,7 +93,7 @@ export async function executeVerifiedRead(bootstrap: ReadBootstrap, dependencies
   const manifest = () => {
     checkpoint(); const captured = core.captureManifest(); checkpoint();
     if (captured.state === "missing") return null;
-    try { return { snapshot: captured, value: parseProjectionManifestV2(JSON.parse(Buffer.from(captured.bytesBase64, "base64").toString("utf8")) as unknown, input.binding.projectionBinding) }; }
+    try { return { snapshot: captured, value: parseRichProjectionManifest(JSON.parse(Buffer.from(captured.bytesBase64, "base64").toString("utf8")) as unknown, input.binding.projectionBinding) }; }
     catch { return fail("INTEGRITY_FAILURE"); }
   };
   const lag = (required: string, observed: string | null): never => {
@@ -84,11 +112,11 @@ export async function executeVerifiedRead(bootstrap: ReadBootstrap, dependencies
     const admission = new SqliteVerifiedReadAdmission(reader, input.binding, measured);
     stage("admission"); const fence = admission.capture(input.request); checkpoint();
     stage("projection-wait");
-    let waits = 0, observed: string | null = null, selected: ProjectionManifestV2;
+    let waits = 0, observed: string | null = null, selected: ProjectionManifestV2 | ProjectionManifestV3;
     let capturedBytes: Uint8Array;
     while (true) {
       const candidate = manifest(); observed = candidate?.value.terminalEventPosition ?? null;
-      if (candidate && BigInt(candidate.value.terminalEventPosition) >= BigInt(fence.requiredPosition)) {
+      if (candidate && (input.version === 3 || candidate.value.schemaVersion === 3) && BigInt(candidate.value.terminalEventPosition) >= BigInt(fence.requiredPosition)) {
         checkpoint();
         // A throwing acquire can leave partial evidence: it proves no ownership and is never released here.
         lockClosed = false;
@@ -97,7 +125,7 @@ export async function executeVerifiedRead(bootstrap: ReadBootstrap, dependencies
         else {
           lockOwned = true; lockAttempted = false; checkpoint();
           const locked = manifest(); observed = locked?.value.terminalEventPosition ?? null;
-          if (locked && BigInt(locked.value.terminalEventPosition) >= BigInt(fence.requiredPosition)) {
+          if (locked && (input.version === 3 || locked.value.schemaVersion === 3) && BigInt(locked.value.terminalEventPosition) >= BigInt(fence.requiredPosition)) {
             stage("capture", observed);
             const captured = core.captureGeneration(input.lockToken, locked.value.databaseFile, 64 * 1024 * 1024); checkpoint();
             // Compare the real locked bytes AND provenance after named image capture, before releasing this token.
@@ -127,26 +155,50 @@ export async function executeVerifiedRead(bootstrap: ReadBootstrap, dependencies
     const imageTimeout = checkpoint(); imageClosed = false;
     image = openImmutableProjectionImage(capturedBytes, imageTimeout); checkpoint();
     const metadata = readProjectionImageMetadata(image, selected); checkpoint();
-    const receipt: VerifiedReadReceipt = decodeVerifiedReadReceipt({ operation: input.request.operation, consistency: input.request.consistency,
+    if (input.version === 4) {
+      if (selected.schemaVersion !== 3) fail("FRESH_START_SCHEMA_MISMATCH");
+      assertCapturedProjectionV3Image(image, selected); checkpoint();
+    }
+    const receiptFields = { consistency: input.request.consistency,
       scope: { ...input.binding.projectionBinding, sessionId: input.request.consistency === "session-strong" ? input.binding.session!.sessionId : null },
       releaseId: fence.releaseId, controlGeneration: fence.controlGeneration, requiredEventPosition: fence.requiredPosition,
       projectionGeneration: metadata.generation, projectionEventPosition: metadata.terminalEventPosition,
-      projectionEventHash: metadata.terminalEventHash, imageSha256: sha256, verification: "image-scope-position-and-active-admission" });
-    // Prospective full terminal reserves packing capacity only. Closure below remains mandatory.
-    const base: ReadSuccessBase = { version: 3, ids: input.ids, kind: "success", receipt, fence,
-      closed: Object.freeze({ image: true, reader: true, lock: true }) };
-    let content;
-    if (input.request.operation !== "verify-published-view") {
+      projectionEventHash: metadata.terminalEventHash, imageSha256: sha256, verification: "image-scope-position-and-active-admission" };
+    const closed = Object.freeze({ image: true, reader: true, lock: true } as const);
+    // Query and reserve the complete actual envelope while this same captured image is still open.
+    // The deferred decoder below observes closure; prospective flags here do not attest cleanup.
+    let decodeTerminal: () => OwnedTerminal;
+    if (input.version === 4) {
+      if (selected.schemaVersion !== 3) fail("FRESH_START_SCHEMA_MISMATCH");
+      const receipt = decodeFullNoteVerifiedReadReceipt({ ...receiptFields, operation: "get-full-note", projectionSchemaVersion: 3 });
+      const base: FullNoteReadSuccessBaseV1 = { version: 4, ids: input.ids, kind: "success", receipt, fence, closed };
       stage("query", selected.terminalEventPosition);
-      const candidate = queryNativeContent(image, selected, { request: input.request, binding: input.binding, receipt, remainingMs: checkpoint() });
-      checkpoint(); content = buildNativeContentResult(candidate, base); checkpoint();
+      const candidate = queryNativeFullNote(image, selected, { request: input.request, binding: input.binding, receipt, remainingMs: checkpoint() });
+      checkpoint(); const content = buildNativeFullNoteResult(candidate, base); checkpoint();
+      decodeTerminal = () => {
+        const result = decodeFullNoteReadReply({ ...base, content }, input.request);
+        if (result.kind !== "success") fail("WORKER_PROTOCOL_ERROR"); return result;
+      };
+    } else {
+      const receipt: VerifiedReadReceipt = decodeVerifiedReadReceipt({ ...receiptFields, operation: input.request.operation });
+      const base: ReadSuccessBase = { version: 3, ids: input.ids, kind: "success", receipt, fence, closed };
+      let content: NativeContentResult | undefined;
+      if (input.request.operation !== "verify-published-view") {
+        stage("query", selected.terminalEventPosition);
+        const candidate = queryNativeContent(image, selected, { request: input.request, binding: input.binding, receipt, remainingMs: checkpoint() });
+        checkpoint(); content = buildNativeContentResult(candidate, base); checkpoint();
+      }
+      decodeTerminal = () => {
+        const result = decodeReadReply({ ...base, ...(content === undefined ? {} : { content }) });
+        if (result.kind !== "success") fail("WORKER_PROTOCOL_ERROR"); return result;
+      };
     }
     closeImage(); closeLock(); checkpoint();
     stage("revalidate", selected.terminalEventPosition);
     admission.revalidate(fence, selected); checkpoint();
     // Linearizes at final authority observation. Closure is still required before any terminal success.
     closeReader(); checkpoint();
-    const terminal = decodeReadReply({ ...base, ...(content === undefined ? {} : { content }) }); checkpoint();
+    const terminal = decodeTerminal(); checkpoint();
     if (terminal.kind !== "success") fail("WORKER_PROTOCOL_ERROR");
     return terminal;
   } catch (error) { primary = error; }
@@ -155,6 +207,6 @@ export async function executeVerifiedRead(bootstrap: ReadBootstrap, dependencies
     try { close(); } catch (error) { primary ??= error; }
   }
   const failure = verifiedReadFailure(primary);
-  return Object.freeze({ version: 3, ids: input.ids, kind: "failure", failure: Object.freeze({ ...failure,
+  return Object.freeze({ version: input.version, ids: input.ids, kind: "failure", failure: Object.freeze({ ...failure,
     cleanup: imageClosed && readerClosed && lockClosed ? "complete" : "incomplete" }) });
 }

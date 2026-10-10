@@ -1,3 +1,6 @@
+import { types } from "node:util";
+import type { GetFullNoteRequest } from "./full-note-contracts.js";
+import { decodeGetFullNoteRequest } from "./full-note-protocol.js";
 import { decodeStoredGenesisChecksums } from "../fresh-start/genesis-codec.js";
 import { decodeFreshStartGenesis, decodeFreshStartIdentity, decodeFreshStartRelease, FreshStartError,
   type FreshStartGenesis, type FreshStartIdentity, type FreshStartMode, type FreshStartRelease, type FreshStartState } from "../fresh-start/contracts.js";
@@ -67,8 +70,12 @@ export class SqliteVerifiedReadAdmission {
     this.#measuredBuildHash = independentlyMeasuredBuildHash;
   }
 
-  capture(request: VerifiedReadRequest): ReadFence {
-    const input = decodeVerifiedReadRequest(request, this.#binding.session);
+  capture(request: VerifiedReadRequest | GetFullNoteRequest): ReadFence {
+    if (!request || typeof request !== "object" || types.isProxy(request)) fail("FRESH_START_INPUT_INVALID");
+    const operation = Object.getOwnPropertyDescriptor(request, "operation");
+    if (!operation || !("value" in operation)) fail("FRESH_START_INPUT_INVALID");
+    const input = operation.value === "get-full-note" ? decodeGetFullNoteRequest(request, this.#binding.session)
+      : decodeVerifiedReadRequest(request, this.#binding.session);
     return this.#snapshot(() => {
       const authority = this.#authority();
       const minimum = BigInt(input.minimumEventPosition);

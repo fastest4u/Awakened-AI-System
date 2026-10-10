@@ -1,3 +1,7 @@
+import { types } from "node:util";
+import type { FullNoteReadBootstrapV1, FullNoteReadCancelV1, FullNoteReadReplyV1, VerifiedFullNoteReadResultV1 } from "./contracts.js";
+import type { GetFullNoteRequest } from "./full-note-contracts.js";
+import { decodeGetFullNoteRequest, decodeFullNoteReadReply, assertNativeFullNoteMatchesRequest } from "./full-note-protocol.js";
 import { randomBytes, randomUUID, createHash } from "node:crypto";
 import { fork, type ForkOptions } from "node:child_process";
 import { lstat, realpath } from "node:fs/promises";
@@ -8,12 +12,12 @@ import type { CleanupBootstrap, CleanupReply, ReadBootstrap, ReadCancel, ReadMes
   MetadataVerifiedReadRequest, VerifiedReadBinding, VerifiedReadDiagnostic, VerifiedReadFailureCode, VerifiedReadReceipt, VerifiedReadRequest } from "./contracts.js";
 import type { VerifiedContentReadRequest, VerifiedContentReadResult } from "./content-contracts.js";
 import { assertNativeContentMatchesRequest } from "./content-protocol.js";
-import { decodeCleanupReply, decodeReadBootstrap, decodeReadReply, decodeVerifiedReadRequest, verifiedReadFailure } from "./protocol.js";
+import { assertReadReplyEnvelope, decodeCleanupReply, decodeReadBootstrap, decodeReadReply, decodeVerifiedReadRequest, verifiedReadFailure } from "./protocol.js";
 import { VerifiedReadOwnershipRepository } from "./ownership.js";
 
 export interface OwnedReadProcess {
   readonly pid: number | undefined;
-  send(envelope: ReadBootstrap | CleanupBootstrap | ReadCancel): void;
+  send(envelope: ReadBootstrap | FullNoteReadBootstrapV1 | CleanupBootstrap | ReadCancel | FullNoteReadCancelV1): void;
   onMessage(handler: (value: unknown) => void): () => void;
   /** Native ports deliver only after actual exit AND IPC/stdio drainage. terminate is never exit evidence. */
   onExit(handler: (code: number | null, signal: string | null) => void): () => void;
@@ -33,19 +37,20 @@ export interface VerifiedReadSupervisorDependencies {
 export interface VerifiedReadAdapter {
   verify(request: MetadataVerifiedReadRequest, options?: { signal?: AbortSignal }): Promise<VerifiedReadReceipt>;
   query(request: VerifiedContentReadRequest, options?: { signal?: AbortSignal }): Promise<VerifiedContentReadResult>;
+  queryFullNote(request: GetFullNoteRequest, options?: { signal?: AbortSignal }): Promise<VerifiedFullNoteReadResultV1>;
   diagnostic(): VerifiedReadDiagnostic;
   close(): Promise<VerifiedReadDiagnostic>;
 }
 const PHASES: ReadPhase[] = ["admission", "projection-wait", "capture", "validate", "revalidate"];
 const CONTENT_PHASES: ReadPhase[] = ["admission", "projection-wait", "capture", "validate", "query", "revalidate"];
-type SuccessCandidate = Extract<ReadReply, { kind: "success" }>;
+type SuccessCandidate = Extract<ReadReply | FullNoteReadReplyV1, { kind: "success" }>;
 const CLEANUP_MS = 2000;
 function error(code: VerifiedReadFailureCode) { return Object.assign(new Error(code), { code }); }
 function matches(a: ReadMessageIds, b: ReadMessageIds): boolean { return a.requestId === b.requestId && a.attemptId === b.attemptId && a.laneEpoch === b.laneEpoch; }
 type ProcessState = { port: OwnedReadProcess; kind: "read" | "cleanup"; exited: boolean; normal: boolean; terminated: boolean;
-  listeners: (() => void)[]; stdout: number; stderr: number; messages: number; stage: number; terminal?: ReadReply | CleanupReply };
-type Lane = { sequence: number; ids: ReadMessageIds; request: VerifiedReadRequest; deadline: number; token: string;
-  resolve(value: VerifiedReadReceipt | VerifiedContentReadResult): void; reject(reason: unknown): void; settled: boolean; responseTimer?: unknown; abort?: () => void;
+  listeners: (() => void)[]; stdout: number; stderr: number; messages: number; stage: number; terminal?: ReadReply | FullNoteReadReplyV1 | CleanupReply };
+type Lane = { sequence: number; ids: ReadMessageIds; request: VerifiedReadRequest | GetFullNoteRequest; deadline: number; token: string;
+  resolve(value: VerifiedReadReceipt | VerifiedContentReadResult | VerifiedFullNoteReadResultV1): void; reject(reason: unknown): void; settled: boolean; responseTimer?: unknown; abort?: () => void;
   phase: VerifiedReadDiagnostic["phase"]; code: VerifiedReadFailureCode | null; positions: VerifiedReadDiagnostic["positions"];
   inFlight: number; started: boolean; recordOwned: boolean; recordClosed: boolean; recordClosing: boolean;
   read?: ProcessState; cleanupChild?: ProcessState; cleanupStarted?: number; cleanupTimer?: unknown; graceTimer?: unknown;
@@ -108,6 +113,7 @@ export function createVerifiedReadAdapter(input: VerifiedReadBinding, dependenci
   function settle(lane: Lane, failure?: VerifiedReadFailureCode, candidate?: SuccessCandidate) {
     if (lane.settled) return; lane.settled = true; deps.clear(lane.responseTimer); lane.abort?.();
     if (failure) { lane.code ??= failure; lane.reject(error(failure)); }
+    else if (candidate!.version === 4) lane.resolve(Object.freeze({ receipt: candidate!.receipt, content: candidate!.content }));
     else lane.resolve(candidate!.content === undefined ? candidate!.receipt : Object.freeze({ receipt: candidate!.receipt, content: candidate!.content }));
   }
   function stopProcess(state: ProcessState | undefined) {
@@ -145,7 +151,8 @@ export function createVerifiedReadAdapter(input: VerifiedReadBinding, dependenci
     beginCleanup(lane); lane.phase = "cleanup";
     if (cleanupLive(lane)) {
       if (lane.read && !lane.read.exited && lane.graceTimer === undefined) {
-        try { lane.read.port.send({ version: 3, ids: lane.ids, kind: "cancel" }); } catch { /* grace/terminate still apply */ }
+        try { lane.read.port.send(lane.request.operation === "get-full-note"
+          ? { version: 4, ids: lane.ids, kind: "cancel" } : { version: 3, ids: lane.ids, kind: "cancel" }); } catch { /* grace/terminate still apply */ }
         lane.graceTimer = deps.schedule(() => { if (cleanupLive(lane)) stopProcess(lane.read); }, Math.min(100, CLEANUP_MS - (deps.now() - lane.cleanupStarted!)));
       }
     }
@@ -179,8 +186,8 @@ export function createVerifiedReadAdapter(input: VerifiedReadBinding, dependenci
   function oldLane(value: unknown): boolean {
     // Bounded identity peek only. Decoder handles all current/unknown traffic; no growing closed-ID cache.
     try {
-      if (!value || typeof value !== "object") return false;
-      const idsValue = Object.getOwnPropertyDescriptor(value, "ids"); if (!idsValue || !("value" in idsValue) || !idsValue.value || typeof idsValue.value !== "object") return false;
+      if (!value || typeof value !== "object" || types.isProxy(value)) return false;
+      const idsValue = Object.getOwnPropertyDescriptor(value, "ids"); if (!idsValue || !("value" in idsValue) || !idsValue.value || typeof idsValue.value !== "object" || types.isProxy(idsValue.value)) return false;
       const field = (key: string): unknown => { const descriptor = Object.getOwnPropertyDescriptor(idsValue.value, key); return descriptor && "value" in descriptor ? descriptor.value : undefined; };
       const epoch = field("laneEpoch"); if (typeof epoch === "string" && epoch.length <= 128 && epoch !== binding.compositionEpoch) return true;
       const id = field("requestId"); if (typeof id !== "string" || id.length > 128 || !id.startsWith(`${supervisorId}:`)) return false;
@@ -188,7 +195,7 @@ export function createVerifiedReadAdapter(input: VerifiedReadBinding, dependenci
       return Number(suffix) <= closedThrough;
     } catch { return false; }
   }
-  function validateSuccess(lane: Lane, reply: Extract<ReadReply, { kind: "success" }>) {
+  function validateSuccess(lane: Lane, reply: Extract<ReadReply | FullNoteReadReplyV1, { kind: "success" }>) {
     const { receipt, fence } = reply; const scope = { ...binding.projectionBinding, sessionId: lane.request.consistency === "session-strong" ? binding.session?.sessionId ?? null : null };
     const required = [BigInt(fence.capturedPosition), BigInt(lane.request.minimumEventPosition), BigInt(binding.session?.minimumEventPosition ?? "0")]
       .reduce((left, right) => left > right ? left : right);
@@ -199,7 +206,13 @@ export function createVerifiedReadAdapter(input: VerifiedReadBinding, dependenci
       || (receipt.projectionEventPosition === fence.capturedPosition && receipt.projectionEventHash !== fence.capturedHash)) throw error("WORKER_PROTOCOL_ERROR");
     if (lane.request.operation !== "verify-published-view") {
       if (reply.content === undefined) throw error("WORKER_PROTOCOL_ERROR");
-      assertNativeContentMatchesRequest(reply.content, lane.request, binding, receipt);
+      if (lane.request.operation === "get-full-note") {
+        if (reply.version !== 4) throw error("WORKER_PROTOCOL_ERROR");
+        assertNativeFullNoteMatchesRequest(reply.content, lane.request, binding, reply.receipt);
+      } else {
+        if (reply.version !== 3) throw error("WORKER_PROTOCOL_ERROR");
+        assertNativeContentMatchesRequest(reply.content!, lane.request, binding, reply.receipt);
+      }
     }
   }
   function observe(lane: Lane, port: OwnedReadProcess, kind: "read" | "cleanup"): ProcessState {
@@ -209,7 +222,9 @@ export function createVerifiedReadAdapter(input: VerifiedReadBinding, dependenci
       if (kind === "read" && (lane.settled || !eligible(lane))) return;
       try {
         if (++state.messages > 8) throw error("WORKER_PROTOCOL_ERROR");
-        const reply = kind === "read" ? decodeReadReply(value) : decodeCleanupReply(value);
+        if (kind === "read") assertReadReplyEnvelope(value, lane.request.operation === "get-full-note" ? 4 : 3, lane.ids);
+        const reply = kind === "cleanup" ? decodeCleanupReply(value)
+          : lane.request.operation === "get-full-note" ? decodeFullNoteReadReply(value, lane.request) : decodeReadReply(value);
         if (!matches(reply.ids, lane.ids) || state.terminal || state.exited) throw error("WORKER_PROTOCOL_ERROR");
         if (reply.kind === "stage") {
           const phases = lane.request.operation === "verify-published-view" ? PHASES : CONTENT_PHASES;
@@ -285,7 +300,9 @@ export function createVerifiedReadAdapter(input: VerifiedReadBinding, dependenci
       if (port.pid === undefined) throw error("WORKER_UNAVAILABLE");
       lane.inFlight++; await deps.ownership.observeChild(lane.ids, port.pid); lane.inFlight--;
       if (!eligible(lane)) { progressCleanup(lane); return; }
-      port.send({ version: 3, ids: lane.ids, binding, request: lane.request, lockToken: lane.token, remainingMs: Math.max(0, lane.deadline - deps.now()) });
+      const base = { ids: lane.ids, binding, lockToken: lane.token, remainingMs: Math.max(0, lane.deadline - deps.now()) };
+      if (lane.request.operation === "get-full-note") port.send({ ...base, version: 4, request: lane.request });
+      else port.send({ ...base, version: 3, request: lane.request });
     } catch (cause) {
       lane.inFlight = Math.max(0, lane.inFlight - 1);
       // Failed durable operations can have published before rejecting. Preserve that uncertainty.
@@ -299,12 +316,12 @@ export function createVerifiedReadAdapter(input: VerifiedReadBinding, dependenci
     const lane = queue.shift(); if (!lane) return;
     if (!eligible(lane)) { pump(); return; } active = lane; void start(lane);
   }
-  function enqueue(value: VerifiedReadRequest, content: boolean, options?: { signal?: AbortSignal }): Promise<VerifiedReadReceipt | VerifiedContentReadResult> {
+  function enqueue(value: VerifiedReadRequest | GetFullNoteRequest, family: "metadata" | "content" | "full-note", options?: { signal?: AbortSignal }): Promise<VerifiedReadReceipt | VerifiedContentReadResult | VerifiedFullNoteReadResultV1> {
       const arrival = deps.now();
       return new Promise((resolve, reject) => {
-        let request: VerifiedReadRequest;
-        try { request = decodeVerifiedReadRequest(value, binding.session); } catch { reject(error("FRESH_START_INPUT_INVALID")); return; }
-        if ((request.operation !== "verify-published-view") !== content) { reject(error("FRESH_START_INPUT_INVALID")); return; }
+        let request: VerifiedReadRequest | GetFullNoteRequest;
+        try { request = family === "full-note" ? decodeGetFullNoteRequest(value, binding.session) : decodeVerifiedReadRequest(value, binding.session); } catch { reject(error("FRESH_START_INPUT_INVALID")); return; }
+        if ((request.operation !== "verify-published-view") !== (family !== "metadata")) { reject(error("FRESH_START_INPUT_INVALID")); return; }
         if (deps.now() >= arrival + request.budgetMs) { reject(error("WORKER_TIMEOUT")); return; }
         if (closing || options?.signal?.aborted) { reject(error("WORKER_CLOSED")); return; }
         if (quarantine) { reject(error("WORKER_UNAVAILABLE")); return; }
@@ -320,10 +337,13 @@ export function createVerifiedReadAdapter(input: VerifiedReadBinding, dependenci
   return Object.freeze({
     diagnostic,
     verify(value: MetadataVerifiedReadRequest, options?: { signal?: AbortSignal }) {
-      return enqueue(value, false, options) as Promise<VerifiedReadReceipt>;
+      return enqueue(value, "metadata", options) as Promise<VerifiedReadReceipt>;
     },
     query(value: VerifiedContentReadRequest, options?: { signal?: AbortSignal }) {
-      return enqueue(value, true, options) as Promise<VerifiedContentReadResult>;
+      return enqueue(value, "content", options) as Promise<VerifiedContentReadResult>;
+    },
+    queryFullNote(value: GetFullNoteRequest, options?: { signal?: AbortSignal }) {
+      return enqueue(value, "full-note", options) as Promise<VerifiedFullNoteReadResultV1>;
     },
     close(): Promise<VerifiedReadDiagnostic> {
       closing = true; for (const lane of queue.splice(0)) settle(lane, "WORKER_CLOSED");
