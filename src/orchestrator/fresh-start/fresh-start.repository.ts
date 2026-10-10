@@ -1,3 +1,4 @@
+import { decodeStoredGenesisChecksums, encodeStoredGenesisChecksums } from "./genesis-codec.js";
 import type { SqliteConnection, SqliteRow } from "../storage/sqlite-driver.js";
 import { FreshStartAdmissionGuard, type FreshStartRecoveryFence } from "./fresh-start-admission.js";
 import {
@@ -74,14 +75,13 @@ export class SqliteFreshStartRepository {
         requireLive();
         const row = storage(() => this.#connection.prepare("SELECT * FROM fresh_start_installation WHERE project_id = $projectId").get({ $projectId: expected.projectId }));
         if (!row) return null;
-        let parsed: unknown;
-        try { parsed = JSON.parse(string(row, "projection_checksums_json")); }
-        catch { return fail("FRESH_START_STORAGE_FAILURE"); }
         try {
+          const stored = decodeStoredGenesisChecksums(string(row, "projection_checksums_json"));
           return decodeFreshStartGenesis({ ...expected,
             initializationId: string(row, "initialization_id"), releaseId: string(row, "release_id"),
             semanticPosition: bigint(row, "semantic_position").toString(), terminalHash: string(row, "terminal_hash"),
-            projectionChecksums: parsed, preparationIntentDigest: string(row, "preparation_intent_digest"),
+            ...(stored.genesisVersion === 2 ? { genesisVersion: 2, projectionSchemaVersion: 3 } : {}),
+            projectionChecksums: stored.projectionChecksums, preparationIntentDigest: string(row, "preparation_intent_digest"),
             actorFingerprint: string(row, "actor_fingerprint"), createdAt: string(row, "created_at") });
         } catch { return fail("FRESH_START_STORAGE_FAILURE"); }
       };
@@ -154,7 +154,7 @@ export class SqliteFreshStartRepository {
             $projectionChecksums, $intentDigest, $actorFingerprint, $createdAt)`).run({
             $projectId: expected.projectId, $vaultId: expected.vaultId, $storeId: expected.storeId,
             $initializationId: genesis.initializationId, $releaseId: genesis.releaseId,
-            $terminalHash: genesis.terminalHash, $projectionChecksums: JSON.stringify(genesis.projectionChecksums),
+            $terminalHash: genesis.terminalHash, $projectionChecksums: encodeStoredGenesisChecksums(genesis),
             $intentDigest: genesis.preparationIntentDigest, $actorFingerprint: genesis.actorFingerprint,
             $createdAt: genesis.createdAt,
           }));

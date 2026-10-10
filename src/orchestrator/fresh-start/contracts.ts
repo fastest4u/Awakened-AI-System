@@ -1,7 +1,7 @@
 import type { ProjectId, StoreId, VaultId } from "../identity/contracts.js";
-import { PROJECTION_NAMES, projectionCoreChecksum } from "../projections/checksum.js";
-import { PROJECTION_SCHEMA_VERSION } from "../projections/schema.js";
-import { GENESIS_GLOBAL_HASH } from "../storage/event-chain-constants.js";
+import type { ProjectionNameV2, ProjectionNameV3 } from "../projections/checksum.js";
+import { FreshStartError } from "./genesis-codec.js";
+export { FreshStartError, decodeFreshStartGenesis, type FreshStartErrorCode } from "./genesis-codec.js";
 
 export type FreshStartMode = "prepared" | "active" | "read-only-recovery" | "disabled";
 export type FreshStartIdentity = Readonly<{ projectId: ProjectId; vaultId: VaultId; storeId: StoreId }>;
@@ -11,11 +11,20 @@ export type FreshStartRelease = FreshStartIdentity & Readonly<{
   capabilityManifestHash: string; recoveryPolicyHash: string;
   evidenceDigest: string; createdAt: string;
 }>;
-export type FreshStartGenesis = FreshStartIdentity & Readonly<{
+export type FreshStartGenesisV1 = FreshStartIdentity & Readonly<{
   initializationId: string; releaseId: string; semanticPosition: "0";
-  terminalHash: string; projectionChecksums: Readonly<Record<string, string>>;
+  terminalHash: string; projectionChecksums: Readonly<Record<ProjectionNameV2, string>>;
   preparationIntentDigest: string; actorFingerprint: string; createdAt: string;
 }>;
+export type FreshStartGenesisV2 = Omit<FreshStartGenesisV1, "projectionChecksums"> & Readonly<{
+  genesisVersion: 2; projectionSchemaVersion: 3;
+  projectionChecksums: Readonly<Record<ProjectionNameV3, string>>;
+}>;
+export type StoredGenesisChecksumsV2 = Readonly<{
+  genesisVersion: 2; projectionSchemaVersion: 3;
+  projectionChecksums: Readonly<Record<ProjectionNameV3, string>>;
+}>;
+export type FreshStartGenesis = FreshStartGenesisV1 | FreshStartGenesisV2;
 export type FreshStartState = FreshStartIdentity & Readonly<{
   releaseId: string; mode: FreshStartMode; generation: bigint;
   recoveryPosition: bigint | null; recoveryHash: string | null;
@@ -45,31 +54,6 @@ export type FreshStartAutomaticStop = Readonly<{
   identity: FreshStartIdentity; expectedGeneration: bigint; target: "read-only-recovery" | "disabled";
   reasonCode: Extract<FreshStartAuthorization, { kind: "automatic-stop" }>["reasonCode"];
 }>;
-
-export type FreshStartErrorCode =
-  | "FRESH_START_CONFIG_INVALID"
-  | "FRESH_START_INPUT_INVALID" | "FRESH_START_IDENTITY_MISMATCH"
-  | "FRESH_START_RELEASE_MISMATCH" | "FRESH_START_ALREADY_INITIALIZED"
-  | "FRESH_START_NOT_INITIALIZED" | "FRESH_START_STALE_STATE"
-  | "FRESH_START_APPROVAL_REUSED" | "FRESH_START_TRANSACTION_CLOSED"
-  | "FRESH_START_TRANSACTION_REENTRANT" | "FRESH_START_ASYNC_TRANSACTION"
-  | "FRESH_START_STORAGE_FAILURE" | "FRESH_START_PATH_OVERLAP"
-  | "FRESH_START_PATH_INVALID" | "FRESH_START_PATH_CHANGED"
-  | "FRESH_START_RECOVERY_REQUIRED" | "FRESH_START_DESTINATION_NOT_EMPTY"
-  | "FRESH_START_JOURNAL_MISMATCH" | "FRESH_START_INITIALIZATION_BUSY"
-  | "FRESH_START_PREPARATION_REQUIRED" | "FRESH_START_RELEASE_NOT_READY"
-  | "FRESH_START_EDGE_FORBIDDEN" | "FRESH_START_APPROVAL_INVALID"
-  | "FRESH_START_APPROVAL_BINDING_MISMATCH" | "FRESH_START_EVIDENCE_INVALID"
-  | "FRESH_START_EVIDENCE_BINDING_MISMATCH"
-  | "FRESH_START_CONTEXT_REQUIRED" | "FRESH_START_BUILD_MISMATCH" | "FRESH_START_SCHEMA_MISMATCH"
-  | "FRESH_START_ADMISSION_STALE" | "FRESH_START_ADMISSION_DENIED" | "FRESH_START_CONTENT_UNVERIFIED";
-
-export class FreshStartError extends Error {
-  constructor(readonly code: FreshStartErrorCode) {
-    super(code);
-    this.name = "FreshStartError";
-  }
-}
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 const HASH = /^[0-9a-f]{64}$/u;
@@ -106,7 +90,6 @@ function identity(value: Record<string, unknown>): FreshStartIdentity {
 }
 
 const RELEASE_KEYS = ["projectId", "vaultId", "storeId", "profileVersion", "releaseId", "buildIdentityHash", "schemaIdentityHash", "configurationHash", "capabilityManifestHash", "recoveryPolicyHash", "evidenceDigest", "createdAt"];
-const GENESIS_KEYS = ["projectId", "vaultId", "storeId", "initializationId", "releaseId", "semanticPosition", "terminalHash", "projectionChecksums", "preparationIntentDigest", "actorFingerprint", "createdAt"];
 
 export function decodeFreshStartRelease(value: unknown): FreshStartRelease {
   const source = record(value, RELEASE_KEYS);
@@ -115,24 +98,6 @@ export function decodeFreshStartRelease(value: unknown): FreshStartRelease {
     buildIdentityHash: hash(source.buildIdentityHash), schemaIdentityHash: hash(source.schemaIdentityHash),
     configurationHash: hash(source.configurationHash), capabilityManifestHash: hash(source.capabilityManifestHash),
     recoveryPolicyHash: hash(source.recoveryPolicyHash), evidenceDigest: hash(source.evidenceDigest),
-    createdAt: timestamp(source.createdAt) });
-}
-
-export function decodeFreshStartGenesis(value: unknown): FreshStartGenesis {
-  const source = record(value, GENESIS_KEYS);
-  const decodedIdentity = identity(source);
-  if (source.semanticPosition !== "0" || source.terminalHash !== GENESIS_GLOBAL_HASH) invalid();
-  const checksumSource = record(source.projectionChecksums, PROJECTION_NAMES);
-  const projectionChecksums: Record<string, string> = {};
-  for (const name of PROJECTION_NAMES) {
-    const checksum = hash(checksumSource[name]);
-    if (checksum !== projectionCoreChecksum(name, PROJECTION_SCHEMA_VERSION, decodedIdentity.projectId, 0n, [])) invalid();
-    projectionChecksums[name] = checksum;
-  }
-  return Object.freeze({ ...decodedIdentity, initializationId: uuid(source.initializationId),
-    releaseId: uuid(source.releaseId), semanticPosition: "0", terminalHash: GENESIS_GLOBAL_HASH,
-    projectionChecksums: Object.freeze(projectionChecksums),
-    preparationIntentDigest: hash(source.preparationIntentDigest), actorFingerprint: hash(source.actorFingerprint),
     createdAt: timestamp(source.createdAt) });
 }
 

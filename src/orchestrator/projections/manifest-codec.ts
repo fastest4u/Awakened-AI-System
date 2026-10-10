@@ -3,7 +3,7 @@ import {
   isProjectionWorkspaceIdentity,
   type ProjectBinding,
 } from "./contracts.js";
-import { PROJECTION_NAMES, type ProjectionName, type ProjectionNameV3 } from "./checksum.js";
+import { PROJECTION_NAMES, PROJECTION_NAMES_V3, type ProjectionName, type ProjectionNameV3 } from "./checksum.js";
 
 const HASH = /^[0-9a-f]{64}$/u;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
@@ -258,13 +258,14 @@ export function parseProjectionManifest(
   });
 }
 
-export function parseProjectionManifestV2(
+function parseRichProfile(
   value: unknown,
   expectedBinding: ProjectBinding,
-): ProjectionManifestV2 {
+  schemaVersion: 2 | 3,
+): ProjectionManifestV2 | ProjectionManifestV3 {
   const source = exactProjectionManifestRecord(value, MANIFEST_V2_KEYS);
   const expected = validateExpectedBinding(expectedBinding);
-  if (source.schemaVersion !== 2 || source.sessionId !== null || !sameScope(source, expected)) invalid();
+  if (source.schemaVersion !== schemaVersion || source.sessionId !== null || !sameScope(source, expected)) invalid();
   for (const key of ["projectId", "vaultId", "storeId"] as const) {
     if (!isProjectionProjectStoreIdentity(source[key])) invalid();
   }
@@ -286,12 +287,12 @@ export function parseProjectionManifestV2(
   ) invalid();
   assertHash(source.terminalEventHash);
   assertHash(source.databaseSha256);
-  const databaseFile = `projections-2-${String(source.generation)}.sqlite`;
+  const databaseFile = `projections-${schemaVersion}-${String(source.generation)}.sqlite`;
   if (source.databaseFile !== databaseFile) invalid();
-  const coreChecksums = validateCoreChecksums(source.coreChecksums, PROJECTION_NAMES);
+  const coreChecksums = validateCoreChecksums(source.coreChecksums, schemaVersion === 2 ? PROJECTION_NAMES : PROJECTION_NAMES_V3);
   const createdAt = validateTimestamp(source.createdAt);
   return Object.freeze({
-    schemaVersion: 2,
+    schemaVersion,
     projectId: source.projectId as ProjectBinding["projectId"],
     vaultId: source.vaultId as ProjectBinding["vaultId"],
     storeId: source.storeId as ProjectBinding["storeId"],
@@ -308,6 +309,21 @@ export function parseProjectionManifestV2(
     coreChecksums,
     createdAt,
   });
+}
+
+export function parseProjectionManifestV2(value: unknown, expectedBinding: ProjectBinding): ProjectionManifestV2 {
+  return parseRichProfile(value, expectedBinding, 2) as ProjectionManifestV2;
+}
+export function parseProjectionManifestV3(value: unknown, expectedBinding: ProjectBinding): ProjectionManifestV3 {
+  return parseRichProfile(value, expectedBinding, 3) as ProjectionManifestV3;
+}
+export function parseRichProjectionManifest(value: unknown, expectedBinding: ProjectBinding): ProjectionManifestV2 | ProjectionManifestV3 {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) invalid();
+  const descriptor = Object.getOwnPropertyDescriptor(value, "schemaVersion");
+  if (!descriptor || !descriptor.enumerable || !("value" in descriptor)) invalid();
+  if (descriptor.value === 2) return parseProjectionManifestV2(value, expectedBinding);
+  if (descriptor.value === 3) return parseProjectionManifestV3(value, expectedBinding);
+  return invalid();
 }
 
 /** Parses either immutable manifest version for internal publication only. */

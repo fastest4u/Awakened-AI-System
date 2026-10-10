@@ -1,6 +1,7 @@
+import { decodeStoredGenesisChecksums } from "../fresh-start/genesis-codec.js";
 import { decodeFreshStartGenesis, decodeFreshStartIdentity, decodeFreshStartRelease, FreshStartError,
   type FreshStartGenesis, type FreshStartIdentity, type FreshStartMode, type FreshStartRelease, type FreshStartState } from "../fresh-start/contracts.js";
-import { parseProjectionManifestV2, type ProjectionManifestV2 } from "../projections/manifest-codec.js";
+import { parseRichProjectionManifest, type ProjectionManifestV2, type ProjectionManifestV3 } from "../projections/manifest-codec.js";
 import { GENESIS_GLOBAL_HASH } from "../storage/event-chain-constants.js";
 import { assertBoundSqliteConnectionIdentity } from "../storage/node-sqlite-driver.js";
 import { inspectStoreSchema, requireCurrentStoreSchema } from "../storage/schema-compatibility.js";
@@ -78,15 +79,15 @@ export class SqliteVerifiedReadAdmission {
     });
   }
 
-  revalidate(fence: ReadFence, manifest: ProjectionManifestV2): void {
+  revalidate(fence: ReadFence, manifest: ProjectionManifestV2 | ProjectionManifestV3): void {
     this.#snapshot(() => {
       // Mode is observed before comparing a stale fence, so recovery never acquires a read receipt.
       const authority = this.#authority();
       const captured = readFence(fence);
       if (captured.releaseId !== this.#binding.expectedRelease.releaseId) fail("FRESH_START_RELEASE_MISMATCH");
       if (captured.controlGeneration !== this.#binding.controlGeneration) fail("FRESH_START_ADMISSION_STALE");
-      let image: ProjectionManifestV2;
-      try { image = parseProjectionManifestV2(manifest, this.#binding.projectionBinding); }
+      let image: ProjectionManifestV2 | ProjectionManifestV3;
+      try { image = parseRichProjectionManifest(manifest, this.#binding.projectionBinding); }
       catch { return integrity(); }
       const capturedPosition = BigInt(captured.capturedPosition), imagePosition = BigInt(image.terminalEventPosition);
       if (capturedPosition > authority.position || imagePosition > authority.position) return integrity();
@@ -141,12 +142,16 @@ export class SqliteVerifiedReadAdmission {
     const installation = this.#connection.prepare("SELECT * FROM fresh_start_installation WHERE project_id = $projectId").get(params);
     if (!installation) return fail("FRESH_START_NOT_INITIALIZED");
     const installedIdentity = this.#identity(installation);
-    const genesis = decoded(() => decodeFreshStartGenesis({ ...installedIdentity,
+    const genesis = decoded(() => {
+      const stored = decodeStoredGenesisChecksums(string(installation, "projection_checksums_json"));
+      return decodeFreshStartGenesis({ ...installedIdentity,
       initializationId: string(installation, "initialization_id"), releaseId: string(installation, "release_id"),
       semanticPosition: integer(installation, "semantic_position").toString(), terminalHash: string(installation, "terminal_hash"),
-      projectionChecksums: JSON.parse(string(installation, "projection_checksums_json")) as unknown,
+      ...(stored.genesisVersion === 2 ? { genesisVersion: 2, projectionSchemaVersion: 3 } : {}),
+      projectionChecksums: stored.projectionChecksums,
       preparationIntentDigest: string(installation, "preparation_intent_digest"), actorFingerprint: string(installation, "actor_fingerprint"),
-      createdAt: string(installation, "created_at") }));
+      createdAt: string(installation, "created_at") });
+    });
     const stateRow = this.#connection.prepare("SELECT * FROM fresh_start_control_state WHERE project_id = $projectId").get(params);
     if (!stateRow) return fail("FRESH_START_NOT_INITIALIZED");
     const stateIdentity = this.#identity(stateRow);

@@ -11,7 +11,7 @@ import type { ProjectDescriptorV1, ProjectStoreRoute } from "../identity/contrac
 import { ImmutableProjectionBuilder } from "../projections/builder.js";
 import { openCommittedProjectionEventSnapshot } from "../projections/event-reader.js";
 import { readVerifiedCanonicalProjectionSnapshot } from "../projections/integrity.js";
-import { parseProjectionManifestV2, type ProjectionManifestV2 } from "../projections/manifest.js";
+import { parseRichProjectionManifest, type ProjectionManifestV2, type ProjectionManifestV3 } from "../projections/manifest.js";
 import type { ProjectBinding } from "../projections/contracts.js";
 import { assertMinimumNodeVersion } from "../runtime/runtime-capabilities.js";
 import { canonicalJson } from "../serialization/canonical-json.js";
@@ -20,7 +20,7 @@ import { NodeSqliteDriver } from "../storage/node-sqlite-driver.js";
 import { expectedSchemaFingerprint, schemaFingerprint } from "../storage/schema-fingerprint.js";
 import { PROJECT_STORE_MIGRATIONS } from "../storage/migrations/registry.js";
 import { inspectStoreSchema, requireCurrentStoreSchema } from "../storage/schema-compatibility.js";
-import { GENESIS_GLOBAL_HASH } from "../storage/event-append-transaction.js";
+import { GENESIS_GLOBAL_HASH } from "../storage/event-chain-constants.js";
 import { decodeFreshStartGenesis, decodeFreshStartIdentity, decodeFreshStartRelease, FreshStartError, type FreshStartGenesis, type FreshStartIdentity, type FreshStartRelease } from "./contracts.js";
 import { SqliteFreshStartRepository } from "./fresh-start.repository.js";
 import { assertFreshStartDisjoint, assertFreshStartOwnedDirectory, assertFreshStartPaths, canonicalFreshStartPath, type FreshStartPaths } from "./fresh-start-paths.js";
@@ -38,12 +38,13 @@ export interface FreshStartInitializerDependencies {
   faultInjector?: { hit(boundary: FreshStartInitializationBoundary): void | Promise<void> };
 }
 type Journal = {
-  version: 1; phase: "reserved" | "store-published" | "receipt-published";
+  phase: "reserved" | "store-published" | "receipt-published";
   paths: FreshStartPaths; initializationId: string; identity: FreshStartIdentity;
   release: FreshStartRelease; actorFingerprint: string; storeRoot: string;
-  projection: ProjectionManifestV2 | null; foundationChecksDigest: string | null;
+  foundationChecksDigest: string | null;
   receipt: FreshStartGenesis | null;
-};
+} & ({ version: 1; projection: ProjectionManifestV2 | null }
+  | { version: 2; projectionSchemaVersion: 3; projection: ProjectionManifestV3 | null });
 const HASH = /^[0-9a-f]{64}$/u;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 const driver = new NodeSqliteDriver({ DatabaseSync });
@@ -90,9 +91,15 @@ function routeFor(paths: FreshStartPaths, identity: FreshStartIdentity, createdA
 }
 function decodeJournal(value: unknown): Journal {
   try {
-    const j = exact(value, ["version", "phase", "paths", "initializationId", "identity", "release", "actorFingerprint", "storeRoot", "projection", "foundationChecksDigest", "receipt"]);
+    if (typeof value !== "object" || value === null) fail("FRESH_START_JOURNAL_MISMATCH");
+    const version = Object.getOwnPropertyDescriptor(value, "version");
+    if (!version || !version.enumerable || !("value" in version) || (version.value !== 1 && version.value !== 2)) return fail("FRESH_START_JOURNAL_MISMATCH");
+    const j = exact(value, ["version", "phase", "paths", "initializationId", "identity", "release", "actorFingerprint", "storeRoot", "projection", "foundationChecksDigest", "receipt",
+      ...(version.value === 2 ? ["projectionSchemaVersion"] : [])]);
+    if (j.version !== version.value || (j.version === 2 && j.projectionSchemaVersion !== 3)) fail("FRESH_START_JOURNAL_MISMATCH");
+    const target = j.version === 1 ? 2 : 3;
     const paths = exact(j.paths, ["projectRoot", "v2VaultRoot", "v1ArchiveRoot"]) as FreshStartPaths;
-    if (Object.values(paths).some(value => typeof value !== "string") || j.version !== 1
+    if (Object.values(paths).some(value => typeof value !== "string")
       || !["reserved", "store-published", "receipt-published"].includes(String(j.phase))
       || typeof j.initializationId !== "string" || !UUID.test(j.initializationId)
       || typeof j.actorFingerprint !== "string" || !HASH.test(j.actorFingerprint)
@@ -101,10 +108,14 @@ function decodeJournal(value: unknown): Journal {
     const release = decodeFreshStartRelease(j.release);
     if (identity.projectId !== release.projectId || identity.vaultId !== release.vaultId || identity.storeId !== release.storeId) fail("FRESH_START_JOURNAL_MISMATCH");
     const receipt = j.receipt === null ? null : decodeFreshStartGenesis(j.receipt);
-    const projectionScope = j.projection as ProjectBinding | null;
-    const projection = projectionScope === null ? null : parseProjectionManifestV2(j.projection, {
-      ...identity, workspaceId: projectionScope.workspaceId, branchScopeId: null, branchRef: null, sessionId: null,
+    const projection = j.projection === null ? null : parseRichProjectionManifest(j.projection, {
+      ...identity, workspaceId: Object.getOwnPropertyDescriptor(j.projection, "workspaceId")?.value,
+      branchScopeId: null, branchRef: null, sessionId: null,
     });
+    if (receipt && (("genesisVersion" in receipt ? 3 : 2) !== target)) fail("FRESH_START_JOURNAL_MISMATCH");
+    if (projection && (projection.schemaVersion !== target || projection.terminalEventPosition !== "0"
+      || projection.terminalEventHash !== GENESIS_GLOBAL_HASH)) fail("FRESH_START_JOURNAL_MISMATCH");
+    if (receipt && projection && digest(receipt.projectionChecksums) !== digest(projection.coreChecksums)) fail("FRESH_START_JOURNAL_MISMATCH");
     if (receipt && (receipt.initializationId !== j.initializationId || receipt.releaseId !== release.releaseId || receipt.projectId !== identity.projectId || receipt.vaultId !== identity.vaultId || receipt.storeId !== identity.storeId || receipt.actorFingerprint !== j.actorFingerprint)) fail("FRESH_START_JOURNAL_MISMATCH");
     if (j.phase === "receipt-published" && (!receipt || !projection || !j.foundationChecksDigest)) fail("FRESH_START_JOURNAL_MISMATCH");
     return { ...j, paths, identity, release, receipt, projection } as Journal;
@@ -222,6 +233,9 @@ export class FreshStartInitializer {
       if (fresh) await this.dependencies.faultInjector?.hit("after-journal-reserved");
       let { route, binding } = await this.recheck(journal.paths, journal);
       if (journal.phase === "receipt-published") return await this.openExisting(journal.paths);
+      // Decoding historical/future receipts does not grant schema3 construction authority.
+      // Task 6 supplies the matching builder, verification and trusted creation target.
+      if (journal.version === 2) fail("FRESH_START_RECOVERY_REQUIRED");
       // Only exact owned files may be present; no generic nonempty-directory exception.
       const administrativeNames = ["fresh-start-init.json", "fresh-start-operation.lock", "project-identity.json",
         ...(route.kind === "vault-local" ? ["v2"] : [])];

@@ -18,11 +18,14 @@ import {
 export {
   parseProjectionManifest,
   parseProjectionManifestV2,
+  parseProjectionManifestV3,
+  parseRichProjectionManifest,
   parseProjectionManifestForPublication,
   PROJECTION_NAMES_V1,
   type ProjectionManifest,
   type ProjectionManifestV1,
   type ProjectionManifestV2,
+  type ProjectionManifestV3,
   type ProjectionNameV1,
 } from "./manifest-codec.js";
 import {

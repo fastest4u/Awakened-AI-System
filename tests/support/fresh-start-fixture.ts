@@ -5,7 +5,7 @@ import { join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
 import type { FreshStartGenesis, FreshStartIdentity, FreshStartRelease } from "../../src/orchestrator/fresh-start/contracts.js";
-import { PROJECTION_NAMES, projectionCoreChecksum } from "../../src/orchestrator/projections/checksum.js";
+import { PROJECTION_NAMES, projectionCoreChecksum, type ProjectionNameV2 } from "../../src/orchestrator/projections/checksum.js";
 import { GENESIS_GLOBAL_HASH } from "../../src/orchestrator/storage/event-append-transaction.js";
 import { NodeSqliteDriver } from "../../src/orchestrator/storage/node-sqlite-driver.js";
 import type { SqliteConnection } from "../../src/orchestrator/storage/sqlite-driver.js";
@@ -20,7 +20,7 @@ import { bindFreshStartAdmissionContext } from "../../src/orchestrator/fresh-sta
 /** Owned-test verifier only. Production promotion remains closed. */
 export async function activateFreshTestStore(connection: SqliteConnection, identity: FreshStartIdentity = FRESH_IDENTITY, options: Readonly<{alreadyInitialized?: true}> = {}) {
   let release = freshRelease({ ...identity, schemaIdentityHash: expectedSchemaFingerprint(PROJECT_STORE_MIGRATIONS) });
-  const genesis = freshGenesis({ ...identity, projectionChecksums: Object.fromEntries(PROJECTION_NAMES.map(name => [name, projectionCoreChecksum(name, 2, identity.projectId, 0n, [])])) });
+  const genesis = freshGenesis({ ...identity, projectionChecksums: Object.fromEntries(PROJECTION_NAMES.map(name => [name, projectionCoreChecksum(name, 2, identity.projectId, 0n, [])])) as Record<ProjectionNameV2, string> });
   const repository = new SqliteFreshStartRepository(connection);
   if(options.alreadyInitialized===true){
     if(arguments.length<2||identity===FRESH_IDENTITY)throw new Error("OWNED_INITIALIZED_IDENTITY_REQUIRED");
