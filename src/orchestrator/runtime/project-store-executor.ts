@@ -1,3 +1,5 @@
+import { decodePreparedGovernedNoteCreateV2, decodePreparedGovernedNoteRecoveryV2, encodePreparedGovernedNoteCreateV2, encodePreparedGovernedNoteRecoveryV2 } from "../governed-notes/codec.js";
+import type { PreparedGovernedNoteCreateV2, PreparedGovernedNoteRecoveryV2, GovernedNoteStoredReceiptV2, GovernedNoteRecoveryResultV2 } from "../governed-notes/contracts.js";
 import { types } from "node:util";
 import { decodePreparedGovernedNoteCreateV1, decodePreparedGovernedNoteRecoveryV1, encodePreparedGovernedNoteCreateV1, encodePreparedGovernedNoteRecoveryV1 } from "../governed-notes/codec.js";
 import type { PreparedGovernedNoteCreateV1, PreparedGovernedNoteRecoveryV1, GovernedNoteStoredReceiptV1, GovernedNoteRecoveryResultV1, GovernedNoteRecoveryIdsV1, GovernedNoteCloseObservationV1 } from "../governed-notes/contracts.js";
@@ -679,6 +681,31 @@ export class ProjectStoreExecutor {
       this.assertCallable(["open"]);
       return await this.request({ id: "", type: "governed-note-recover", binding: encodeWorkerBindingAssertion(this.#options.context), prepared: wire },
         "bounded", null) as GovernedNoteRecoveryResultV1;
+    } catch (error) { throw sanitizeGovernedNoteError(error, ids); }
+  }
+
+  async createGovernedNoteV2(prepared: PreparedGovernedNoteCreateV2): Promise<AppendResult<GovernedNoteStoredReceiptV2>> {
+    let ids: GovernedNoteRecoveryIdsV1 | null = null;
+    try {
+      const wire = encodePreparedGovernedNoteCreateV2(prepared);
+      const owned = decodePreparedGovernedNoteCreateV2(wire);
+      ids = { commandId: owned.command.commandId, idempotencyKey: owned.command.idempotencyKey };
+      this.assertCallable(["open"]);
+      const result = await this.request({ id: "", type: "governed-note-create", binding: encodeWorkerBindingAssertion(this.#options.context), prepared: wire },
+        "mutation", semanticIdentity(this.#options.context.binding.projectId, ids.commandId, ids.idempotencyKey));
+      return decodeAppendResultWire(result) as AppendResult<GovernedNoteStoredReceiptV2>;
+    } catch (error) { throw sanitizeGovernedNoteError(error, ids); }
+  }
+
+  async recoverGovernedNoteResultV2(prepared: PreparedGovernedNoteRecoveryV2): Promise<GovernedNoteRecoveryResultV2> {
+    let ids: GovernedNoteRecoveryIdsV1 | null = null;
+    try {
+      const wire = encodePreparedGovernedNoteRecoveryV2(prepared);
+      const owned = decodePreparedGovernedNoteRecoveryV2(wire);
+      ids = { commandId: owned.request.commandId, idempotencyKey: owned.request.idempotencyKey };
+      this.assertCallable(["open"]);
+      return await this.request({ id: "", type: "governed-note-recover", binding: encodeWorkerBindingAssertion(this.#options.context), prepared: wire },
+        "bounded", null) as GovernedNoteRecoveryResultV2;
     } catch (error) { throw sanitizeGovernedNoteError(error, ids); }
   }
 

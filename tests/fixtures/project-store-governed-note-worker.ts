@@ -1,3 +1,7 @@
+import { decodeGovernedFixtureRequestV1, decodeGovernedFixtureReplyV1 } from "../../src/orchestrator/governed-notes/fixture-control.js";
+import { governedNoteCreateProofTargetV2, governedNoteRecoveryProofTargetV2 } from "../../src/orchestrator/governed-notes/authority.js";
+import { decodeGovernedNoteRecoveryV2 } from "../../src/orchestrator/governed-notes/codec.js";
+import type { GovernedFixtureActionPortV2 } from "../../src/orchestrator/governed-notes/fixture-control.js";
 import { FreshStartAdmissionGuard } from "../../src/orchestrator/fresh-start/fresh-start-admission.js";
 import { GovernedNoteRepository } from "../../src/orchestrator/governed-notes/repository.js";
 import { randomBytes, randomUUID } from "node:crypto";
@@ -36,7 +40,7 @@ import { decodeGovernedNoteRecoveryV1 } from "../../src/orchestrator/governed-no
 import { boundedRetainedJson,retainedExactRecord } from "../../src/orchestrator/privacy/evidence-contracts.js";
 import { retainedEvidenceProofTarget } from "../../src/orchestrator/privacy/retained-evidence-authority.js";
 import { GovernedNoteError } from "../../src/orchestrator/governed-notes/errors.js";
-import { decodeGovernedFixtureRequestV1,decodeGovernedFixtureReplyV1,type GovernedFixtureActionV1,type TrustedGovernedFixtureFactoryV1 } from "../../src/orchestrator/governed-notes/fixture-control.js";
+import { decodeGovernedFixtureRequestV2,decodeGovernedFixtureReplyV2,type GovernedFixtureActionV2,type TrustedGovernedFixtureFactoryV1 } from "../../src/orchestrator/governed-notes/fixture-control.js";
 import { LocalGovernedProviders,decodeProvisioning,observationView,OBS,writeSafeId } from "../support/governed-note-local-providers.js";
 import type { StoredCapabilityMaterialV1 } from "../../src/orchestrator/lifecycle/capability.service.js";
 import type { SessionAuthorityRecord } from "../../src/orchestrator/storage/lifecycle-storage.types.js";
@@ -54,6 +58,9 @@ import { computeProjectContextFingerprint } from "../../src/orchestrator/identit
 
 rootContext.binding.contextFingerprint=computeProjectContextFingerprint(rootContext.binding);childContext.binding.contextFingerprint=computeProjectContextFingerprint(childContext.binding);
 let nextSessionId:string|undefined,bootstrapped=config.bootstrapConsumed;
+let lifecycleEffectAdmitted=false;
+let successfulV2:Readonly<{commandId:string;idempotencyKey:string;sessionId:string}>|undefined;
+let fixtureRoot:string|undefined,fixtureChild:string|undefined,terminalConsumed=false;
 const ids={uuid:()=>{const next=nextSessionId;nextSessionId=undefined;return next??randomUUID();},bytes:randomBytes};
 const READ_HASH="a".repeat(64);
 const sourceState=()=>({sourceStateScopeVersion:1 as const,workspaceId:context.binding.workspaceId,branchRef:context.workspace.kind==="git"?context.workspace.branchRef:null,headCommit:context.workspace.kind==="git"?context.workspace.headCommit:null,dirtyWorktreeFingerprint:READ_HASH});
@@ -116,14 +123,14 @@ function scanDurable():void{
  const dedup=connection.prepare("SELECT * FROM command_dedup WHERE command_type='create-governed-note'").all();
  let failures=0;const repository=new GovernedNoteRepository(connection);
  for(const row of rows.filter(r=>r.event_type==='GovernedNoteCreated')){
-  try{const prior=repository.findGovernedNotePrior(String(row.command_id),String(row.idempotency_key));if(!prior||prior.events.length!==2||prior.events[0].eventType!=="GovernedNoteCreated"||prior.events[1].eventType!=="MemorySourceRecorded"||prior.events.some(e=>e.verificationStatus!=="unverified"||e.visibilityScope!=="session")||prior.result.response.status!=="candidate"||JSON.parse(prior.events[1].payloadJson).item.status!=="candidate")failures++;}catch{failures++;}
+  try{const prior=repository.findGovernedNotePriorAny(String(row.command_id),String(row.idempotency_key));if(!prior||prior.events.length!==2||prior.events[0].eventType!=="GovernedNoteCreated"||prior.events[1].eventType!=="MemorySourceRecorded"||prior.events.some(e=>e.verificationStatus!=="unverified"||e.visibilityScope!=="session")||prior.result.response.status!=="candidate"||JSON.parse(prior.events[1].payloadJson).item.status!=="candidate")failures++;}catch{failures++;}
  }
  const text=JSON.stringify({rows,dedup},(_key,value:unknown)=>typeof value==="bigint"?value.toString():value);
  const markers=["fixture_secret","fixture_exception_marker",...tokenMarkers];
  Atomics.store(observation,OBS.pairs,rows.filter(r=>r.event_type==='GovernedNoteCreated').length);Atomics.store(observation,OBS.pairHeaderFailures,failures);Atomics.store(observation,OBS.privacyLeaks,markers.some(marker=>text.includes(marker))||providers.containsPrivateMaterial(text)?1:0);
 }
 const originalEvidenceMac=providers.evidence.mac.bind(providers.evidence);
-providers.evidence.mac=(scope,purpose,ref,domain,bytes)=>{if(config.scenario==="provider-error"&&domain==="governed-note-original-input/v1"){Atomics.add(observation,OBS.providerFailure,1);throw new Error("fixture_exception_marker");}return originalEvidenceMac(scope,purpose,ref,domain,bytes);};
+providers.evidence.mac=(scope,purpose,ref,domain,bytes)=>{if(config.scenario==="provider-error"&&["governed-note-original-input/v1","governed-note-original-input/v2"].includes(domain)){Atomics.add(observation,OBS.providerFailure,1);throw new Error("fixture_exception_marker");}return originalEvidenceMac(scope,purpose,ref,domain,bytes);};
 const governedFactory=new GovernedNoteRuntimeFactory({provider:providers.evidence,policy:()=>providers.state.policy,clock,nonceSource:ids,faults:{inject(point){
  if(point==="recovery-before-final-verify"&&!readFaultInjected&&["read-rollback-failure","read-rollback-success"].includes(config.scenario)){readFaultInjected=true;throw new GovernedNoteError("GOVERNED_NOTE_UNAVAILABLE");}
  if(point==="recovery-before-final-verify"&&["delay-committed","delay-absent","detach-expired"].includes(config.scenario))localClock(new Date(Date.parse(lastExpiry)+(config.scenario==="detach-expired"?0:-1)).toISOString());
@@ -156,12 +163,16 @@ const fixtureFactory:TrustedGovernedFixtureFactoryV1={create(input){
  const protectedAuth=(sessionId:string,p:ReturnType<typeof createCapabilityProof>)=>({kind:"protected" as const,authoritySessionId:sessionId as never,targetSessionId:sessionId as never,proof:p,approval:null,childBindingGrant:null});
  async function bootstrap(rootSessionId:string,childSessionId:string){
   if(bootstrapped)throw new GovernedNoteError("GOVERNED_NOTE_UNAVAILABLE");bootstrapped=true;
+  if(["full-note-sibling-v2","full-note-child-terminal-v2"].includes(config.scenario)&&context.binding.actorRole!=="untrusted")throw new GovernedNoteError("GOVERNED_NOTE_UNAVAILABLE");
+  fixtureRoot=rootSessionId;fixtureChild=childSessionId;
   const b=rootContext.binding,common={projectId:b.projectId,vaultId:b.vaultId,storeId:b.storeId,workspaceId:b.workspaceId,clientNamespace:b.clientNamespace,presentingActorRole:"primary" as const,presentingClientInstanceId:b.clientInstanceId,targetActorRole:"primary" as const,targetClientInstanceId:b.clientInstanceId,internalWorkflowId:null,internalWorkflowGeneration:null,internalPlannedWorkId:null};
   const command=decodeLifecycleSemanticCommandDraft({commandType:"root-start",commandId:randomUUID(),idempotencyKey:randomUUID(),agentId:"fixture-agent",expectedProjectId:b.projectId,expectedVaultId:b.vaultId,expectedWorkspaceId:b.workspaceId,expectedBranchRef:null,continuityKey:`g10/${rootSessionId}`,resumePolicy:"new"});
   const witness=buildLifecycleIntentWitness(command,{...common,authorizationKind:"initial-authority",authorizationSessionId:null,targetSessionId:command.commandId,capabilityKind:null,capabilityGeneration:null});
   nextSessionId=rootSessionId;
+  lifecycleEffectAdmitted=true;
   const started=await lifecycleRuntime.execute(decodeLifecycleWorkerOperationWire({kind:"semantic",operation:"root-start",prepared:{command,candidateIntentHash:witness.intentHash,authorization:{kind:"initial-authority",authoritySessionId:null,targetSessionId:null,proof:null,approval:null,childBindingGrant:null}}}),rootContext);
   if((started.result as unknown as {publicResult?:{sessionId:string}}).publicResult?.sessionId!==rootSessionId)throw new GovernedNoteError("GOVERNED_NOTE_UNAVAILABLE");
+  async function fork(childSessionId:string){
   const row=repository.get(connection,b.projectId,rootSessionId)!,version=connection.prepare("SELECT current_version FROM streams WHERE stream_id=$id").get({$id:`session/${rootSessionId}`})!.current_version;
   const childCommand=decodeLifecycleSemanticCommandDraft({commandType:"fork-child",commandId:randomUUID(),idempotencyKey:randomUUID(),agentId:"fixture-agent",expectedProjectId:b.projectId,expectedVaultId:b.vaultId,expectedWorkspaceId:b.workspaceId,expectedBranchRef:null,parentSessionId:rootSessionId,expectedStreamVersion:String(version),assignment:{assignmentId:randomUUID(),summary:"Owned synthetic child",scope:"governed-fixture"},directAccessRequested:true});
   const childWitness=buildLifecycleIntentWitness(childCommand,{...common,targetActorRole:"untrusted",targetClientInstanceId:childContext.binding.clientInstanceId,authorizationKind:"protected",authorizationSessionId:rootSessionId,targetSessionId:rootSessionId,capabilityKind:"root-session-handle",capabilityGeneration:row.ownerGeneration!.toString()});
@@ -172,28 +183,62 @@ const fixtureFactory:TrustedGovernedFixtureFactoryV1={create(input){
    const p=proof(rootSessionId,rootContext,s=>({...s,targetActorRole:"untrusted",targetClientInstanceId:childContext.binding.clientInstanceId,proofVersion:1,target:"semantic-command",commandId:childCommand.commandId,idempotencyKey:childCommand.idempotencyKey,intentHash:childWitness.intentHash,proofNonce:randomUUID()}));
    nextSessionId=childSessionId;
    const child=await lifecycleRuntime.execute(decodeLifecycleWorkerOperationWire({kind:"semantic",operation:"fork-child",prepared:{command:childCommand,candidateIntentHash:childWitness.intentHash,authorization:{...protectedAuth(rootSessionId,p),childBindingGrant:{...claims,mac:Buffer.from(mac).toString("base64url")}}}}),rootContext);
-   if((child.result as unknown as {publicResult?:{childSessionId:string}}).publicResult?.childSessionId!==childSessionId)throw new GovernedNoteError("GOVERNED_NOTE_UNAVAILABLE");
+   const result=child.result as unknown as {kind:string;publicResult:{operation:string;childSessionId:string;parentSessionId:string;eventPosition:string;state:string}};
+   const actual=repository.get(connection,b.projectId,childSessionId)!;repository.requireFoldMatch(connection,actual);
+   if(result.kind!=="success"||result.publicResult.operation!=="fork-child"||result.publicResult.childSessionId!==childSessionId||result.publicResult.parentSessionId!==rootSessionId||actual.parentSessionId!==rootSessionId||actual.sessionKind!=="child"||actual.semanticState!=="active"||actual.directAccessEnabled!==true||!actual.childCapabilityGeneration||BigInt(result.publicResult.eventPosition)<1n)throw new GovernedNoteError("GOVERNED_NOTE_UNAVAILABLE");
+   return {position:BigInt(result.publicResult.eventPosition),generation:actual.childCapabilityGeneration};
   }finally{bytes.fill(0);mac?.fill(0);nextSessionId=undefined;}
+  }
+  await fork(childSessionId);
+  if(config.scenario==="full-note-sibling-v2"){
+   const sibling=randomUUID(),facts=await fork(sibling);if(sibling===childSessionId)throw new GovernedNoteError("GOVERNED_NOTE_UNAVAILABLE");
+   writeSafeId(config.observation,4,sibling);Atomics.store(times,10,facts.position);Atomics.store(times,11,facts.generation);Atomics.store(times,15,1n);Atomics.store(observation,OBS.siblingReady,1);
+  }
   for(const [index,sessionId,c]of [[0,rootSessionId,rootContext],[1,childSessionId,childContext]] as const){
    const decoded=decodeRetainEvidenceBatch({version:1,commandType:"retain-evidence-batch",commandId:randomUUID(),idempotencyKey:randomUUID(),targetSessionId:sessionId,conversationId:randomUUID(),frames:[{frameId:randomUUID(),ordinal:"0",role:"user",category:"user-message",occurredAt:clock.now(),mediaType:"text/plain; charset=utf-8",content:"Retained fixture_secret original",previousFrameId:null,toolCorrelationId:null,artifactHashes:[]}]});
    try{const p=proof(sessionId,c,s=>retainedEvidenceProofTarget(decoded,s,randomUUID()));const result=retainedEvidenceRuntime.execute({command:decoded.command,authorization:protectedAuth(sessionId,p)},c);writeSafeId(config.observation,index,result.response.evidenceIds[0]!);writeSafeId(config.observation,index+2,result.eventIds[0]!);Atomics.add(observation,OBS.sourceCount,1);}finally{decoded.canonicalOriginalBytes.fill(0);}
   }
   return {kind:"bootstrap" as const,rootSessionId,childSessionId};
  }
- return {async execute(action:GovernedFixtureActionV1){Atomics.add(observation,OBS.actionPosts,1);
+ async function terminalize(original:Readonly<{commandId:string;idempotencyKey:string;authoritySessionId:string}>){
+  if(terminalConsumed||!fixtureRoot||!fixtureChild||!successfulV2||original.commandId!==successfulV2.commandId||original.idempotencyKey!==successfulV2.idempotencyKey||original.authoritySessionId!==fixtureChild||successfulV2.sessionId!==fixtureChild)throw new GovernedNoteError("GOVERNED_NOTE_UNAVAILABLE");
+  terminalConsumed=true;
+  const rootId=fixtureRoot,childId=fixtureChild,b=rootContext.binding,prior=repository.get(connection,b.projectId,childId)!;
+  const base={agentId:"fixture-agent",expectedProjectId:b.projectId,expectedVaultId:b.vaultId,expectedWorkspaceId:b.workspaceId,expectedBranchRef:null,parentSessionId:rootId,childSessionId:childId};
+  const currentVersion=()=>String(connection.prepare("SELECT current_version FROM streams WHERE stream_id=$id").get({$id:`session/${childId}`})!.current_version);
+  async function execute(command:ReturnType<typeof decodeLifecycleSemanticCommandDraft>){
+   const root=repository.get(connection,b.projectId,rootId)!;
+   const witness=buildLifecycleIntentWitness(command,{projectId:b.projectId,vaultId:b.vaultId,storeId:b.storeId,workspaceId:b.workspaceId,clientNamespace:b.clientNamespace,presentingActorRole:"primary",presentingClientInstanceId:b.clientInstanceId,targetActorRole:"primary",targetClientInstanceId:b.clientInstanceId,internalWorkflowId:null,internalWorkflowGeneration:null,internalPlannedWorkId:null,authorizationKind:"protected",authorizationSessionId:rootId,targetSessionId:childId,capabilityKind:"root-session-handle",capabilityGeneration:root.ownerGeneration!.toString()});
+   const p=proof(rootId,rootContext,scope=>({...scope,targetSessionId:childId,proofVersion:1,target:"semantic-command",commandId:command.commandId,idempotencyKey:command.idempotencyKey,intentHash:witness.intentHash,proofNonce:randomUUID()}));
+   lifecycleEffectAdmitted=true;
+   const executed=await lifecycleRuntime.execute(decodeLifecycleWorkerOperationWire({kind:"semantic",operation:command.commandType,prepared:{command,candidateIntentHash:witness.intentHash,authorization:{...protectedAuth(rootId,p),targetSessionId:childId}}}),rootContext);
+   const result=executed.result as unknown as {kind:string;publicResult:{operation:string;childSessionId:string;parentSessionId:string;reportId:string;eventPosition:string;state:string}};
+   if(result.kind!=="success"||result.publicResult.operation!==command.commandType||result.publicResult.childSessionId!==childId||result.publicResult.parentSessionId!==rootId||BigInt(result.publicResult.eventPosition)<1n)throw new GovernedNoteError("GOVERNED_NOTE_UNAVAILABLE");
+   Atomics.add(times,15,1n);return result.publicResult;
+  }
+  const report=await execute(decodeLifecycleSemanticCommandDraft({...base,commandType:"record-child-report",commandId:randomUUID(),idempotencyKey:randomUUID(),childAuthorAgentId:"fixture-agent",expectedStreamVersion:currentVersion(),report:{reportVersion:1,outcomeSummary:"Owned synthetic terminal report",findings:[],proposedDecisions:[],filesObservedOrChanged:[],verificationPerformed:[],openFollowUps:[],blockers:[],evidenceFingerprints:[]}}));
+  const completed=await execute(decodeLifecycleSemanticCommandDraft({...base,commandType:"complete-child-session",commandId:randomUUID(),idempotencyKey:randomUUID(),expectedStreamVersion:currentVersion(),reportId:report.reportId}));
+  const row=repository.get(connection,b.projectId,childId)!,root=repository.get(connection,b.projectId,rootId)!;repository.requireFoldMatch(connection,row);repository.requireFoldMatch(connection,root);
+  const position=BigInt(completed.eventPosition);
+  if(completed.state!=="completed"||row.semanticState!=="completed"||row.terminalEventType!=="ChildSessionCompleted"||row.terminalEventPosition!==position||row.authorityEventPosition!==position||row.revocationEventPosition!==position||row.revocationReasonCode!=="child-completed"||!row.terminalAt||!row.revokedAt||row.childCapabilityGeneration!==prior.childCapabilityGeneration||row.parentSessionId!==rootId||root.semanticState!=="active"||root.revocationEventPosition!==null)throw new GovernedNoteError("GOVERNED_NOTE_UNAVAILABLE");
+  writeSafeId(config.observation,5,original.commandId);writeSafeId(config.observation,6,original.idempotencyKey);writeSafeId(config.observation,7,report.reportId);Atomics.store(times,11,row.childCapabilityGeneration!);Atomics.store(times,12,position);Atomics.store(times,13,row.authorityEventPosition);Atomics.store(times,14,row.revocationEventPosition);Atomics.store(observation,OBS.terminalReady,1);
+ }
+ return {async execute(action:GovernedFixtureActionV2){Atomics.add(observation,OBS.actionPosts,1);
   switch(action.kind){
    case "bootstrap":return bootstrap(action.rootSessionId,action.childSessionId);
    case "retain":return {kind:"retain",receipt:retainedEvidenceRuntime.execute(action.prepared,context).response};
    case "prepare-create":{const p=proof(action.authoritySessionId,context,s=>governedNoteCreateProofTarget(action.command,s,deriveGovernedNoteBinding(connection,context,action.authoritySessionId),randomUUID()));return {kind:"prepare-create",prepared:{command:action.command,authorization:protectedAuth(action.authoritySessionId,p)}};}
    case "prepare-recovery":{const request=decodeGovernedNoteRecoveryV1({version:1,operation:"recover-governed-note-result",operationId:action.operationId,requestId:action.requestId,commandId:action.commandId,idempotencyKey:action.idempotencyKey,expiresAt:new Date(Number(clock.nowMs()+60000n)).toISOString()});lastExpiry=request.expiresAt;Atomics.store(times,0,BigInt(Date.parse(lastExpiry)));const p=proof(action.authoritySessionId,context,s=>governedNoteRecoveryProofTarget(request,context,deriveGovernedNoteBinding(connection,context,action.authoritySessionId),s.capabilityGeneration,randomUUID()));const b=context.binding;return {kind:"prepare-recovery",prepared:{request,authorization:{kind:"bounded-operation",authoritySessionId:action.authoritySessionId as never,targetSessionId:action.authoritySessionId as never,proof:p,audience:{presentingActorRole:b.actorRole,targetActorRole:b.actorRole,presentingClientInstanceId:b.clientInstanceId,targetClientInstanceId:b.clientInstanceId}}}};}
+   case "prepare-create-v2":{const p=proof(action.authoritySessionId,context,s=>governedNoteCreateProofTargetV2(action.command,s,deriveGovernedNoteBinding(connection,context,action.authoritySessionId),randomUUID()));return {kind:"prepare-create-v2",prepared:{command:action.command,authorization:protectedAuth(action.authoritySessionId,p)}};}
+   case "prepare-recovery-v2":{if(config.scenario==="full-note-child-terminal-v2"&&(terminalConsumed||!successfulV2||action.commandId!==successfulV2.commandId||action.idempotencyKey!==successfulV2.idempotencyKey||action.authoritySessionId!==fixtureChild))throw new GovernedNoteError("GOVERNED_NOTE_UNAVAILABLE");const request=decodeGovernedNoteRecoveryV2({version:2,operation:"recover-governed-note-result",operationId:action.operationId,requestId:action.requestId,commandId:action.commandId,idempotencyKey:action.idempotencyKey,expiresAt:new Date(Number(clock.nowMs()+60000n)).toISOString()});lastExpiry=request.expiresAt;Atomics.store(times,0,BigInt(Date.parse(lastExpiry)));const p=proof(action.authoritySessionId,context,s=>governedNoteRecoveryProofTargetV2(request,context,deriveGovernedNoteBinding(connection,context,action.authoritySessionId),s.capabilityGeneration,randomUUID()));if(config.scenario==="full-note-child-terminal-v2")await terminalize(action);const b=context.binding;return {kind:"prepare-recovery-v2",prepared:{request,authorization:{kind:"bounded-operation",authoritySessionId:action.authoritySessionId as never,targetSessionId:action.authoritySessionId as never,proof:p,audience:{presentingActorRole:b.actorRole,targetActorRole:b.actorRole,presentingClientInstanceId:b.clientInstanceId,targetClientInstanceId:b.clientInstanceId}}}};}
    case "change-authority":{const result=await lifecycleRuntime.execute(action.operation,context);if((result.result as unknown as {kind?:string;publicResult?:{operation:string}}).kind!=="success"||(result.result as unknown as {publicResult?:{operation:string}}).publicResult?.operation!==action.operation.operation)throw new GovernedNoteError("GOVERNED_NOTE_UNAVAILABLE");return {kind:"applied",applied:true};}
    case "set-fixture-controls":providers.control(action.controls);return {kind:"applied",applied:true};
   }
- },dispose(){providers.dispose();tokenMarkers.clear();}};
+ },dispose(){providers.dispose();tokenMarkers.clear();}} as GovernedFixtureActionPortV2;
 }};
 const backend=new ProjectStoreWorkerBackend({selfUrl:new URL(import.meta.url),executorLeaseMs:data.executorLeaseMs,appendRetryDeadlineMs:data.appendRetryDeadlineMs,keyProvider:providers.capability,trustedFreshStartBuildInspector:()=>config.buildHash,
  lifecycleRuntimeFactory:{create(input){observeConnection(input);const lifecycle=lifecycleFactory.create(input);return {execute:(operation,c)=>lifecycle.execute(operation,c),dispose(){try{lifecycle.dispose();}finally{providers.dispose();}}};}},retainedEvidenceRuntimeFactory:{create(input){observeConnection(input);return retainedFactory.create(input);}},
- governedNoteRuntimeFactory:{create(input){observeConnection(input);const runtime=governedFactory.create(input);return {create(p,c){Atomics.add(observation,OBS.createPosts,1);try{const result=runtime.create(p,c);scanDurable();return result;}catch(error){scanDurable();throw error;}},recover(p,c){Atomics.add(observation,OBS.recoveryPosts,1);recovery=true;try{return runtime.recover(p,c);}finally{recovery=false;}}};}},trustedGovernedFixtureFactory:config.scenario==="missing-factory"?undefined:fixtureFactory});
+ governedNoteRuntimeFactory:{create(input){observeConnection(input);const runtime=governedFactory.create(input);return {createV2(p:import("../../src/orchestrator/governed-notes/contracts.js").PreparedGovernedNoteCreateV2,c:ProjectContext){Atomics.add(observation,OBS.createPosts,1);try{const result=runtime.createV2(p,c);if(config.scenario==="full-note-child-terminal-v2"&&!successfulV2)successfulV2=Object.freeze({commandId:result.response.commandId,idempotencyKey:result.response.idempotencyKey,sessionId:result.response.scope.sessionId!});scanDurable();return result;}catch(error){scanDurable();throw error;}},recoverV2(p:import("../../src/orchestrator/governed-notes/contracts.js").PreparedGovernedNoteRecoveryV2,c:ProjectContext){Atomics.add(observation,OBS.recoveryPosts,1);recovery=true;try{return runtime.recoverV2(p,c);}finally{recovery=false;}},create(p,c){Atomics.add(observation,OBS.createPosts,1);try{const result=runtime.create(p,c);scanDurable();return result;}catch(error){scanDurable();throw error;}},recover(p,c){Atomics.add(observation,OBS.recoveryPosts,1);recovery=true;try{return runtime.recover(p,c);}finally{recovery=false;}}};}},trustedGovernedFixtureFactory:config.scenario==="missing-factory"?undefined:fixtureFactory});
 const dispatch=backend.dispatch.bind(backend);backend.dispatch=async request=>{if(request.id===queuedRecoveryId)Atomics.add(times,8,1n);return dispatch(request);};
 const runtime=new ProjectStoreWorkerRuntime({backend,trustedGovernedFixtureActions:{execute:(binding,action)=>backend.executeTrustedGovernedFixtureAction(binding,action)},heartbeatIntervalMs:data.heartbeatIntervalMs,
  scheduler:{setInterval:(callback,ms)=>setInterval(callback,ms),clearInterval:handle=>clearInterval(handle as NodeJS.Timeout)},port:{postMessage(value){
@@ -204,19 +249,19 @@ const runtime=new ProjectStoreWorkerRuntime({backend,trustedGovernedFixtureActio
   parentPort!.postMessage(value);
  },close(){Atomics.store(observation,OBS.closed,1);config.port.close();parentPort!.close();}}});
 config.port.on("message",async(value:unknown)=>{
- let request:ReturnType<typeof decodeGovernedFixtureRequestV1>|undefined,executed=false;
- try{request=decodeGovernedFixtureRequestV1(value,{runId:state.runId,storeId:context.binding.storeId,ownerGeneration:config.ownerGeneration,binding:encodeWorkerBindingAssertion(context)});const result=await runtime.enqueueTrustedGovernedFixtureAction(request.binding,request.action);executed=true;const reply=decodeGovernedFixtureReplyV1({version:1,requestId:request.requestId,ok:true,result},request);
+ let request:ReturnType<typeof decodeGovernedFixtureRequestV1>|ReturnType<typeof decodeGovernedFixtureRequestV2>|undefined,executed=false;
+ try{const version=retainedExactRecord(value,["version","requestId","runId","storeId","ownerGeneration","binding","action"]).version;request=(version===2?decodeGovernedFixtureRequestV2:decodeGovernedFixtureRequestV1)(value,{runId:state.runId,storeId:context.binding.storeId,ownerGeneration:config.ownerGeneration,binding:encodeWorkerBindingAssertion(context)});const result=await runtime.enqueueTrustedGovernedFixtureAction(request.binding,request.action);executed=true;const reply=request.version===2?decodeGovernedFixtureReplyV2({version:2,requestId:request.requestId,ok:true,result},request):decodeGovernedFixtureReplyV1({version:1,requestId:request.requestId,ok:true,result},request);
  if(request.action.kind==="set-fixture-controls"){
   if(config.scenario==="action-outcome-unknown")throw Object.assign(new Error("fixture_exception_marker"),{code:"OPERATION_OUTCOME_UNKNOWN"});
   if(config.scenario==="timeout-control")return;
   if(config.scenario==="malformed-control"){config.port.postMessage({...reply,requestId:randomUUID()});return;}
   if(config.scenario==="delay-control"){setTimeout(()=>config.port.postMessage(reply),500);return;}
- }config.port.postMessage(reply);}
+ }config.port.postMessage(reply);lifecycleEffectAdmitted=false;}
  catch(error){
   // An executed action without a validated ACK has no nonexecution certificate.
   // Closing this private port produces the controller's local transport-loss certificate.
-  if(!request||executed||!(error instanceof GovernedNoteError)||["COMMAND_OUTCOME_UNKNOWN","GOVERNED_NOTE_OWNERSHIP_UNCERTAIN","WORKER_PROTOCOL_ERROR","WORKER_UNAVAILABLE"].includes(error.code)){config.port.close();return;}
-  config.port.postMessage({version:1,requestId:request.requestId,ok:false,error:{code:"GOVERNED_NOTE_UNAVAILABLE",message:"GOVERNED_NOTE_UNAVAILABLE",details:{}}});
+  if(!request||executed||lifecycleEffectAdmitted||!(error instanceof GovernedNoteError)||["COMMAND_OUTCOME_UNKNOWN","GOVERNED_NOTE_OWNERSHIP_UNCERTAIN","WORKER_PROTOCOL_ERROR","WORKER_UNAVAILABLE"].includes(error.code)){config.port.close();void backend.close().catch(()=>undefined).finally(()=>parentPort!.close());return;}
+  config.port.postMessage({version:request.version,requestId:request.requestId,ok:false,error:{code:"GOVERNED_NOTE_UNAVAILABLE",message:"GOVERNED_NOTE_UNAVAILABLE",details:{}}});
  }
 });
 parentPort.on("message",value=>{

@@ -1,4 +1,6 @@
-import { decodeGovernedFixtureActionV1, decodeGovernedFixtureResultV1, type GovernedFixtureActionV1, type GovernedFixtureResultV1, type GovernedFixtureActionPortV1, type TrustedGovernedFixtureFactoryV1 } from "../governed-notes/fixture-control.js";
+import { decodeOwnedGovernedCreate, decodeOwnedGovernedRecovery } from "../governed-notes/worker-protocol.js";
+import type { GovernedNoteRuntimeV2, PreparedGovernedNoteCreateV1, PreparedGovernedNoteCreateV2, PreparedGovernedNoteRecoveryV1, PreparedGovernedNoteRecoveryV2 } from "../governed-notes/contracts.js";
+import { decodeGovernedFixtureActionV2, decodeGovernedFixtureResultV2, type GovernedFixtureActionV2, type GovernedFixtureResultV2, type GovernedFixtureActionPortV1, type TrustedGovernedFixtureFactoryV1 } from "../governed-notes/fixture-control.js";
 import { GovernedNoteError } from "../governed-notes/errors.js";
 import { hasUncertainGovernedRecoveryCleanup } from "../governed-notes/service.js";
 import { decodePreparedGovernedNoteCreateV1, decodePreparedGovernedNoteRecoveryV1 } from "../governed-notes/codec.js";
@@ -653,10 +655,10 @@ export class ProjectStoreWorkerBackend implements WorkerRuntimeBackend {
     }
   }
 
-  async executeTrustedGovernedFixtureAction(binding:WorkerBindingAssertion,action:GovernedFixtureActionV1):Promise<GovernedFixtureResultV1>{
-    const owned=decodeGovernedFixtureActionV1(action),active=this.requireActive(binding);
+  async executeTrustedGovernedFixtureAction(binding:WorkerBindingAssertion,action:GovernedFixtureActionV2):Promise<GovernedFixtureResultV2>{
+    const owned=decodeGovernedFixtureActionV2(action),active=this.requireActive(binding);
     if(!active.governedFixture)throw new GovernedNoteError("GOVERNED_NOTE_UNAVAILABLE");
-    return decodeGovernedFixtureResultV1(await active.governedFixture.execute(owned),owned);
+    return decodeGovernedFixtureResultV2(await (active.governedFixture as import("../governed-notes/fixture-control.js").GovernedFixtureActionPortV2).execute(owned),owned);
   }
 
   private active(): ActiveStore {
@@ -700,19 +702,23 @@ export class ProjectStoreWorkerBackend implements WorkerRuntimeBackend {
       const runtime = active.governedNoteRuntime;
       if (runtime === null) throw new GovernedNoteError("GOVERNED_NOTE_UNAVAILABLE");
       const context = active.context;
+      const create=request.type==="governed-note-create"?decodeOwnedGovernedCreate(request.prepared):null;
+      const recover=request.type==="governed-note-recover"?decodeOwnedGovernedRecovery(request.prepared):null;
+      const v2=runtime as Partial<GovernedNoteRuntimeV2>;
+      if(create?.command.version===2&&typeof v2.createV2!=="function"||recover?.request.version===2&&typeof v2.recoverV2!=="function")throw new GovernedNoteError("GOVERNED_NOTE_UNAVAILABLE");
       const data = request.type === "governed-note-create"
         ? encodeAppendResultWire(await retryPrimarySqliteBusy(() => {
-          const result = runtime.create(decodePreparedGovernedNoteCreateV1(request.prepared), context);
+          const result = create!.command.version===2?v2.createV2!(create as PreparedGovernedNoteCreateV2,context):runtime.create(create as PreparedGovernedNoteCreateV1,context);
           returned = true;
           return result;
         }, { deadlineMs: this.#options.appendRetryDeadlineMs }))
-        : runtime.recover(decodePreparedGovernedNoteRecoveryV1(request.prepared), context);
+        : (recover!.request.version===2?v2.recoverV2!(recover as PreparedGovernedNoteRecoveryV2,context):runtime.recover(recover as PreparedGovernedNoteRecoveryV1,context));
       returned = true;
       const response = decodeGovernedNoteWorkerResponse({ id: request.id, ok: true, data }, request);
       if (!response.ok) throw new GovernedNoteError("WORKER_PROTOCOL_ERROR");
       return response.data;
     } catch (error) {
-      if (active && hasUncertainGovernedRecoveryCleanup(active.connection)) {
+      if (request.type === "governed-note-recover" && active && hasUncertainGovernedRecoveryCleanup(active.connection)) {
         // Invalidate before yielding. The runtime closes this owner's transport
         // without an ordinary ACK; actual worker exit poisons its parent owner.
         this.#closed = true;

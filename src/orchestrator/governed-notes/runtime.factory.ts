@@ -8,7 +8,7 @@ import { GovernedNoteAuthorityVerifier } from "./authority.js";
 import { GovernedNoteRepository } from "./repository.js";
 import { GovernedNoteProvenanceRepository } from "./provenance.repository.js";
 import { GovernedNoteService, type GovernedNoteFaultInjectorV1 } from "./service.js";
-import type { GovernedNoteClockV1, GovernedNoteRuntime, GovernedNoteRuntimeFactoryPort } from "./contracts.js";
+import type { GovernedNoteClockV1, GovernedNoteRuntimeV2, GovernedNoteRuntimeFactoryPortV2 } from "./contracts.js";
 export interface GovernedNoteRuntimeFactoryOptions {
   readonly provider: EvidenceKeyProvider;
   readonly policy: () => TrustedRedactionPolicyV1;
@@ -16,9 +16,9 @@ export interface GovernedNoteRuntimeFactoryOptions {
   readonly nonceSource: CapabilityNonceSource;
   readonly faults?: GovernedNoteFaultInjectorV1;
 }
-export class GovernedNoteRuntimeFactory implements GovernedNoteRuntimeFactoryPort {
+export class GovernedNoteRuntimeFactory implements GovernedNoteRuntimeFactoryPortV2 {
   constructor(private readonly options: GovernedNoteRuntimeFactoryOptions) {}
-  create(input: RetainedEvidenceRuntimeCreateInput): GovernedNoteRuntime {
+  create(input: RetainedEvidenceRuntimeCreateInput): GovernedNoteRuntimeV2 {
     const { connection, maintenanceFence, keyProvider } = input;
     const capabilities = new CapabilityService({ keyProvider, clock: this.options.clock, nonceSource: this.options.nonceSource });
     const service = new GovernedNoteService({ connection,
@@ -30,6 +30,6 @@ export class GovernedNoteRuntimeFactory implements GovernedNoteRuntimeFactoryPor
       ...(this.options.faults === undefined ? {} : { faults: this.options.faults }),
     });
     // The service owns each attempt and preserves only its certified BEGIN-busy retry classification.
-    return Object.freeze({ create: service.create.bind(service), recover: service.recover.bind(service) });
+    return Object.freeze({ createV2: service.createV2.bind(service), recoverV2: service.recoverV2.bind(service), create: service.create.bind(service), recover: service.recover.bind(service) });
   }
 }

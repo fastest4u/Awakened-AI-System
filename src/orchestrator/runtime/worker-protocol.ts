@@ -1,3 +1,6 @@
+import { decodeOwnedGovernedCreate, decodeOwnedGovernedRecovery } from "../governed-notes/worker-protocol.js";
+import { encodePreparedGovernedNoteCreateV2, encodePreparedGovernedNoteRecoveryV2 } from "../governed-notes/codec.js";
+import type { PreparedGovernedNoteCreateWireV2, PreparedGovernedNoteRecoveryWireV2, GovernedNoteRecoveryResultV2 } from "../governed-notes/contracts.js";
 import { types } from "node:util";
 import { decodePreparedGovernedNoteCreateV1, decodePreparedGovernedNoteRecoveryV1, encodePreparedGovernedNoteCreateV1, encodePreparedGovernedNoteRecoveryV1 } from "../governed-notes/codec.js";
 import type { PreparedGovernedNoteCreateWireV1, PreparedGovernedNoteRecoveryWireV1, GovernedNoteRecoveryResultV1 } from "../governed-notes/contracts.js";
@@ -327,8 +330,8 @@ export type WorkerRequest =
   | { id: string; type: "open"; binding: WorkerBinding; freshStart?: FreshStartContextWire }
   | { id: string; type: "append"; binding: WorkerBindingAssertion; command: AppendCommandWire }
   | { id: string; type: "lifecycle"; binding: WorkerBindingAssertion; operation: LifecycleWorkerOperationWire }
-  | { id: string; type: "governed-note-create"; binding: WorkerBindingAssertion; prepared: PreparedGovernedNoteCreateWireV1 }
-  | { id: string; type: "governed-note-recover"; binding: WorkerBindingAssertion; prepared: PreparedGovernedNoteRecoveryWireV1 }
+  | { id: string; type: "governed-note-create"; binding: WorkerBindingAssertion; prepared: PreparedGovernedNoteCreateWireV1 | PreparedGovernedNoteCreateWireV2 }
+  | { id: string; type: "governed-note-recover"; binding: WorkerBindingAssertion; prepared: PreparedGovernedNoteRecoveryWireV1 | PreparedGovernedNoteRecoveryWireV2 }
   | { id: string; type: "retained-evidence"; binding: WorkerBindingAssertion; prepared: PreparedRetainedEvidenceCommandWireV1 }
   | { id: string; type: "quickIntegrity"; binding: WorkerBindingAssertion; tailLimit: number }
   | { id: string; type: "fullIntegrity"; binding: WorkerBindingAssertion }
@@ -336,7 +339,7 @@ export type WorkerRequest =
   | { id: string; type: "close" };
 
 export type WorkerSuccessData =
-  | GovernedNoteRecoveryResultV1
+  | GovernedNoteRecoveryResultV1 | GovernedNoteRecoveryResultV2
   | WorkerPingResult
   | WorkerOpenResult
   | StoreIdentityWire
@@ -764,9 +767,8 @@ export function decodeWorkerRequest(value: unknown): WorkerRequest {
       exact(value, ["id", "type", "binding", "prepared"]);
       assertGovernedNoteEnvelopeSize(value, 4 * 1024 * 1024);
       const binding = Object.freeze(decodeAssertion(request.binding));
-      return type === "governed-note-create"
-        ? Object.freeze({ id, type, binding, prepared: encodePreparedGovernedNoteCreateV1(decodePreparedGovernedNoteCreateV1(request.prepared)) })
-        : Object.freeze({ id, type, binding, prepared: encodePreparedGovernedNoteRecoveryV1(decodePreparedGovernedNoteRecoveryV1(request.prepared)) });
+      if(type==="governed-note-create") { const p=decodeOwnedGovernedCreate(request.prepared); return Object.freeze({id,type,binding,prepared:p.command.version===2?encodePreparedGovernedNoteCreateV2(p as import("../governed-notes/contracts.js").PreparedGovernedNoteCreateV2):encodePreparedGovernedNoteCreateV1(p as import("../governed-notes/contracts.js").PreparedGovernedNoteCreateV1)}); }
+      const p=decodeOwnedGovernedRecovery(request.prepared);return Object.freeze({id,type,binding,prepared:p.request.version===2?encodePreparedGovernedNoteRecoveryV2(p as import("../governed-notes/contracts.js").PreparedGovernedNoteRecoveryV2):encodePreparedGovernedNoteRecoveryV1(p as import("../governed-notes/contracts.js").PreparedGovernedNoteRecoveryV1)});
     }
     case "retained-evidence": {
       exact(value, ["id", "type", "binding", "prepared"]);

@@ -1,8 +1,11 @@
+import { assertMarkdownNoteBodyV1 } from "./body-content.js";
+import { decodeGovernedNoteCommandV2, encodeGovernedNoteCommandV2, decodePreparedGovernedNoteCreateV2, decodePreparedGovernedNoteRecoveryV2, encodePreparedGovernedNoteCreateV2, encodePreparedGovernedNoteRecoveryV2 } from "./codec.js";
+import type { GovernedNoteCommandV2, PreparedGovernedNoteCreateV2, PreparedGovernedNoteRecoveryV2 } from "./contracts.js";
 import type { ProjectContext } from "../identity/contracts.js";
 import type { CapabilityKeyPurpose } from "../lifecycle/authority/capability-key-provider.js";
 import type { EvidenceKeyPurpose,EvidenceKeyRefV1 } from "../privacy/evidence-key-provider.js";
 import { redactGovernedNoteSummaryV1,type TrustedRedactionPolicyV1 } from "../privacy/redaction.js";
-import { boundedRetainedJson,decodeRetainedEvidenceReceipt,retainedDataEntries,retainedExactRecord,type RetainedEvidenceReceiptV1 } from "../privacy/evidence-contracts.js";
+import { boundedRetainedJson,retainedStringMetrics,decodeRetainedEvidenceReceipt,retainedDataEntries,retainedExactRecord,type RetainedEvidenceReceiptV1 } from "../privacy/evidence-contracts.js";
 import { decodeEvidenceKeyRef,retainedIdentifier } from "../privacy/retained-evidence-codec.js";
 import { decodePreparedRetainedEvidenceCommand,encodePreparedRetainedEvidenceCommand,type PreparedRetainedEvidenceCommandV1 } from "../privacy/retained-evidence-worker-protocol.js";
 import type { RetainedEvidenceRuntimeCreateInput,RetainedEvidenceRuntime } from "../privacy/retained-evidence-runtime.factory.js";
@@ -110,3 +113,77 @@ export function decodeGovernedFixtureReplyV1(value:unknown,request:GovernedFixtu
 const uncertainFailures=new WeakSet<object>();
 export function governedFixtureTransportUncertain():Error{const error=new GovernedNoteError("GOVERNED_NOTE_UNAVAILABLE");uncertainFailures.add(error);return error;}
 export function isGovernedFixtureTransportUncertain(error:unknown):boolean{return typeof error==="object"&&error!==null&&uncertainFailures.has(error);}
+
+export type GovernedFixtureActionV2=GovernedFixtureActionV1
+ |Readonly<{kind:"prepare-create-v2";authoritySessionId:string;command:GovernedNoteCommandV2}>
+ |Readonly<{kind:"prepare-recovery-v2";authoritySessionId:string;operationId:string;requestId:string;commandId:string;idempotencyKey:string}>;
+export type GovernedFixtureResultV2=GovernedFixtureResultV1
+ |Readonly<{kind:"prepare-create-v2";prepared:PreparedGovernedNoteCreateV2}>
+ |Readonly<{kind:"prepare-recovery-v2";prepared:PreparedGovernedNoteRecoveryV2}>;
+export interface GovernedFixtureActionPortV2 extends GovernedFixtureActionPortV1 {
+ execute(action:GovernedFixtureActionV1):Promise<GovernedFixtureResultV1>;
+ execute(action:GovernedFixtureActionV2):Promise<GovernedFixtureResultV2>;
+}
+export type GovernedFixtureRequestV2=Omit<GovernedFixtureRequestV1,"version"|"action">&Readonly<{version:2;action:GovernedFixtureActionV2}>;
+export type GovernedFixtureReplyV2=Readonly<{version:2;requestId:string;ok:true;result:GovernedFixtureResultV2}>|Readonly<{version:2;requestId:string;ok:false;error:GovernedNoteErrorV1}>;
+/** No caller property is read before descriptor admission. Only this exact selected path owns a body. */
+function fixtureBodyCopy(value:unknown,bodyPath:readonly string[]):unknown {
+ let containers=0;const ancestors=new Set<object>();
+ const selected=(path:readonly string[])=>path.length===bodyPath.length&&path.every((k,n)=>k===bodyPath[n]);
+ const scalar=(v:string)=>{retainedStringMetrics(v,2048);};
+ function visit(v:unknown,depth:number,path:readonly string[],metadata:boolean):unknown {
+  if(typeof v==="string"){if(selected(path)){assertMarkdownNoteBodyV1(v);return metadata?"":v;}scalar(v);return v;}
+  if(v===null||typeof v==="boolean")return v;
+  if(typeof v==="number"&&Number.isFinite(v))return v;
+  if(typeof v!=="object"||ancestors.has(v)||depth>8||++containers>128)invalid();
+  const entries=retainedDataEntries(v,Array.isArray(v)?64:32);ancestors.add(v);
+  const out:Record<string,unknown>|unknown[]=Array.isArray(v)?[]:Object.create(null);
+  for(const[k,c]of entries){scalar(k);Object.defineProperty(out,k,{value:visit(c,depth+1,[...path,k],metadata),enumerable:true});}
+  ancestors.delete(v);return Object.freeze(out);
+ }
+ const owned=visit(value,0,[],false);boundedRetainedJson(owned,262144);containers=0;boundedRetainedJson(visit(owned,0,[],true),65536);return owned;
+}
+export function decodeGovernedFixtureActionV2(value:unknown):GovernedFixtureActionV2 {
+ const r=record(value);
+ if(r.kind==="prepare-create-v2"){
+  retainedExactRecord(value,["kind","authoritySessionId","command"]);session(r.authoritySessionId);
+  const owned=fixtureBodyCopy(value,["command","content","body"]) as Extract<GovernedFixtureActionV2,{kind:"prepare-create-v2"}>;
+  return Object.freeze({...owned,command:decodeGovernedNoteCommandV2(owned.command)});
+ }
+ if(r.kind==="prepare-recovery-v2"){
+  retainedExactRecord(value,["kind","authoritySessionId","operationId","requestId","commandId","idempotencyKey"]);session(r.authoritySessionId);
+  for(const k of ["operationId","requestId","commandId","idempotencyKey"])fixtureUuid(r[k]);
+  return boundedRetainedJson(value,8192).snapshot as unknown as GovernedFixtureActionV2;
+ }
+ return decodeGovernedFixtureActionV1(value);
+}
+export function decodeGovernedFixtureResultV2(value:unknown,action:GovernedFixtureActionV2):GovernedFixtureResultV2 {
+ if(action.kind!=="prepare-create-v2"&&action.kind!=="prepare-recovery-v2")return decodeGovernedFixtureResultV1(value,action);
+ const r=retainedExactRecord(value,["kind","prepared"]);if(r.kind!==action.kind)invalid();
+ if(action.kind==="prepare-create-v2"){
+  const owned=fixtureBodyCopy(value,["prepared","command","content","body"]) as Extract<GovernedFixtureResultV2,{kind:"prepare-create-v2"}>;
+  const p=decodePreparedGovernedNoteCreateV2(encodePreparedGovernedNoteCreateV2(owned.prepared));
+  if(p.authorization.authoritySessionId!==action.authoritySessionId||encodeGovernedNoteCommandV2(p.command)!==encodeGovernedNoteCommandV2(action.command))invalid();
+  return Object.freeze({kind:action.kind,prepared:p});
+ }
+ boundedRetainedJson(value,16384);const p=decodePreparedGovernedNoteRecoveryV2(encodePreparedGovernedNoteRecoveryV2(r.prepared as PreparedGovernedNoteRecoveryV2));
+ if(p.authorization.authoritySessionId!==action.authoritySessionId)invalid();for(const k of ["operationId","requestId","commandId","idempotencyKey"]as const)if(p.request[k]!==action[k])invalid();
+ return Object.freeze({kind:action.kind,prepared:p});
+}
+export function decodeGovernedFixtureRequestV2(value:unknown,expected:Parameters<typeof decodeGovernedFixtureRequestV1>[1]):GovernedFixtureRequestV2 {
+ const r=retainedExactRecord(value,["version","requestId","runId","storeId","ownerGeneration","binding","action"]);
+ if(r.version!==2||r.runId!==expected.runId||r.storeId!==expected.storeId||r.ownerGeneration!==expected.ownerGeneration)invalid();fixtureUuid(r.requestId);fixtureUuid(r.runId);
+ if(typeof r.ownerGeneration!=="string"||parseUnsignedDecimal(r.ownerGeneration,"generation")<1n)invalid();
+ const binding=decodeWorkerBindingAssertion(r.binding);if(boundedRetainedJson(binding,4096).canonical!==boundedRetainedJson(expected.binding,4096).canonical)invalid();
+ const action=decodeGovernedFixtureActionV2(r.action);
+ if(action.kind==="prepare-create-v2")fixtureBodyCopy(value,["action","command","content","body"]);else boundedRetainedJson(value,action.kind==="prepare-recovery-v2"?8192:FIXTURE_REQUEST_BYTES);
+ return Object.freeze({version:2,requestId:r.requestId as string,runId:r.runId as string,storeId:r.storeId as string,ownerGeneration:r.ownerGeneration,binding,action});
+}
+export function decodeGovernedFixtureReplyV2(value:unknown,request:GovernedFixtureRequestV2):GovernedFixtureReplyV2 {
+ const r=record(value);retainedExactRecord(value,r.ok===true?["version","requestId","ok","result"]:["version","requestId","ok","error"]);
+ if(r.version!==2||r.requestId!==request.requestId)invalid();
+ if(r.ok===true){const result=decodeGovernedFixtureResultV2(r.result,request.action);if(result.kind==="prepare-create-v2")fixtureBodyCopy(value,["result","prepared","command","content","body"]);else boundedRetainedJson(value,16384);return Object.freeze({version:2,requestId:request.requestId,ok:true,result});}
+ if(r.ok!==false)invalid();boundedRetainedJson(value,16384);
+ const a=request.action,ids=a.kind==="prepare-create-v2"||a.kind==="prepare-create"?a.command:a.kind==="prepare-recovery-v2"||a.kind==="prepare-recovery"?a:a.kind==="retain"?a.prepared.command:null;
+ return Object.freeze({version:2,requestId:request.requestId,ok:false,error:decodeGovernedNoteErrorV1(r.error,ids)});
+}

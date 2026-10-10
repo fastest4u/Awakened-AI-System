@@ -1,4 +1,4 @@
-import { decodeGovernedFixtureActionV1, decodeGovernedFixtureResultV1, type GovernedFixtureActionV1, type GovernedFixtureResultV1 } from "../governed-notes/fixture-control.js";
+import { decodeGovernedFixtureActionV2, decodeGovernedFixtureResultV2, type GovernedFixtureActionV2, type GovernedFixtureResultV2 } from "../governed-notes/fixture-control.js";
 import { decodeWorkerBindingAssertion } from "./worker-protocol.js";
 import { decodeGovernedNoteWorkerResponse, governedNoteRequestIds, isGovernedNoteRequest, sanitizeGovernedNoteError } from "../governed-notes/worker-protocol.js";
 import { GovernedNoteError } from "../governed-notes/errors.js";
@@ -43,7 +43,7 @@ export interface WorkerRuntimeBackend {
 }
 
 export interface ProjectStoreWorkerRuntimeOptions {
-  trustedGovernedFixtureActions?: Readonly<{execute:(binding:WorkerBindingAssertion,action:GovernedFixtureActionV1)=>Promise<GovernedFixtureResultV1>}>;
+  trustedGovernedFixtureActions?: Readonly<{execute:(binding:WorkerBindingAssertion,action:GovernedFixtureActionV2)=>Promise<GovernedFixtureResultV2>}>;
   backend: WorkerRuntimeBackend;
   port: WorkerRuntimePort;
   scheduler: WorkerRuntimeScheduler;
@@ -153,11 +153,11 @@ export class ProjectStoreWorkerRuntime {
     this.#heartbeatIntervalMs = options.heartbeatIntervalMs;
   }
 
-  enqueueTrustedGovernedFixtureAction(binding:WorkerBindingAssertion,action:GovernedFixtureActionV1):Promise<GovernedFixtureResultV1>{
-    const owned=decodeGovernedFixtureActionV1(action),assertion=decodeWorkerBindingAssertion(binding);
+  enqueueTrustedGovernedFixtureAction(binding:WorkerBindingAssertion,action:GovernedFixtureActionV2):Promise<GovernedFixtureResultV2>{
+    const owned=decodeGovernedFixtureActionV2(action),assertion=decodeWorkerBindingAssertion(binding);
     const check=()=>{if(this.#closing||this.#quiescing||!this.#open||!this.#binding||!this.#trustedGovernedFixtureActions||bindingAssertionFailure(this.#binding,assertion))throw new GovernedNoteError("GOVERNED_NOTE_UNAVAILABLE");};
     check();
-    const operation=this.#fifo.then(async()=>{check();return decodeGovernedFixtureResultV1(await this.#trustedGovernedFixtureActions!.execute(assertion,owned),owned);});
+    const operation=this.#fifo.then(async()=>{check();return decodeGovernedFixtureResultV2(await this.#trustedGovernedFixtureActions!.execute(assertion,owned),owned);});
     this.#fifo=operation.then(()=>undefined,()=>undefined);return operation;
   }
 

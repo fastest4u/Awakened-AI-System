@@ -80,3 +80,13 @@ export interface GovernedNoteRunV1 {
   close(permit: GovernedNoteOwnerPermitV1): Promise<void>;
   reopen(permit: GovernedNoteOwnerPermitV1): Promise<GovernedNoteOwnerPermitV1>;
 }
+
+export interface GovernedNoteRuntimeV2 extends GovernedNoteRuntime {
+ createV2(prepared: PreparedGovernedNoteCreateV2, context: ProjectContext): AppendResult<GovernedNoteStoredReceiptV2>;
+ recoverV2(prepared: PreparedGovernedNoteRecoveryV2, context: ProjectContext): GovernedNoteRecoveryResultV2;
+}
+export interface GovernedNoteRuntimeFactoryPortV2 extends GovernedNoteRuntimeFactoryPort { create(input: RetainedEvidenceRuntimeCreateInput): GovernedNoteRuntimeV2 }
+export interface GovernedNoteRunV2 extends GovernedNoteRunV1 {
+ createV2(permit: GovernedNoteOwnerPermitV1, input: PreparedGovernedNoteCreateV2): Promise<GovernedNoteReceiptV2>;
+ recoverV2(permit: GovernedNoteOwnerPermitV1, input: PreparedGovernedNoteRecoveryV2): Promise<GovernedNoteRecoveryResultV2>;
+}
