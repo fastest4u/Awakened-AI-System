@@ -1053,7 +1053,8 @@ export class ProjectionIntegrityService {
         const replayed = replayCommittedProjectionSources(binding, { driver:this.#options.driver, eventStorePath:this.#options.eventStorePath,
           busyTimeoutMs:this.#options.busyTimeoutMs, terminalEventPosition:BigInt(manifest.terminalEventPosition),
           maxEvents:this.#options.maxReplayEvents, maxAggregateBytes:this.#options.maxReplayBytes }, source => accumulator.append(source));
-        if (replayed.terminalEventHash !== manifest.terminalEventHash) return integrity();
+        if (replayed.terminalEventPosition !== BigInt(manifest.terminalEventPosition)
+          || replayed.terminalEventHash !== manifest.terminalEventHash) return integrity();
         this.#inspectV3State(binding,manifest,accumulator.finish());
         return Object.freeze({status:"passed",terminalEventPosition:manifest.terminalEventPosition});
       }

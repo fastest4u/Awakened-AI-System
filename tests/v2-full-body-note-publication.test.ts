@@ -13,7 +13,7 @@ import { SqliteProjectionEventReader, type ProjectionEventSnapshotV3 } from "../
 import { ProjectionIntegrityService, assertUnpublishedProjectionV3Image } from "../src/orchestrator/projections/integrity.js";
 import { assertCapturedProjectionV3Image, readCapturedProjectionV3Rows } from "../src/orchestrator/projections/captured-image-v3.js";
 import { openImmutableProjectionImage } from "../src/orchestrator/projections/immutable-image.js";
-import { projectionCoreChecksum } from "../src/orchestrator/projections/checksum.js";
+import { PROJECTION_NAMES_V3, projectionCoreChecksum } from "../src/orchestrator/projections/checksum.js";
 import { parseProjectionManifestV3, parseProjectionManifestForPublication } from "../src/orchestrator/projections/manifest-codec.js";
 import { FreshStartInitializer } from "../src/orchestrator/fresh-start/fresh-start-initializer.js";
 import { freshInitializationFixture } from "./support/fresh-start-fixture.js";
@@ -303,4 +303,60 @@ test("schema3_ambiguous_manifest_observation_retains_publication_evidence",async
     assert.equal(readFileSync(join(root,"projection-manifest.json"),"utf8"),"unreadable retained evidence");
     await assert.rejects(c.ensurePublishedV3(binding,0n,15000));
   }finally{rmSync(root,{recursive:true,force:true});}
+});
+
+
+test("schema3_full_replay_rejects_coherent_image_ahead_of_store_terminal", async () => {
+  const fixture = await makeGovernedNoteDomainFixture();
+  const root = mkdtempSync(join(tmpdir(), "body-terminal-attestation-"));
+  try {
+    const command = fixture.commandV2({ content: { format: "markdown", body: literalBody } });
+    fixture.service().createV2(fixture.prepareCreateV2(command), fixture.rootContext);
+    const scope = sourceBinding(fixture);
+    const reader = new SqliteProjectionEventReader({ driver, eventStorePath: fixture.retained.path });
+    const builder = new ImmutableProjectionBuilder({ driver, projectionDirectory: root });
+    const coordinator = new V2ProjectionBuildCoordinator({ builder, eventReader: reader,
+      projectionDirectory: root, schema3: { builder, eventReader: reader } });
+    const published = await coordinator.ensurePublishedV3(scope, 0n, 15000);
+    const integrity = new ProjectionIntegrityService({ driver, eventStorePath: fixture.retained.path, projectionDirectory: root });
+    assert.equal(integrity.verify(scope, published.manifest).status, "passed");
+
+    const originalImage = openImmutableProjectionImage(readFileSync(published.databasePath));
+    const originalRows = (() => {
+      try { return readCapturedProjectionV3Rows(originalImage); }
+      finally { originalImage.close(); }
+    })();
+    assert.equal(originalRows.governedNotes[0]!.body, literalBody);
+    const claimedPosition = BigInt(published.manifest.terminalEventPosition) + 1n;
+    const coreChecksums = { ...published.manifest.coreChecksums };
+    for (const name of PROJECTION_NAMES_V3) {
+      coreChecksums[name] = projectionCoreChecksum(name, 3, scope.projectId, claimedPosition, originalRows[name]);
+      assert.notEqual(coreChecksums[name], published.manifest.coreChecksums[name]);
+    }
+    const mutation = new DatabaseSync(published.databasePath);
+    try {
+      mutation.prepare("UPDATE projection_metadata SET terminal_event_position=?").run(claimedPosition);
+      const update = mutation.prepare("UPDATE projection_core_checksums SET checksum=? WHERE projection_name=?");
+      for (const name of PROJECTION_NAMES_V3) update.run(coreChecksums[name], name);
+    } finally { mutation.close(); }
+    const changed = readFileSync(published.databasePath);
+    const ahead = parseProjectionManifestV3({ ...published.manifest,
+      terminalEventPosition: String(claimedPosition), databaseSha256: hash(changed), coreChecksums }, scope);
+    assert.notEqual(ahead.databaseSha256, published.manifest.databaseSha256);
+    const captured = openImmutableProjectionImage(changed);
+    try {
+      // The adversary is coherent: exact metadata, nine checksums and body/cross-row rules pass.
+      assertCapturedProjectionV3Image(captured, ahead);
+      assert.deepEqual(readCapturedProjectionV3Rows(captured), originalRows);
+    } finally { captured.close(); }
+    const actual = await reader.openCommittedSnapshotV3(scope);
+    try {
+      assert.equal(actual.terminalEventPosition, claimedPosition - 1n);
+      assert.equal(actual.terminalEventHash, ahead.terminalEventHash);
+    } finally { actual.close(); }
+    assert.throws(() => integrity.verify(scope, ahead), { code: "INTEGRITY_FAILURE" });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+    await fixture.cleanup();
+  }
 });
