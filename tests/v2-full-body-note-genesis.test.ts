@@ -144,7 +144,7 @@ test("pure rich manifest parsers own exact schema3 metadata and preserve schema2
   assert.equal(rich(two, scope).schemaVersion, 2);
   assert.throws(() => manifests.parseProjectionManifestV2(manifest3(scope), scope));
   assert.throws(() => parse3(two, scope));
-  assert.throws(() => manifests.parseProjectionManifestForPublication(manifest3(scope), scope));
+  assert.deepEqual(manifests.parseProjectionManifestForPublication(manifest3(scope), scope), parsed);
   for (const wrong of [{ schemaVersion: 1 }, { schemaVersion: 4 }, { databaseFile: "projections-2-2.sqlite" },
     { highestObservedGeneration: 1 }, { generation: 0 }, { generation: 2147483648 }, { highestObservedGeneration: 2147483648 },
     { terminalEventPosition: "00" }, { terminalEventPosition: "9223372036854775808" }, { sessionId: FRESH_IDENTITY.projectId },
@@ -268,6 +268,11 @@ test("journal2 decode/openExisting round trip binds its V2 receipt and schema3 m
       await assert.rejects(initializer.openExisting(f.input), { code: "FRESH_START_JOURNAL_MISMATCH" });
     }
     writeFileSync(f.journalPath, JSON.stringify({ ...journal, phase: "reserved", receipt: null, projection: null, foundationChecksDigest: null }));
-    await assert.rejects(initializer.resumeInitialization(f.input), { code: "FRESH_START_RECOVERY_REQUIRED" });
+    await assert.rejects(initializer.openExisting(f.input), { code: "FRESH_START_RECOVERY_REQUIRED" });
+    await assert.rejects(initializer.resumeInitialization(f.input), { code: "FRESH_START_DESTINATION_NOT_EMPTY" });
+    await assert.rejects(
+      new FreshStartInitializer({ ...f.dependencies, projectionSchemaVersion: 2 }).resumeInitialization(f.input),
+      { code: "FRESH_START_JOURNAL_MISMATCH" },
+    );
   } finally { f.cleanup(); }
 });
