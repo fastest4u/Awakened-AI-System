@@ -25,7 +25,8 @@ import { encodeWorkerBinding,encodeWorkerBindingAssertion } from "../../src/orch
 import type { GovernedNoteRunV1,FreshGovernedNoteFixtureV1,GovernedNoteOwnerPermitV1,GovernedNoteCommandV1,GovernedNoteRecoveryIdsV1,PreparedGovernedNoteCreateV1,PreparedGovernedNoteRecoveryV1,GovernedNoteReceiptV1,TrustedGovernedNoteTimingV1 } from "../../src/orchestrator/governed-notes/contracts.js";
 import type { VerifiedReadBinding } from "../../src/orchestrator/verified-read/contracts.js";
 import { ImmutableProjectionBuilder } from "../../src/orchestrator/projections/builder.js";
-import { openCommittedProjectionEventSnapshot } from "../../src/orchestrator/projections/event-reader.js";
+import { openCommittedProjectionEventSnapshot,SqliteProjectionEventReader } from "../../src/orchestrator/projections/event-reader.js";
+import { fileURLToPath } from "node:url";
 import { publishProjectionManifest,PROJECTION_MANIFEST_FILENAME } from "../../src/orchestrator/projections/manifest.js";
 import { activateFreshTestStore,freshRelease } from "./fresh-start-fixture.js";
 import { decodeProvisioning,applyProvisioningControl,OBS,OBSERVATION_BYTES,observationView,readSafeId,type SyntheticGovernedNoteProvisioningV1 } from "./governed-note-local-providers.js";
@@ -84,13 +85,35 @@ export interface GovernedNoteNativeFixtureV1 {
  observations():Readonly<{scenario:GovernedNoteScenarioFactsV2|null;ownerReusable:boolean;workerExits:number;workerExitCode:number|null;cleanupDisposition:string|null;recoveryPosts:number;transactionOpen:number;readRollbacks:bigint;failedReadRollbacks:bigint;closedWithReadTransaction:bigint;queuedRecoveries:bigint;queuedDispatches:bigint;queuedReplies:bigint;openWriterConnectionCount:number;parentProviderRpcCalls:number;factoryConnectionIdentityCount:number;factoryFenceIdentityCount:number;factoryKeyProviderIdentityCount:number;admissionFault:number;failedReadCommit:number;safeOutputLeaks:number;metricLeaks:number;logLeaks:number;logBytes:number;providerThreadId:number;ownerWorkerThreadId:number;disposed:number;ownerGeneration:bigint;detach:number;commit:number;delivery:number;expiresAt:bigint;detachTime:bigint;deliveryTime:bigint;createPosts:number;actionPosts:number;proofMints:number;unwrap:number;originalMac:number;pairs:number;pairHeaderFailures:number;privacyLeaks:number;statuses:readonly number[]}>;
  cleanup():Promise<void>;
 }
+/** Public synthetic configuration only: explicit field selection, never provisioning spread/digest. */
+export type GovernedNoteEvidenceConfigurationV1=Readonly<{
+ capabilityKeys:readonly Readonly<{purpose:string;keyId:string;current:boolean;status:string}>[];
+ evidenceKeys:readonly Readonly<{purpose:string;keyId:string;version:string;current:boolean;status:string}>[];
+ policy:Readonly<{policyId:string;policyVersion:string;publicRulesSha256:string}>;
+ timing:Readonly<{requestTimeoutMs:number;closeTimeoutMs:number;recoveryProofLifetimeMs:number;maxPending:number;executorLeaseMs:number;heartbeatIntervalMs:number;appendRetryDeadlineMs:number;sqliteBusyTimeoutMs:number;privateReadBudgetMs:number}>;
+}>;
+export const G11_PRIVATE_READ_BUDGET_MS=5000;
 export interface GovernedNoteNativeFixtureV2 extends GovernedNoteNativeFixtureV1 {
  run:GovernedNoteRunV2;
+ readonly projectionSchemaVersion:2|3;
  prepareCreateV2(command:GovernedNoteCommandV2):Promise<PreparedGovernedNoteCreateV2>;
  prepareRecoveryV2(ids:GovernedNoteRecoveryIdsV1):Promise<PreparedGovernedNoteRecoveryV2>;
  verifiedReadBinding(receipt:GovernedNoteReceiptV1|GovernedNoteReceiptV2):Promise<VerifiedReadBinding>;
+ identity():Readonly<{runId:string;fixtureId:string}>;
+ /** Observed at the actual Worker construction boundary, with the invoked bytes hashed there. */
+ writerInvocations():readonly Readonly<{path:string;sha256:string}>[];
+ evidenceConfiguration():GovernedNoteEvidenceConfigurationV1;
+}
+/** Explicit schema3 publication through the reviewed buildV3 producer; no second writer. */
+export async function makeGovernedNoteFixtureV2(options:Readonly<{child?:boolean;scenario?:string;projectionSchemaVersion?:3}>={}):Promise<GovernedNoteNativeFixtureV2>{
+ if(options.projectionSchemaVersion!==undefined&&options.projectionSchemaVersion!==3)throw new Error("G11_PROFILE_INVALID");
+ if(options.scenario==="corrupt-companion")throw new Error("G11_SCENARIO_UNSUPPORTED");
+ return makeOwnedGovernedNoteFixture({child:options.child,scenario:options.scenario},3);
 }
 export async function makeGovernedNoteFixture(options:Readonly<{child?:boolean;scenario?:string}>={}):Promise<GovernedNoteNativeFixtureV2>{
+ return makeOwnedGovernedNoteFixture(options,2);
+}
+async function makeOwnedGovernedNoteFixture(options:Readonly<{child?:boolean;scenario?:string}>,projectionSchemaVersion:2|3):Promise<GovernedNoteNativeFixtureV2>{
  const parentDirectory=realpathSync.native(mkdtempSync(join(tmpdir(),"g10-owned-"))),driver=new NodeSqliteDriver({DatabaseSync});
  const rootSessionId=randomUUID(),childSessionId=randomUUID(),sessionId=options.child?childSessionId:rootSessionId;
  const manifest=JSON.parse(readFileSync(join(process.cwd(),"dist/v2-build.json"),"utf8")) as {buildIdentityHash:string};
@@ -99,6 +122,7 @@ export async function makeGovernedNoteFixture(options:Readonly<{child?:boolean;s
  let ownerReusable=()=>false,workerExits=0,workerExitCode:number|null=null,cleanupDisposition:string|null=null;
  let cleanupOwner:(()=>ReturnType<ProjectStoreExecutor["closeForGovernedNoteController"]>)|undefined;
  const logs:string[]=[];let logBytes=0;
+ const writerInvocations:Readonly<{path:string;sha256:string}>[]=[];
  const run=createGovernedNoteRunV2({timing:G10_TIMING,freshInitializer:{async initialize(input){
   freshDirectory=input.freshDirectory;const v2VaultRoot=join(freshDirectory,"vault"),v1ArchiveRoot=join(freshDirectory,"archive");mkdirSync(v2VaultRoot);mkdirSync(v1ArchiveRoot);
   const {projectId:_p,vaultId:_v,storeId:_s,...requested}=freshRelease({releaseId:randomUUID(),buildIdentityHash:manifest.buildIdentityHash,schemaIdentityHash:expectedSchemaFingerprint(PROJECT_STORE_MIGRATIONS)});
@@ -129,7 +153,7 @@ export async function makeGovernedNoteFixture(options:Readonly<{child?:boolean;s
     if(action.kind==="bootstrap")bootstrapConsumed=true;
     return reply.result;
    },dispose(){if(portDisposed)return;portDisposed=true;fail();channel.port1.close();}};
-  const executor=new ProjectStoreExecutor({workerUrl:new URL("../fixtures/project-store-governed-note-worker.js",import.meta.url),context:construction.context,freshStart:construction.freshStartContext,...construction.timing},{workerFactory:(url,workerOptions)=>{const worker=new Worker(url,{stdout:true,stderr:true,workerData:{...workerOptions.workerData,g10:{context:encodeWorkerBinding(construction.context),provisioning,ownerGeneration:generation,port:channel.port2,observation:buffer,buildHash:manifest.buildIdentityHash,scenario:options.scenario??"normal",bootstrapConsumed}},transferList:[channel.port2]});
+  const executor=new ProjectStoreExecutor({workerUrl:new URL("../fixtures/project-store-governed-note-worker.js",import.meta.url),context:construction.context,freshStart:construction.freshStartContext,...construction.timing},{workerFactory:(url,workerOptions)=>{const invoked=url instanceof URL?url:new URL(String(url));writerInvocations.push(Object.freeze({path:fileURLToPath(invoked),sha256:createHash("sha256").update(readFileSync(invoked)).digest("hex")}));const worker=new Worker(invoked,{stdout:true,stderr:true,workerData:{...workerOptions.workerData,g10:{context:encodeWorkerBinding(construction.context),provisioning,ownerGeneration:generation,port:channel.port2,observation:buffer,buildHash:manifest.buildIdentityHash,scenario:options.scenario??"normal",bootstrapConsumed}},transferList:[channel.port2]});
    worker.on("exit",code=>{workerExits++;workerExitCode=code;});
    const capture=(chunk:Buffer)=>{logBytes+=chunk.byteLength;if(logBytes<=65536)logs.push(chunk.toString());};worker.stdout?.on("data",capture);worker.stderr?.on("data",capture);return worker;}});
   closeFailedOwner=()=>{void executor.closeForGovernedNoteController().catch(()=>undefined);};
@@ -143,7 +167,21 @@ export async function makeGovernedNoteFixture(options:Readonly<{child?:boolean;s
  try{
   await executeGovernedFixtureActionV1(run,permit,{kind:"bootstrap",rootSessionId,childSessionId});
   const sourceId=readSafeId(observation!,options.child?1:0);
-  const result:GovernedNoteNativeFixtureV2={run,fixture,get permit(){return permit;},set permit(value){permit=value;},sourceId,rootSessionId,childSessionId,
+  const result:GovernedNoteNativeFixtureV2={run,fixture,get permit(){return permit;},set permit(value){permit=value;},sourceId,rootSessionId,childSessionId,projectionSchemaVersion,
+   identity(){return Object.freeze({runId:provisioning!.runId,fixtureId:provisioning!.fixtureId});},
+   writerInvocations(){return Object.freeze([...writerInvocations]);},
+   evidenceConfiguration(){
+    const current=provisioning!;
+    // Only nonsecret fixed rule identities enter the digest; literal/process-secret values never do.
+    const publicRules=current.policy.rules.map(rule=>rule.kind==="token"?{kind:rule.kind,ruleId:rule.ruleId,prefix:rule.prefix}:{kind:rule.kind,ruleId:rule.ruleId});
+    const canonical=(value:unknown):string=>Array.isArray(value)?`[${value.map(canonical).join(",")}]`:value&&typeof value==="object"?`{${Object.keys(value).sort().map(key=>`${JSON.stringify(key)}:${canonical((value as Record<string,unknown>)[key])}`).join(",")}}`:JSON.stringify(value);
+    return Object.freeze({
+     capabilityKeys:Object.freeze(current.capabilityKeys.map(key=>Object.freeze({purpose:key.purpose,keyId:key.keyId,current:key.current,status:key.status}))),
+     evidenceKeys:Object.freeze(current.evidenceKeys.map(key=>Object.freeze({purpose:key.purpose,keyId:key.ref.keyId,version:key.ref.version,current:key.current,status:key.status}))),
+     policy:Object.freeze({policyId:current.policy.policyId,policyVersion:current.policy.policyVersion,publicRulesSha256:createHash("sha256").update(canonical(publicRules)).digest("hex")}),
+     timing:Object.freeze({requestTimeoutMs:G10_TIMING.requestTimeoutMs,closeTimeoutMs:G10_TIMING.closeTimeoutMs,recoveryProofLifetimeMs:G10_TIMING.recoveryProofLifetimeMs,maxPending:G10_TIMING.maxPending,executorLeaseMs:G10_TIMING.executorLeaseMs,heartbeatIntervalMs:G10_TIMING.heartbeatIntervalMs,appendRetryDeadlineMs:G10_TIMING.appendRetryDeadlineMs,sqliteBusyTimeoutMs:G10_TIMING.sqliteBusyTimeoutMs,privateReadBudgetMs:G11_PRIVATE_READ_BUDGET_MS}),
+    });
+   },
    async prepareCreate(command){const result=await executeGovernedFixtureActionV1(run,permit,{kind:"prepare-create",authoritySessionId:sessionId,command});if(result.kind!=="prepare-create")throw new Error("G10_PREPARED_KIND");return result.prepared;},
    async prepareRecovery(ids){const result=await executeGovernedFixtureActionV1(run,permit,{kind:"prepare-recovery",authoritySessionId:sessionId,operationId:randomUUID(),requestId:randomUUID(),commandId:ids.commandId,idempotencyKey:ids.idempotencyKey});if(result.kind!=="prepare-recovery")throw new Error("G10_PREPARED_KIND");return result.prepared;},
    async prepareCreateV2(command){const result=await executeGovernedFixtureActionV2(run,permit,{kind:"prepare-create-v2",authoritySessionId:sessionId,command});if(result.kind!=="prepare-create-v2")throw new Error("G10_PREPARED_KIND");return result.prepared;},
@@ -167,6 +205,13 @@ export async function makeGovernedNoteFixture(options:Readonly<{child?:boolean;s
     const canonicalPath=realpathSync.native(join(deployment.canonicalPath,"internal")),stat=lstatSync(canonicalPath,{bigint:true});
     const path=join(freshDirectory,"vault/.memory-mcp/v2/events.sqlite"),eventsStat=lstatSync(path,{bigint:true});
     const binding:VerifiedReadBinding={projectionBinding:{...receipt.scope,sessionId:null},expectedRelease:release,controlGeneration:"1",session:{sessionId:receipt.scope.sessionId!,minimumEventPosition:receipt.terminalPosition},eventsFile:{path,device:String(eventsStat.dev),inode:String(eventsStat.ino)},projectionDirectory,executorStateDirectory,deploymentDirectory:{canonicalPath,device:String(stat.dev),inode:String(stat.ino)},compositionEpoch:`g10-${generation}`};
+    if(projectionSchemaVersion===3){
+     // Same read-only committed snapshot owner and publication lock; buildV3 consumes authenticated dispositions.
+     const source=await new SqliteProjectionEventReader({driver,eventStorePath:path,busyTimeoutMs:5000}).openCommittedSnapshotV3(binding.projectionBinding);
+     try{const staged=await new ImmutableProjectionBuilder({driver,projectionDirectory:projectionDirectory.canonicalPath,now:()=>"2026-10-09T00:00:00.000Z"}).buildV3(source,++readGeneration);publishProjectionManifest({projectionDirectory:projectionDirectory.canonicalPath,manifest:staged.manifest,expectedBinding:binding.projectionBinding},{beforeManifestInstall:{install(directory){renameSync(staged.temporaryDatabasePath,join(directory,staged.manifest.databaseFile));}}});}
+     finally{source.close();}
+     return binding;
+    }
     const snapshot=openCommittedProjectionEventSnapshot(binding.projectionBinding,{driver,eventStorePath:path,busyTimeoutMs:5000});
     // Corruption is confined to detached read input; immutable durable events remain unchanged.
     const projectionInput=options.scenario==="corrupt-companion"?{...snapshot,*events(){for(const event of snapshot.events())yield event.eventType==="MemorySourceRecorded"&&event.commandId===receipt.commandId?Object.freeze({...event,payloadJson:"{}"}):event;}}:snapshot;

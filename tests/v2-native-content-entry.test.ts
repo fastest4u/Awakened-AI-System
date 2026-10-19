@@ -135,6 +135,19 @@ test("pure_retrieval_closure_is_exact", () => {
     }
     assert.ok(!closure.runtimeImports.some((path: string) => /^(node:)?(?:child_process|worker_threads)$/.test(path)));
     assert.ok(!inputs.some((path: string) => /\/(?:stable-directory|builder|coordinator|integrity|manifest)\.ts$|\/workers\/|\/parity\/|\/migration\//.test(path)));
+    // Full-note lane: actual runtime inputs pinned in source closure AND with emitted contribution; type-only contracts never pinned.
+    const emitted = (Object.values(closure.metafile.outputs)[0] as { inputs: Record<string, { bytesInOutput: number }> }).inputs;
+    const fullNotePins = ["verified-read/full-note-query.ts", "verified-read/full-note-protocol.ts", "verified-read/full-note-result.ts",
+      "projections/captured-image-v3.ts", "governed-notes/body-content.ts"].map(path => `src/orchestrator/${path}`);
+    if (!cleanup) for (const pin of fullNotePins) { assert.equal(inputs.includes(pin), true, `missing full-note pin ${pin}`); assert.ok(emitted[pin]!.bytesInOutput > 0, `pin ${pin} not emitted`); }
+    else for (const query of ["verified-read/full-note-query.ts", "verified-read/full-note-result.ts", "projections/captured-image-v3.ts"])
+      assert.equal(inputs.includes(`src/orchestrator/${query}`), false, `cleanup includes ${query}`);
+    assert.equal(inputs.includes("src/orchestrator/verified-read/full-note-contracts.ts"), false);
+    // Narrow pure governed exception (body helper + its pure errors), not admission of the governed owner directory.
+    assert.deepEqual(inputs.filter((path: string) => path.includes("/governed-notes/")), ["src/orchestrator/governed-notes/body-content.ts", "src/orchestrator/governed-notes/errors.ts"]);
+    assert.ok(!inputs.some((path: string) => /\/governed-notes\/(?:repository|provenance\.repository|service|runtime\.factory|run|fixture-control|fixture-allocation|codec)\.ts$|\/storage\/(?:event-store|[a-z-]+\.repository)\.ts$|\/verified-read\/supervisor\.ts$|\/runtime\/project-store-[a-z-]+\.ts$/.test(path)), "private closure includes writer/owner");
+    const emittedBundle = readFileSync(join(deployment, name), "utf8");
+    assert.equal(/\bfrom\s*["'](?:node:)?(?:child_process|worker_threads)["']|\brequire\(\s*["'](?:node:)?(?:child_process|worker_threads)["']\s*\)/u.test(emittedBundle), false);
     for (const input of closure.inputs) assert.equal(createHash("sha256").update(readFileSync(input.path)).digest("hex"), input.sha256, `stale source ${input.path}`);
   }
 });

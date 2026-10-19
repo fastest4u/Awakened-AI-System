@@ -4,10 +4,10 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { collectNativeRankedQuery } from "../src/orchestrator/verified-read/content-ranking.js";
-import { parseProjectionManifestV2 } from "../src/orchestrator/projections/manifest-codec.js";
+import { parseProjectionManifestV2, parseProjectionManifestV3 } from "../src/orchestrator/projections/manifest-codec.js";
 import { PROJECTION_MANIFEST_FILENAME } from "../src/orchestrator/projections/manifest.js";
 import { randomUUID,createHash } from "node:crypto";
-import { makeGovernedNoteFixture } from "./support/governed-note-fixture.js";
+import { makeGovernedNoteFixture, makeGovernedNoteFixtureV2 } from "./support/governed-note-fixture.js";
 import { createVerifiedReadAdapter } from "../src/orchestrator/verified-read/supervisor.js";
 
 test("exact ID private read returns actual candidate summary at terminal position", {timeout:120000}, async(t)=>{
@@ -40,4 +40,26 @@ test("injected detached companion corruption never projects through actual build
   const command={version:1 as const,operation:"create-governed-note" as const,commandId:randomUUID(),idempotencyKey:randomUUID(),recordKind:"mistake" as const,summary:"g10unique safe",confidence:"low" as const,provenance:[{kind:"retained-evidence" as const,identity:f.sourceId}]};
   const receipt=await f.run.create(f.permit,await f.prepareCreate(command));await assert.rejects(f.verifiedReadBinding(receipt),error=>error instanceof Error&&error.message==="INTEGRITY_FAILURE");
  }finally{await f.cleanup();}
+});
+
+test("v2 full-body candidate stays summary-only on ordinary routes over actual schema3 image",{timeout:120000},async(t)=>{
+ const f=await makeGovernedNoteFixtureV2();const adapter:{value?:ReturnType<typeof createVerifiedReadAdapter>}={};
+ try{
+  const command={version:2 as const,operation:"create-governed-note" as const,commandId:randomUUID(),idempotencyKey:randomUUID(),recordKind:"adr" as const,summary:"g11unique fixture_secret",confidence:"low" as const,provenance:[{kind:"retained-evidence" as const,identity:f.sourceId}],content:{format:"markdown" as const,body:"# Decision\n\nBODYONLY marker fixture_secret\n"}};
+  const receipt=await f.run.createV2(f.permit,await f.prepareCreateV2(command));assert.equal(receipt.resultVersion,2);
+  const binding=await f.verifiedReadBinding(receipt);
+  const manifest=parseProjectionManifestV3(JSON.parse(readFileSync(join(binding.projectionDirectory.canonicalPath,PROJECTION_MANIFEST_FILENAME),"utf8")),binding.projectionBinding);assert.equal(manifest.schemaVersion,3);
+  adapter.value=createVerifiedReadAdapter(binding);
+  const response=await adapter.value.query({operation:"get-canonical-record",consistency:"session-strong",minimumEventPosition:receipt.terminalPosition,budgetMs:5000,parameters:{id:receipt.recordId,visibility:"session"}});
+  if(response.content.operation!=="get-canonical-record")throw new Error("wrong operation");assert.ok(response.content.item);
+  assert.equal(response.content.item.text,"g11unique [REDACTED]");assert.equal(response.content.item.verificationMethod,"governed-note-unverified-v2");assert.equal(response.content.item.status,"candidate");
+  for(const key of ["recordKind","bodyAvailability","content","verificationStatus"])assert.equal(key in response.content.item,false);
+  assert.equal(response.receipt.imageSha256,manifest.databaseSha256);assert.equal("projectionSchemaVersion" in response.receipt,false);
+  for(const operation of ["search-projected-content","build-context-pack"] as const){const ranked=await adapter.value.query({operation,consistency:"session-strong",minimumEventPosition:receipt.terminalPosition,budgetMs:5000,parameters:{query:"g11unique",visibility:"session"}});if(ranked.content.operation!=="search-projected-content"&&ranked.content.operation!=="build-context-pack")throw new Error("wrong ranked operation");assert.ok(ranked.content.items.some(item=>item.id===receipt.recordId));assert.equal(JSON.stringify(ranked).includes("BODYONLY"),false);}
+  const body=await adapter.value.query({operation:"search-projected-content",consistency:"session-strong",minimumEventPosition:receipt.terminalPosition,budgetMs:5000,parameters:{query:"BODYONLY",visibility:"session"}});
+  if(body.content.operation!=="search-projected-content")throw new Error("wrong operation");assert.equal(body.content.items.some(item=>item.id===receipt.recordId),false,"body is not ordinary retrieval text");
+  assert.equal(JSON.stringify(response).includes("BODYONLY"),false);assert.equal(JSON.stringify(response).includes("fixture_secret"),false);
+  assert.equal((await adapter.value.close()).cleanup,"complete");
+  t.diagnostic(JSON.stringify({caseId:"v2-schema3-ordinary-summary-only",recordId:receipt.recordId,projectionSchemaVersion:manifest.schemaVersion,projectionGeneration:manifest.generation,terminalPosition:receipt.terminalPosition}));
+ }finally{await adapter.value?.close();await f.cleanup();}
 });

@@ -6,6 +6,14 @@ import path from 'node:path';
 const digest = bytes => createHash('sha256').update(bytes).digest('hex');
 const pureRetrievalInputs = new Set(['database-core.ts', 'selection-core.ts', 'contracts.ts', 'eligibility.ts', 'ranking.ts']
     .map(name => 'src/orchestrator/retrieval/' + name));
+// Actual runtime inputs of the private full-note read lane; full-note-contracts.ts is type-only and has no emitted pin.
+const fullNoteReadPins = ['verified-read/full-note-query.ts', 'verified-read/full-note-protocol.ts', 'verified-read/full-note-result.ts',
+    'projections/captured-image-v3.ts', 'governed-notes/body-content.ts'].map(name => 'src/orchestrator/' + name);
+// Cleanup is decoder-only: no query, packing or captured-image validation code.
+const cleanupQueryInputs = /\/verified-read\/(?:full-note-query|full-note-result|content-query|content-result)\.ts$|\/projections\/captured-image-v3\.ts$/;
+// Precise owner denials: governed repository/service/run, event/authority writers, parent supervisor, owned worker custody.
+// Pure governed body-content/errors and inert storage constants/migration definitions remain admitted.
+const privateOwnerDenials = /\/governed-notes\/(?:repository|provenance\.repository|service|runtime\.factory|run|fixture-control|fixture-allocation)\.ts$|\/storage\/(?:event-store|[a-z-]+\.repository)\.ts$|\/verified-read\/supervisor\.ts$|\/runtime\/project-store-[a-z-]+\.ts$/;
 function canonical(value) {
     if (Array.isArray(value)) return '[' + value.map(canonical).join(',') + ']';
     if (value && typeof value === 'object') return '{' + Object.keys(value).sort().map(key => JSON.stringify(key) + ':' + canonical(value[key])).join(',') + '}';
@@ -52,11 +60,16 @@ export function freshStartBuild(outDir, inspectIsolatedSyntax) {
                 const inputs = Object.entries(result.metafile.inputs).map(([inputName, input]) => {
                     const captured = captures.get(inputName);
                     if (!captured || captured.entry.bytes !== input.bytes || /\/(?:stable-directory|builder|coordinator|integrity|manifest)\.ts$|\/workers\//.test(inputName)
+                        || privateOwnerDenials.test(inputName)
                         || (inputName.includes('/retrieval/') && !pureRetrievalInputs.has(inputName))) throw new Error('FRESH_START_BUILD_MISMATCH');
                     inspectIsolatedSyntax(inputName, captured.bytes, false);
                     for (const imported of input.imports) if (/^(node:)?(child_process|worker_threads)$/.test(imported.path)) throw new Error('FRESH_START_BUILD_MISMATCH');
                     return captured.entry;
                 }).sort((a, b) => a.path.localeCompare(b.path));
+                const contributed = new Map(Object.values(result.metafile.outputs).flatMap(output => Object.entries(output.inputs).map(([inputName, value]) => [inputName, value.bytesInOutput])));
+                if (name === names[3]) {
+                    for (const pin of fullNoteReadPins) if (!inputs.some(entry => entry.path === pin) || !(contributed.get(pin) > 0)) throw new Error('FRESH_START_BUILD_MISMATCH');
+                } else if (inputs.some(entry => cleanupQueryInputs.test(entry.path))) throw new Error('FRESH_START_BUILD_MISMATCH');
                 const runtimeImports = [...new Set(Object.values(result.metafile.outputs).flatMap(output => output.imports.map(item => item.path)))].sort();
                 if (runtimeImports.some(value => /^(node:)?(child_process|worker_threads)$/.test(value))) throw new Error('FRESH_START_BUILD_MISMATCH');
                 inspectIsolatedSyntax(name, Buffer.from(file.contents), true);

@@ -1,10 +1,14 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { cpSync, lstatSync, mkdirSync, readFileSync } from "node:fs";
+import { cpSync, lstatSync, mkdirSync, readFileSync, renameSync } from "node:fs";
 import { dirname, join } from "node:path";
-import type { DatabaseSync } from "node:sqlite";
+import { DatabaseSync } from "node:sqlite";
 import type { AppendCommand, JsonValue } from "../../src/orchestrator/contracts/event.js";
 import { openImmutableProjectionImage } from "../../src/orchestrator/projections/immutable-image.js";
-import { parseProjectionManifestV2, type ProjectionManifestV2 } from "../../src/orchestrator/projections/manifest-codec.js";
+import { parseProjectionManifestV2, parseRichProjectionManifest, type ProjectionManifestV2, type ProjectionManifestV3 } from "../../src/orchestrator/projections/manifest-codec.js";
+import { ImmutableProjectionBuilder } from "../../src/orchestrator/projections/builder.js";
+import { SqliteProjectionEventReader } from "../../src/orchestrator/projections/event-reader.js";
+import { publishProjectionManifest } from "../../src/orchestrator/projections/manifest.js";
+import { NodeSqliteDriver } from "../../src/orchestrator/storage/node-sqlite-driver.js";
 import type { GetCanonicalRecordRequest, NativeContentFilters, SearchProjectedContentRequest } from "../../src/orchestrator/verified-read/content-contracts.js";
 import { command } from "../fixtures/fresh-start-admission-child.js";
 import { FRESH_NOW } from "./fresh-start-fixture.js";
@@ -145,6 +149,10 @@ export type NativeCorpus = Readonly<{
 export type NativeContentFixture = Awaited<ReturnType<typeof makeActiveReadFixture>> & Readonly<{
   appendCorpus(): Promise<NativeCorpus>;
   captureImage(): Readonly<{ database: DatabaseSync; manifest: ProjectionManifestV2; close(): void }>;
+  /** Explicit new-generation schema3 publication from the same committed stream; never appends events. */
+  publishV3(): Promise<ProjectionManifestV3>;
+  currentManifest(): ProjectionManifestV2 | ProjectionManifestV3;
+  eventTail(): Readonly<{ position: string; hash: string | null; count: string }>;
 }>;
 
 export function nativeSearchRequest(overrides: Partial<SearchProjectedContentRequest> = {}): SearchProjectedContentRequest {
@@ -234,7 +242,29 @@ export async function makeNativeContentFixture(buildHash = READ_HASH, options: R
     const database = openImmutableProjectionImage(bytes);
     return Object.freeze({ database, manifest, close: () => database.close() });
   };
-  return { ...fixture, appendCorpus, captureImage };
+  const currentManifest = () => parseRichProjectionManifest(JSON.parse(readFileSync(
+    join(fixture.binding.projectionDirectory.canonicalPath, "projection-manifest.json"), "utf8")), fixture.binding.projectionBinding);
+  const publishV3 = async (): Promise<ProjectionManifestV3> => {
+    const driver = new NodeSqliteDriver({ DatabaseSync }), prior = currentManifest();
+    const source = await new SqliteProjectionEventReader({ driver, eventStorePath: fixture.path, busyTimeoutMs: 1000 })
+      .openCommittedSnapshotV3(fixture.binding.projectionBinding);
+    try {
+      const staged = await new ImmutableProjectionBuilder({ driver, projectionDirectory: fixture.binding.projectionDirectory.canonicalPath, now: () => FRESH_NOW })
+        .buildV3(source, Math.max(prior.generation, prior.highestObservedGeneration) + 1);
+      publishProjectionManifest({ projectionDirectory: fixture.binding.projectionDirectory.canonicalPath, manifest: staged.manifest,
+        expectedBinding: fixture.binding.projectionBinding }, { beforeManifestInstall: { install(directory) {
+          renameSync(staged.temporaryDatabasePath, join(directory, staged.manifest.databaseFile));
+        } } });
+      return staged.manifest;
+    } finally { source.close(); }
+  };
+  const eventTail = () => {
+    const row = fixture.writer.prepare("SELECT COUNT(*) AS count, MAX(global_position) AS position FROM events").get()!;
+    const position = row.position === null ? 0n : row.position as bigint;
+    const hash = position === 0n ? null : fixture.writer.prepare("SELECT event_hash FROM events WHERE global_position = $position").get({ $position: position })!.event_hash as string;
+    return Object.freeze({ position: position.toString(), hash, count: (row.count as bigint).toString() });
+  };
+  return { ...fixture, appendCorpus, captureImage, publishV3, currentManifest, eventTail };
 }
 
 /** Current measured artifacts only, with the same identity-checked internal directory as production. */
