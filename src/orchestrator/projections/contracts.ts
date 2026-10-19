@@ -266,10 +266,43 @@ export interface RetrievalFeedbackProjectionEvent extends ProjectionEventSource 
   readonly sourceItemEventPosition: bigint;
 }
 
+export interface GovernedLifecycleProjectionEventV1 extends ProjectionEventSource {
+  readonly kind: "governed-lifecycle-transition";
+  readonly transitionKind: "promote" | "supersede" | "retract" | "expire" | "erase-evidence";
+  readonly recordId: string;
+  readonly targetStatus: ProjectionItemStatus;
+  readonly verificationMethod?: string;
+  readonly verificationAnchor?: string | null;
+  readonly validFrom?: string | null;
+  readonly validTo?: string | null;
+  readonly supersededByEventId?: string | null;
+  readonly supersedingRecordId?: string | null;
+  readonly retractedByEventId?: string | null;
+  readonly conflictKey?: string | null;
+  readonly conflictGroupId?: string | null;
+  readonly conflictingRecordIds?: readonly string[];
+  readonly resolutionState?: "open" | "resolved";
+  readonly resolutionEventId?: string | null;
+  readonly reason: string;
+  readonly erasedEvidenceIds?: readonly string[];
+  readonly erasedRecordIds?: readonly string[];
+}
+
+export interface CanonicalConflictProjectionRowV1 {
+  readonly projectId: string;
+  readonly conflictKey: string;
+  readonly conflictGroupId: string;
+  readonly recordIds: readonly string[];
+  readonly resolutionState: "open" | "resolved";
+  readonly resolutionEventId: string | null;
+  readonly updatedEventPosition: string;
+}
+
 export type ProjectionEvent =
   | CheckpointProjectionEvent
   | MemorySourceProjectionEvent
   | GovernedMemorySourceProjectionEvent
+  | GovernedLifecycleProjectionEventV1
   | SessionLifecycleProjectionEvent
   | RetrievalFeedbackProjectionEvent;
 
@@ -492,6 +525,26 @@ function ownedRows(value: unknown): readonly unknown[] {
   });
 }
 
+export const GOVERNED_NOTE_V1_MARKERS: ReadonlySet<string> = new Set([
+  "governed-note-unverified-v1",
+  "governed-note-user-confirmed-v1",
+  "governed-note-test-verified-v1",
+  "governed-note-source-anchored-v1",
+  "governed-note-accepted-adr-v1",
+  "governed-note-cross-session-v1",
+]);
+
+export const GOVERNED_NOTE_V2_MARKERS: ReadonlySet<string> = new Set([
+  "governed-note-unverified-v2",
+  "governed-note-user-confirmed-v2",
+  "governed-note-test-verified-v2",
+  "governed-note-source-anchored-v2",
+  "governed-note-accepted-adr-v2",
+  "governed-note-cross-session-v2",
+]);
+
+export const GOVERNED_NOTE_ERASED_MARKER = "governed-note-erased-v1" as const;
+
 /** Pure image-side validation: no event-store lookup or writer dependency. */
 export function validateGovernedNoteProjectionRows(
   canonicalItems: readonly Pick<CanonicalItemProjection, "projectId" | "itemId" | "normalizedKey" | "verificationMethod" | "sourceEventPosition">[],
@@ -513,7 +566,10 @@ export function validateGovernedNoteProjectionRows(
       items.set(key, item);
       const reserved = item.normalizedKey.startsWith("governed-note/");
       const marker = item.verificationMethod;
-      if (reserved !== (marker === "governed-note-unverified-v1" || marker === "governed-note-unverified-v2")
+      const isKnownGovernedMarker = GOVERNED_NOTE_V1_MARKERS.has(marker)
+        || GOVERNED_NOTE_V2_MARKERS.has(marker)
+        || marker === GOVERNED_NOTE_ERASED_MARKER;
+      if (reserved !== isKnownGovernedMarker
         || (marker.startsWith("governed-note-") && !reserved)) return governedProjectionIntegrity();
     }
     const seen = new Set<string>();
@@ -526,16 +582,20 @@ export function validateGovernedNoteProjectionRows(
       if (seen.has(key) || item === undefined || row.sourceEventPosition !== String(item.sourceEventPosition)
         || item.normalizedKey !== `governed-note/${String(row.recordKind)}/${row.itemId}`) return governedProjectionIntegrity();
       seen.add(key);
-      if (item.verificationMethod === "governed-note-unverified-v1") {
+      if (GOVERNED_NOTE_V1_MARKERS.has(String(item.verificationMethod))) {
         if (row.format !== null || row.body !== null || row.bodyContentHash !== null) return governedProjectionIntegrity();
-      } else if (item.verificationMethod === "governed-note-unverified-v2") {
+      } else if (GOVERNED_NOTE_V2_MARKERS.has(String(item.verificationMethod))) {
         if (row.format !== "markdown" || typeof row.bodyContentHash !== "string" || !PROJECTION_SHA256.test(row.bodyContentHash)) return governedProjectionIntegrity();
         assertMarkdownNoteBodyV1(row.body);
         if (governedNoteBodyHash({ format: "markdown", body: row.body }) !== row.bodyContentHash) return governedProjectionIntegrity();
       } else return governedProjectionIntegrity();
       return Object.freeze(row) as GovernedNoteProjectionRowV1;
     });
-    for (const [key, item] of items) if (String(item.normalizedKey).startsWith("governed-note/") && !seen.has(key)) return governedProjectionIntegrity();
+    for (const [key, item] of items) {
+      if (String(item.normalizedKey).startsWith("governed-note/") && item.verificationMethod !== GOVERNED_NOTE_ERASED_MARKER && !seen.has(key)) {
+        return governedProjectionIntegrity();
+      }
+    }
     const binary = (left: string, right: string) => left < right ? -1 : left > right ? 1 : 0;
     return Object.freeze(result.sort((left, right) => binary(left.projectId, right.projectId) || binary(left.itemId, right.itemId)));
   } catch { return governedProjectionIntegrity(); }

@@ -1,5 +1,13 @@
-import type { ProjectionEventV3, GovernedMemorySourceProjectionEventV3, ProjectionSourceDisposition, ProjectionFoldStateV3, GovernedNoteProjectionRowV1 } from "./contracts.js";
-import { validateGovernedNoteProjectionRows } from "./contracts.js";
+import type {
+  ProjectionEventV3,
+  GovernedMemorySourceProjectionEventV3,
+  ProjectionSourceDisposition,
+  ProjectionFoldStateV3,
+  GovernedNoteProjectionRowV1,
+  GovernedLifecycleProjectionEventV1,
+  CanonicalConflictProjectionRowV1,
+} from "./contracts.js";
+import { GOVERNED_NOTE_ERASED_MARKER, validateGovernedNoteProjectionRows } from "./contracts.js";
 export { validateGovernedNoteProjectionRows } from "./contracts.js";
 import { decodeProjectionSourceV3 } from "./source-event-codec.js";
 import {
@@ -693,8 +701,135 @@ function foldFeedback(state: ProjectionFoldState, event: Extract<ProjectionEvent
   return Object.freeze({ ...state, retrievalFeedback: frozen([...state.retrievalFeedback, feedback]) });
 }
 
+const GOVERNED_LIFECYCLE_STATUS_TRANSITIONS: Readonly<
+  Record<ProjectionItemStatus, readonly ProjectionItemStatus[]>
+> = Object.freeze({
+  candidate: Object.freeze([
+    "provisional",
+    "verified",
+    "conflicted",
+    "superseded",
+    "retracted",
+    "expired",
+    "erased-evidence",
+  ] as const),
+  provisional: Object.freeze([
+    "verified",
+    "conflicted",
+    "superseded",
+    "retracted",
+    "expired",
+    "erased-evidence",
+  ] as const),
+  verified: Object.freeze([
+    "conflicted",
+    "superseded",
+    "retracted",
+    "expired",
+    "erased-evidence",
+  ] as const),
+  conflicted: Object.freeze([
+    "verified",
+    "superseded",
+    "retracted",
+    "expired",
+    "erased-evidence",
+  ] as const),
+  superseded: Object.freeze(["erased-evidence"] as const),
+  retracted: Object.freeze(["erased-evidence"] as const),
+  expired: Object.freeze(["erased-evidence"] as const),
+  "erased-evidence": Object.freeze([] as const),
+});
+
+function foldGovernedLifecycleTransition(
+  state: ProjectionFoldState,
+  event: GovernedLifecycleProjectionEventV1,
+): ProjectionFoldState {
+  if (event.transitionKind === "erase-evidence") {
+    const idsToErase = new Set([event.recordId, ...(event.erasedRecordIds ?? [])]);
+    const canonicalItems = frozen(
+      state.canonicalItems.map((row) => {
+        if (!idsToErase.has(row.itemId)) return row;
+        if (
+          row.status !== "erased-evidence"
+          && !GOVERNED_LIFECYCLE_STATUS_TRANSITIONS[row.status].includes("erased-evidence")
+        ) {
+          return integrity();
+        }
+        return Object.freeze({
+          ...row,
+          status: "erased-evidence" as const,
+          summary: "[ERASED]",
+          verificationMethod: row.normalizedKey.startsWith("governed-note/")
+            ? GOVERNED_NOTE_ERASED_MARKER
+            : "erased-evidence",
+          anchor: event.verificationAnchor !== undefined ? event.verificationAnchor : event.sourceEventId,
+          sourceEventId: event.sourceEventId,
+          sourceEventPosition: event.sourceEventPosition,
+        });
+      }),
+    );
+    const lexicalChunks = frozen(
+      state.lexicalChunks.filter((row) => row.itemId === null || !idsToErase.has(row.itemId)),
+    );
+    return Object.freeze({ ...state, canonicalItems, lexicalChunks });
+  }
+  const current = state.canonicalItems.find((row) => row.itemId === event.recordId);
+  if (current === undefined) return integrity();
+  if (
+    current.status !== event.targetStatus
+    && !GOVERNED_LIFECYCLE_STATUS_TRANSITIONS[current.status].includes(event.targetStatus)
+  ) {
+    return integrity();
+  }
+  const validFrom = event.validFrom ?? current.validFrom;
+  const validTo = event.validTo !== undefined ? event.validTo : current.validTo;
+  if (validTo !== null && Date.parse(validTo) < Date.parse(validFrom)) return integrity();
+  const supersedingItemId = event.supersedingRecordId !== undefined
+    ? event.supersedingRecordId !== null
+      && state.canonicalItems.some((row) => row.itemId === event.supersedingRecordId)
+      ? event.supersedingRecordId
+      : null
+    : current.supersedingItemId;
+  const updated: CanonicalItemProjection = Object.freeze({
+    ...current,
+    status: event.targetStatus,
+    verificationMethod: event.verificationMethod ?? current.verificationMethod,
+    anchor: event.verificationAnchor !== undefined ? event.verificationAnchor : current.anchor,
+    validFrom,
+    validTo,
+    conflictGroupId: event.conflictGroupId !== undefined ? event.conflictGroupId : current.conflictGroupId,
+    supersedingItemId,
+    sourceEventId: event.sourceEventId,
+    sourceEventPosition: event.sourceEventPosition,
+  });
+  const chunkId = `item/${event.recordId}`;
+  const existingChunk = state.lexicalChunks.find((row) => row.chunkId === chunkId);
+  const lexicalChunks = existingChunk === undefined
+    ? state.lexicalChunks
+    : replace(
+        state.lexicalChunks,
+        (row) => row.chunkId,
+        Object.freeze({
+          ...existingChunk,
+          sourceEventId: event.sourceEventId,
+          sourceEventPosition: event.sourceEventPosition,
+          anchor: updated.anchor,
+        }),
+      );
+  return Object.freeze({
+    ...state,
+    canonicalItems: replace(state.canonicalItems, (row) => row.itemId, updated),
+    lexicalChunks,
+  });
+}
+
 function advanceMaterialEventStream(state: ProjectionFoldState, event: ProjectionEvent): ProjectionFoldState {
-  if (event.kind === "session-lifecycle" || event.kind === "checkpoint") return state;
+  if (
+    event.kind === "session-lifecycle"
+    || event.kind === "checkpoint"
+    || event.kind === "governed-lifecycle-transition"
+  ) return state;
   const sessionId = event.binding.sessionId;
   if (sessionId === null) return state;
   const session = state.sessionTree.find((row) => row.sessionId === sessionId);
@@ -723,7 +858,8 @@ function apply(state: ProjectionFoldState, event: ProjectionEvent): ProjectionFo
     : event.kind === "checkpoint" ? foldCheckpoint(scoped, event)
       : event.kind === "memory-source" ? foldMemory(scoped, event)
         : event.kind === "governed-memory-source" ? foldGoverned(scoped, event)
-          : foldFeedback(scoped, event);
+          : event.kind === "governed-lifecycle-transition" ? foldGovernedLifecycleTransition(scoped, event)
+            : foldFeedback(scoped, event);
   return Object.freeze({ ...folded, terminalEventPosition: event.sourceEventPosition });
 }
 
@@ -753,6 +889,11 @@ class ProjectionFoldAccumulatorCore {
   readonly #lexicalChunks = new Map<string, LexicalChunkProjection>();
   readonly #checkpointChunks = new Map<string, Set<string>>();
   readonly #retrievalFeedback = new Map<string, RetrievalFeedbackProjection>();
+  readonly #canonicalConflicts = new Map<string, CanonicalConflictProjectionRowV1>();
+
+  canonicalConflicts(): readonly CanonicalConflictProjectionRowV1[] {
+    return Object.freeze([...this.#canonicalConflicts.values()]);
+  }
 
   append(event: ProjectionEventV3, independentGovernedStream = false): void {
     if (this.#binding !== null && !sameScope(this.#binding, event.binding)) return integrity();
@@ -760,7 +901,11 @@ class ProjectionFoldAccumulatorCore {
       return integrity();
     }
     this.#binding ??= event.binding;
-    if (event.kind !== "session-lifecycle" && event.kind !== "checkpoint") {
+    if (
+      event.kind !== "session-lifecycle"
+      && event.kind !== "checkpoint"
+      && event.kind !== "governed-lifecycle-transition"
+    ) {
       if (independentGovernedStream) {
         if (event.kind !== "governed-memory-source") return integrity();
         const session = event.binding.sessionId === null ? undefined : this.#sessionTree.get(event.binding.sessionId);
@@ -772,6 +917,7 @@ class ProjectionFoldAccumulatorCore {
     else if (event.kind === "checkpoint") this.#appendCheckpoint(event);
     else if (event.kind === "memory-source") this.#appendMemory(event);
     else if (event.kind === "governed-memory-source") this.#appendGoverned(event);
+    else if (event.kind === "governed-lifecycle-transition") this.#appendGovernedLifecycleTransition(event);
     else this.#appendFeedback(event);
     this.#terminalEventPosition = event.sourceEventPosition;
   }
@@ -1016,6 +1162,111 @@ class ProjectionFoldAccumulatorCore {
       sourceEventId: event.sourceEventId, sourceEventPosition: event.sourceEventPosition, anchor: null,
     }));
   }
+
+  #appendGovernedLifecycleTransition(event: GovernedLifecycleProjectionEventV1): void {
+    if (event.transitionKind === "erase-evidence") {
+      const idsToErase = new Set([event.recordId, ...(event.erasedRecordIds ?? [])]);
+      for (const id of idsToErase) {
+        const current = this.#canonicalItems.get(id);
+        if (current !== undefined) {
+          if (
+            current.status !== "erased-evidence"
+            && !GOVERNED_LIFECYCLE_STATUS_TRANSITIONS[current.status].includes("erased-evidence")
+          ) {
+            return integrity();
+          }
+          this.#canonicalItems.set(id, Object.freeze({
+            ...current,
+            status: "erased-evidence",
+            summary: "[ERASED]",
+            verificationMethod: current.normalizedKey.startsWith("governed-note/")
+              ? GOVERNED_NOTE_ERASED_MARKER
+              : "erased-evidence",
+            anchor: event.verificationAnchor !== undefined ? event.verificationAnchor : event.sourceEventId,
+            sourceEventId: event.sourceEventId,
+            sourceEventPosition: event.sourceEventPosition,
+          }));
+        }
+        this.#lexicalChunks.delete(`item/${id}`);
+        for (const [chunkKey, chunk] of this.#lexicalChunks) {
+          if (chunk.itemId === id) {
+            this.#lexicalChunks.delete(chunkKey);
+          }
+        }
+      }
+      return;
+    }
+
+    const current = this.#canonicalItems.get(event.recordId);
+    if (current === undefined) return integrity();
+    if (
+      current.status !== event.targetStatus
+      && !GOVERNED_LIFECYCLE_STATUS_TRANSITIONS[current.status].includes(event.targetStatus)
+    ) {
+      return integrity();
+    }
+    const validFrom = event.validFrom ?? current.validFrom;
+    const validTo = event.validTo !== undefined ? event.validTo : current.validTo;
+    if (validTo !== null && Date.parse(validTo) < Date.parse(validFrom)) return integrity();
+    const supersedingItemId = event.supersedingRecordId !== undefined
+      ? event.supersedingRecordId !== null && this.#canonicalItems.has(event.supersedingRecordId)
+        ? event.supersedingRecordId
+        : null
+      : current.supersedingItemId;
+    const updated: CanonicalItemProjection = Object.freeze({
+      ...current,
+      status: event.targetStatus,
+      verificationMethod: event.verificationMethod ?? current.verificationMethod,
+      anchor: event.verificationAnchor !== undefined ? event.verificationAnchor : current.anchor,
+      validFrom,
+      validTo,
+      conflictGroupId: event.conflictGroupId !== undefined ? event.conflictGroupId : current.conflictGroupId,
+      supersedingItemId,
+      sourceEventId: event.sourceEventId,
+      sourceEventPosition: event.sourceEventPosition,
+    });
+    this.#canonicalItems.set(event.recordId, updated);
+    const chunkId = `item/${event.recordId}`;
+    const existingChunk = this.#lexicalChunks.get(chunkId);
+    if (existingChunk !== undefined) {
+      this.#lexicalChunks.set(chunkId, Object.freeze({
+        ...existingChunk,
+        sourceEventId: event.sourceEventId,
+        sourceEventPosition: event.sourceEventPosition,
+        anchor: updated.anchor,
+      }));
+    }
+    if (event.conflictKey !== undefined && event.conflictKey !== null) {
+      const existingConflict = this.#canonicalConflicts.get(event.conflictKey);
+      const conflictGroupId = event.conflictGroupId
+        ?? existingConflict?.conflictGroupId
+        ?? current.conflictGroupId
+        ?? event.sourceEventId;
+      const mergedRecordIds = [
+        ...new Set([
+          ...(existingConflict?.recordIds ?? []),
+          event.recordId,
+          ...(event.conflictingRecordIds ?? []),
+        ]),
+      ].sort();
+      const resolutionState = event.resolutionState
+        ?? (event.targetStatus === "verified" || event.targetStatus === "superseded" ? "resolved" : "open");
+      const resolutionEventId = event.resolutionEventId !== undefined
+        ? event.resolutionEventId
+        : resolutionState === "resolved"
+          ? event.sourceEventId
+          : null;
+      this.#canonicalConflicts.set(event.conflictKey, Object.freeze({
+        projectId: event.binding.projectId,
+        conflictKey: event.conflictKey,
+        conflictGroupId,
+        recordIds: Object.freeze(mergedRecordIds),
+        resolutionState,
+        resolutionEventId,
+        updatedEventPosition: event.sourceEventPosition.toString(),
+      }));
+    }
+  }
 }
 
 /**
@@ -1056,7 +1307,11 @@ export class LegacyProjectionFoldAccumulator {
 
   append(value: LegacyProjectionEvent): void {
     const event = validateProjectionEvent(value);
-    if (event.kind === "session-lifecycle" || event.kind === "governed-memory-source") {
+    if (
+      event.kind === "session-lifecycle"
+      || event.kind === "governed-memory-source"
+      || event.kind === "governed-lifecycle-transition"
+    ) {
       return integrity();
     }
     if (this.#binding !== null && !sameScope(this.#binding, event.binding)) return integrity();
@@ -1236,8 +1491,32 @@ export class ProjectionFoldAccumulatorV3 {
     if (key !== null && (this.#governedNotes.has(key) || this.#governedNotes.size >= MAX_ROWS)) return integrity();
     if (decoded.event !== null) this.#core.append(decoded.event, row !== null);
     if (key !== null && row !== null) this.#governedNotes.set(key, row);
+    if (decoded.event !== null && decoded.event.kind === "governed-lifecycle-transition") {
+      if (decoded.event.transitionKind === "erase-evidence") {
+        const idsToErase = [decoded.event.recordId, ...(decoded.event.erasedRecordIds ?? [])];
+        for (const id of idsToErase) {
+          this.#governedNotes.delete(`${decoded.binding.projectId}\0${id}`);
+        }
+      } else {
+        const targetKey = `${decoded.binding.projectId}\0${decoded.event.recordId}`;
+        const existingNote = this.#governedNotes.get(targetKey);
+        if (existingNote !== undefined) {
+          this.#governedNotes.set(
+            targetKey,
+            Object.freeze({
+              ...existingNote,
+              sourceEventPosition: decoded.event.sourceEventPosition.toString(),
+            }),
+          );
+        }
+      }
+    }
     this.#binding ??= decoded.binding;
     this.#lastSourcePosition = decoded.sourceEventPosition;
+  }
+
+  canonicalConflicts(): readonly CanonicalConflictProjectionRowV1[] {
+    return this.#core.canonicalConflicts();
   }
 
   finish(): ProjectionFoldStateV3 {

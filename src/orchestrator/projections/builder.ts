@@ -856,7 +856,11 @@ function foldLegacy(snapshot: ProjectionEventSnapshot): LegacyProjectionFoldStat
   for (const source of snapshot.events()) {
     const decoded = decodeProjectionEventV1(source);
     if (decoded.kind !== "projected") continue;
-    if (decoded.event.kind === "session-lifecycle" || decoded.event.kind === "governed-memory-source") {
+    if (
+      decoded.event.kind === "session-lifecycle"
+      || decoded.event.kind === "governed-memory-source"
+      || decoded.event.kind === "governed-lifecycle-transition"
+    ) {
       return failure("INTEGRITY_FAILURE");
     }
     accumulator.append(decoded.event);

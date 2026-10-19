@@ -37,6 +37,7 @@ import type {
   GovernedEntityAlias,
   GovernedEntityEdge,
   GovernedFollowUp,
+  GovernedLifecycleProjectionEventV1,
   GovernedMemorySourceProjectionEvent,
   MemorySourceProjectionEvent,
   ProjectBinding,
@@ -1250,11 +1251,194 @@ export function validateProjectionEvent(value: unknown): ProjectionEvent {
         sourceItemEventPosition,
       }) as RetrievalFeedbackProjectionEvent;
     }
+    if (kind === "governed-lifecycle-transition") {
+      const allowedKeys = new Set<string>([
+        ...PROJECTION_BASE_KEYS,
+        "transitionKind",
+        "recordId",
+        "targetStatus",
+        "verificationMethod",
+        "verificationAnchor",
+        "validFrom",
+        "validTo",
+        "supersededByEventId",
+        "supersedingRecordId",
+        "retractedByEventId",
+        "conflictKey",
+        "conflictGroupId",
+        "conflictingRecordIds",
+        "resolutionState",
+        "resolutionEventId",
+        "reason",
+        "erasedEvidenceIds",
+        "erasedRecordIds",
+      ]);
+      const rawKeys = Reflect.ownKeys(value as object).map(String);
+      if (rawKeys.some((k) => !allowedKeys.has(k))) return integrity();
+      for (const reqKey of [...PROJECTION_BASE_KEYS, "transitionKind", "recordId", "targetStatus", "reason"]) {
+        if (!rawKeys.includes(reqKey)) return integrity();
+      }
+      const source = exactRecord(value, rawKeys);
+      const recordId = uuid(source.recordId);
+      const supersedingRecordId = source.supersedingRecordId === undefined
+        ? undefined
+        : nullableUuid(source.supersedingRecordId);
+      if (supersedingRecordId === recordId) return integrity();
+      const validFrom = source.validFrom === undefined
+        ? undefined
+        : source.validFrom === null
+          ? null
+          : timestamp(source.validFrom);
+      const validTo = source.validTo === undefined
+        ? undefined
+        : source.validTo === null
+          ? null
+          : timestamp(source.validTo);
+      if (validFrom !== undefined && validFrom !== null && validTo !== undefined && validTo !== null) {
+        if (Date.parse(validTo) < Date.parse(validFrom)) return integrity();
+      }
+      return Object.freeze({
+        kind: "governed-lifecycle-transition",
+        sourceEventId: uuid(source.sourceEventId),
+        sourceEventPosition: positiveBigint(source.sourceEventPosition),
+        sourceStreamVersion: positiveBigint(source.sourceStreamVersion),
+        sourceEventSchemaVersion: safeInteger(source.sourceEventSchemaVersion, 1, 1),
+        occurredAt: timestamp(source.occurredAt),
+        recordedAt: timestamp(source.recordedAt),
+        binding: decodeBinding(source.binding),
+        transitionKind: oneOf(source.transitionKind, [
+          "promote",
+          "supersede",
+          "retract",
+          "expire",
+          "erase-evidence",
+        ] as const),
+        recordId,
+        targetStatus: oneOf(source.targetStatus, [
+          "candidate",
+          "provisional",
+          "verified",
+          "conflicted",
+          "superseded",
+          "retracted",
+          "expired",
+          "erased-evidence",
+        ] as const),
+        ...(source.verificationMethod !== undefined
+          ? { verificationMethod: boundedString(source.verificationMethod, 128) }
+          : {}),
+        ...(source.verificationAnchor !== undefined
+          ? { verificationAnchor: nullableAnchor(source.verificationAnchor) }
+          : {}),
+        ...(validFrom !== undefined ? { validFrom } : {}),
+        ...(validTo !== undefined ? { validTo } : {}),
+        ...(source.supersededByEventId !== undefined
+          ? { supersededByEventId: nullableUuid(source.supersededByEventId) }
+          : {}),
+        ...(supersedingRecordId !== undefined ? { supersedingRecordId } : {}),
+        ...(source.retractedByEventId !== undefined
+          ? { retractedByEventId: nullableUuid(source.retractedByEventId) }
+          : {}),
+        ...(source.conflictKey !== undefined
+          ? { conflictKey: nullableBoundedString(source.conflictKey, 512) }
+          : {}),
+        ...(source.conflictGroupId !== undefined
+          ? { conflictGroupId: nullableUuid(source.conflictGroupId) }
+          : {}),
+        ...(source.conflictingRecordIds !== undefined
+          ? {
+              conflictingRecordIds: Object.freeze(
+                strictArray(source.conflictingRecordIds, MAX_GOVERNED_ROWS).map((id) => uuid(id)),
+              ),
+            }
+          : {}),
+        ...(source.resolutionState !== undefined
+          ? { resolutionState: oneOf(source.resolutionState, ["open", "resolved"] as const) }
+          : {}),
+        ...(source.resolutionEventId !== undefined
+          ? { resolutionEventId: nullableUuid(source.resolutionEventId) }
+          : {}),
+        reason: boundedString(source.reason, MAX_SUMMARY_BYTES),
+        ...(source.erasedEvidenceIds !== undefined
+          ? {
+              erasedEvidenceIds: Object.freeze(
+                strictArray(source.erasedEvidenceIds, MAX_GOVERNED_ROWS).map((id) => uuid(id)),
+              ),
+            }
+          : {}),
+        ...(source.erasedRecordIds !== undefined
+          ? {
+              erasedRecordIds: Object.freeze(
+                strictArray(source.erasedRecordIds, MAX_GOVERNED_ROWS).map((id) => uuid(id)),
+              ),
+            }
+          : {}),
+      }) as GovernedLifecycleProjectionEventV1;
+    }
     return integrity();
   } catch (error) {
     if (error instanceof Error && error.message === "INTEGRITY_FAILURE") throw error;
     return integrity();
   }
+}
+
+const GOVERNED_LIFECYCLE_EVENT_TYPES = Object.freeze([
+  "GovernedRecordPromoted",
+  "GovernedRecordSuperseded",
+  "GovernedRecordRetracted",
+  "GovernedRecordExpired",
+  "EvidenceErased",
+] as const);
+
+function decodeGovernedLifecycleTransition(source: DecodedStoredEvent): ProjectionEventDecodeResult {
+  if (source.eventSchemaVersion !== 1 || source.record.streamType !== "governed-lifecycle") {
+    return integrity();
+  }
+  const rawPayload = source.payload;
+  if (typeof rawPayload !== "object" || rawPayload === null || Array.isArray(rawPayload)) {
+    return integrity();
+  }
+  const payloadKeys = Reflect.ownKeys(rawPayload).map(String);
+  const payload = exactRecord(rawPayload, payloadKeys);
+  const recordId = uuid(payload.recordId);
+  if (source.record.streamId !== `governed-lifecycle/${recordId}`) {
+    return integrity();
+  }
+  if (payload.binding !== undefined) {
+    const payloadBinding = decodeBinding(payload.binding);
+    if (!sameBinding(payloadBinding, source.binding)) return integrity();
+  }
+  const transitionKind =
+    source.eventType === "GovernedRecordPromoted" ? "promote" as const
+    : source.eventType === "GovernedRecordSuperseded" ? "supersede" as const
+    : source.eventType === "GovernedRecordRetracted" ? "retract" as const
+    : source.eventType === "GovernedRecordExpired" ? "expire" as const
+    : source.eventType === "EvidenceErased" ? "erase-evidence" as const
+    : integrity();
+
+  const event = validateProjectionEvent({
+    kind: "governed-lifecycle-transition",
+    ...baseProjection(source),
+    transitionKind,
+    recordId,
+    targetStatus: payload.targetStatus,
+    ...(payload.verificationMethod !== undefined ? { verificationMethod: payload.verificationMethod } : {}),
+    ...(payload.verificationAnchor !== undefined ? { verificationAnchor: payload.verificationAnchor } : {}),
+    ...(payload.validFrom !== undefined ? { validFrom: payload.validFrom } : {}),
+    ...(payload.validTo !== undefined ? { validTo: payload.validTo } : {}),
+    ...(payload.supersededByEventId !== undefined ? { supersededByEventId: payload.supersededByEventId } : {}),
+    ...(payload.supersedingRecordId !== undefined ? { supersedingRecordId: payload.supersedingRecordId } : {}),
+    ...(payload.retractedByEventId !== undefined ? { retractedByEventId: payload.retractedByEventId } : {}),
+    ...(payload.conflictKey !== undefined ? { conflictKey: payload.conflictKey } : {}),
+    ...(payload.conflictGroupId !== undefined ? { conflictGroupId: payload.conflictGroupId } : {}),
+    ...(payload.conflictingRecordIds !== undefined ? { conflictingRecordIds: payload.conflictingRecordIds } : {}),
+    ...(payload.resolutionState !== undefined ? { resolutionState: payload.resolutionState } : {}),
+    ...(payload.resolutionEventId !== undefined ? { resolutionEventId: payload.resolutionEventId } : {}),
+    reason: payload.reason,
+    ...(payload.erasedEvidenceIds !== undefined ? { erasedEvidenceIds: payload.erasedEvidenceIds } : {}),
+    ...(payload.erasedRecordIds !== undefined ? { erasedRecordIds: payload.erasedRecordIds } : {}),
+  });
+  return Object.freeze({ kind: "projected", event });
 }
 
 export function decodeProjectionEvent(event: StoredEvent): ProjectionEventDecodeResult {
@@ -1275,6 +1459,9 @@ export function decodeProjectionEvent(event: StoredEvent): ProjectionEventDecode
     }
     if (envelope.eventType === "RetrievalFeedbackRecorded") {
       return decodeFeedback(validateKnownPayload(envelope));
+    }
+    if ((GOVERNED_LIFECYCLE_EVENT_TYPES as readonly string[]).includes(envelope.eventType)) {
+      return decodeGovernedLifecycleTransition(validateKnownPayload(envelope));
     }
     return Object.freeze({
       kind: "unprojected",
