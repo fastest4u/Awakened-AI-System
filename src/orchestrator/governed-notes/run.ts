@@ -172,4 +172,9 @@ export type GovernedNoteOwnerPortV2=GovernedNoteOwnerPortV1 & Pick<ProjectStoreE
 export type GovernedNoteRunOptionsV2=Omit<GovernedNoteRunOptionsV1,"ownerFactory">&Readonly<{ownerFactory:(input:GovernedNoteOwnerConstructionV1)=>GovernedNoteOwnerPortV2}>;
 export function createGovernedNoteRunV1(options:GovernedNoteRunOptionsV1):GovernedNoteRunV1{return createRun(options,1);}
 export function createGovernedNoteRunV2(options:GovernedNoteRunOptionsV2):GovernedNoteRunV2{return createRun(options,2);}
-export async function executeGovernedFixtureActionV1(run:GovernedNoteRunV1,permit:GovernedNoteOwnerPermitV1,action:import("./fixture-control.js").GovernedFixtureActionV1):Promise<import("./fixture-control.js").GovernedFixtureResultV1>{const execute=fixtureIngress.get(run);if(!execute)invalid();return execute(permit,action) as Promise<import("./fixture-control.js").GovernedFixtureResultV1>;}
+/** Closed V1 entry: a V2 run's ingress admits V2-only kinds, so V1 ownership is enforced here before dispatch and on the result. */
+export async function executeGovernedFixtureActionV1(run:GovernedNoteRunV1,permit:GovernedNoteOwnerPermitV1,action:import("./fixture-control.js").GovernedFixtureActionV1):Promise<import("./fixture-control.js").GovernedFixtureResultV1>{
+  const execute=fixtureIngress.get(run);if(!execute)invalid();
+  const owned=decodeGovernedFixtureActionV1(action);
+  return decodeGovernedFixtureResultV1(await execute(permit,owned),owned);
+}

@@ -1,4 +1,4 @@
-﻿import assert from "node:assert/strict";
+import assert from "node:assert/strict";
 import test from "node:test";
 import { randomUUID } from "node:crypto";
 import { makeGovernedNoteDomainFixture } from "./support/governed-note-domain-fixture.js";
@@ -6,6 +6,7 @@ import { makeGovernedNoteFixture } from "./support/governed-note-fixture.js";
 import { encodePreparedGovernedNoteCreateV1, encodePreparedGovernedNoteCreateV2 } from "../src/orchestrator/governed-notes/codec.js";
 import { decodeWorkerRequest, decodeWorkerResponseForRequest, encodeWorkerBindingAssertion, encodeAppendResultWire } from "../src/orchestrator/runtime/worker-protocol.js";
 import * as fixtureCodecs from "../src/orchestrator/governed-notes/fixture-control.js";
+import { executeGovernedFixtureActionV1, executeGovernedFixtureActionV2 } from "../src/orchestrator/governed-notes/run.js";
 import type { GovernedNoteCommandV2, PreparedGovernedNoteCreateV2, GovernedNoteReceiptV2 } from "../src/orchestrator/governed-notes/contracts.js";
 
 test("queued_v2_send_uses_owned_snapshot", async t => {
@@ -167,4 +168,25 @@ test("unknown_private_action_ack_closes_owner_and_cannot_renew_or_reopen",async(
  await assert.rejects(f.run.createV2(f.permit,p),{code:"GOVERNED_NOTE_OWNERSHIP_UNCERTAIN"});await assert.rejects(f.prepareRecoveryV2(p.command));await assert.rejects(f.run.reopen(f.permit));assert.equal(f.observations().proofMints,before.proofMints);assert.equal(f.observations().createPosts,before.createPosts);assert.equal(f.observations().ownerGeneration,before.ownerGeneration);
  try{await f.cleanup();}catch{/* The original uncertain fixture is retained; physical owner closure is observed below. */}
  for(let n=0;n<100&&f.observations().workerExits===0;n++)await new Promise(r=>setTimeout(r,10));assert.equal(f.observations().workerExits,1);assert.equal(f.observations().openWriterConnectionCount,0);
+});
+test("v1_fixture_entry_keeps_closed_actions_on_v2_run",async t=>{
+ const f=await makeGovernedNoteFixture();t.after(()=>f.cleanup());const command=commandFor(f);
+ const actions=[{kind:"prepare-create-v2"as const,authoritySessionId:f.rootSessionId,command},{kind:"prepare-recovery-v2"as const,authoritySessionId:f.rootSessionId,operationId:randomUUID(),requestId:randomUUID(),commandId:command.commandId,idempotencyKey:command.idempotencyKey}];
+ for(const action of actions)await t.test(`rejects ${action.kind} before dispatch`,async()=>{
+  const before=f.observations();
+  await assert.rejects(executeGovernedFixtureActionV1(f.run,f.permit,action as never),{code:"GOVERNED_NOTE_INPUT_INVALID"});
+  const after=f.observations();
+  for(const key of ["actionPosts","proofMints","createPosts","recoveryPosts","pairs","ownerGeneration","openWriterConnectionCount","factoryConnectionIdentityCount"]as const)assert.equal(after[key],before[key],key);
+  assert.equal(after.ownerReusable,true);
+ });
+ await t.test("explicit v2 and legacy v1 helpers retain their admitted results",async()=>{
+  for(const action of actions){const result=await executeGovernedFixtureActionV2(f.run,f.permit,action);assert.equal(result.kind,action.kind);}
+  const {content:_content,...legacyFields}=command;
+  const legacy=await executeGovernedFixtureActionV1(f.run,f.permit,{kind:"prepare-create",authoritySessionId:f.rootSessionId,command:{...legacyFields,version:1}});
+  assert.equal(legacy.kind,"prepare-create");if(legacy.kind!=="prepare-create")throw Error();assert.equal(legacy.prepared.command.version,1);
+  const action=actions[1]!;if(action.kind!=="prepare-recovery-v2")throw Error();
+  const recovered=await executeGovernedFixtureActionV1(f.run,f.permit,{...action,kind:"prepare-recovery"});
+  assert.equal(recovered.kind,"prepare-recovery");if(recovered.kind!=="prepare-recovery")throw Error();assert.equal(recovered.prepared.request.version,1);
+  t.diagnostic(JSON.stringify({caseId:"v1-fixture-entry-closed-on-v2-run",commandId:command.commandId,idempotencyKey:command.idempotencyKey,operationId:action.operationId,requestId:action.requestId,rootSessionId:f.rootSessionId}));
+ });
 });
