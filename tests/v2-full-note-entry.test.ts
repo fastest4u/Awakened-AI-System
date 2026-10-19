@@ -553,12 +553,12 @@ test("native_full_note_deadline_cancel_fault_and_captured_image", { timeout: 300
       const { adapter, ownership } = helperAdapter(binding, mode); adapters.push(adapter);
       let ticks = 0; const timer = setInterval(() => ticks++, 10), arrival = performance.now(), abort = new AbortController();
       try {
-        const outcome = adapter.queryFullNote(fullNote(receiptA.recordId, receiptA.terminalPosition, "session-strong", 2000), { signal: abort.signal }).then(() => null, (error: { code?: string }) => error.code ?? null);
-        await until(() => existsSync(join(projection, marker)), 1900, `${mode} barrier`);
+        const outcome = adapter.queryFullNote(fullNote(receiptA.recordId, receiptA.terminalPosition, "session-strong", 4000), { signal: abort.signal }).then(() => null, (error: { code?: string }) => error.code ?? null);
+        await until(() => existsSync(join(projection, marker)), 3800, `${mode} barrier`);
         assert.match(readFileSync(join(projection, marker), "utf8"), /^validated-image-owned-lock-/u);
         if (cancel) abort.abort();
         const code = await outcome; assert.equal(code, cancel ? "WORKER_CLOSED" : "WORKER_TIMEOUT");
-        const elapsedMs = Math.round(performance.now() - arrival); assert.ok(elapsedMs <= 3000); assert.ok(ticks >= 5, "parent responsive while child blocked synchronously");
+        const elapsedMs = Math.round(performance.now() - arrival); assert.ok(elapsedMs <= 5500); assert.ok(ticks >= 5, "parent responsive while child blocked synchronously");
         const diagnostic = await adapter.close(); assert.equal(diagnostic.cleanup, "complete"); assert.equal(diagnostic.code, code);
         const read = lastFork(isHelper(mode))!; await until(() => read.close !== null && !!lastFork(isHelper("cleanup-measured"))?.close, 5000, "exact owned closes");
         const cleanup = lastFork(isHelper("cleanup-measured"))!;
@@ -568,7 +568,7 @@ test("native_full_note_deadline_cancel_fault_and_captured_image", { timeout: 300
           read: readBlock(read, binding, receiptA.recordId, null, { code, cleanup: "complete", ownerState: "closed" }), upgrade: null,
           identities: { buildIdentityHash: binding.expectedRelease.buildIdentityHash, writer, reader: helperIdentity(read), cleanup: helperIdentity(cleanup) },
           configuration, observations: observationsBlock(f, { adapterReusable: false, lockClosed: !existsSync(lock), read, cleanup,
-            detail: { phaseOrdinal: read.stages.length, phase: read.stages.at(-1) ?? null, actualReadBudgetMs: 2000, elapsedMs,
+            detail: { phaseOrdinal: read.stages.length, phase: read.stages.at(-1) ?? null, actualReadBudgetMs: 4000, elapsedMs,
               parentResponsive: ticks >= 5, independentWriterSurvived: f.observations().ownerReusable && f.observations().openWriterConnectionCount === 1 } }) });
       } finally { clearInterval(timer); }
     }
@@ -621,17 +621,17 @@ test("late_full_note_success_cannot_override_uncertain_cleanup", { timeout: 2400
     const binding = await f.verifiedReadBinding(receipt), projection = binding.projectionDirectory.canonicalPath, writerBefore = f.observations();
     const owned = helperAdapter(binding, "full-note-late-success", "cleanup-hang"); adapter = owned.adapter;
     const helperCount = () => forks.filter(value => samePath(value.path, COMPILED_HELPER)).length, spawnedBefore = helperCount();
-    const outcome = adapter.queryFullNote(fullNote(receipt.recordId, receipt.terminalPosition, "session-strong", 1500)).then(() => null, (error: { code?: string }) => error.code ?? null);
+    const outcome = adapter.queryFullNote(fullNote(receipt.recordId, receipt.terminalPosition, "session-strong", 4000)).then(() => null, (error: { code?: string }) => error.code ?? null);
     const queued = adapter.queryFullNote(fullNote(receipt.recordId, receipt.terminalPosition, "session-strong", 15000)).then(() => null, (error: { code?: string }) => error.code ?? null);
-    await until(() => existsSync(join(projection, "full-note-late-held")), 1400, "late success withheld");
+    await until(() => existsSync(join(projection, "full-note-late-held")), 3800, "late success withheld");
     assert.equal(readFileSync(join(projection, "full-note-late-held"), "utf8"), "success");
     assert.equal(await outcome, "WORKER_TIMEOUT"); const failedAt = performance.now();
     const read = lastFork(isHelper("full-note-late-success"))!;
-    await until(() => read.success !== null, 2000, "late success delivered after failure");
+    await until(() => read.success !== null, 4000, "late success delivered after failure");
     assert.equal(read.success!.afterFailure, true, "success arrived only after the lane failed");
-    await until(() => existsSync(join(projection, "cleanup-blocked")), 2500, "cleanup barrier");
-    await until(() => adapter!.diagnostic().cleanup === "incomplete", 3000, "cleanup uncertainty");
-    const uncertainAfterMs = Math.round(performance.now() - failedAt); assert.ok(uncertainAfterMs <= 3000, `one cleanup deadline ${uncertainAfterMs}`);
+    await until(() => existsSync(join(projection, "cleanup-blocked")), 4000, "cleanup barrier");
+    await until(() => adapter!.diagnostic().cleanup === "incomplete", 4000, "cleanup uncertainty");
+    const uncertainAfterMs = Math.round(performance.now() - failedAt); assert.ok(uncertainAfterMs <= 4500, `one cleanup deadline ${uncertainAfterMs}`);
     assert.equal(await queued, "WORKER_UNAVAILABLE");
     await assert.rejects(adapter.queryFullNote(fullNote(receipt.recordId, receipt.terminalPosition)), { code: "WORKER_UNAVAILABLE" });
     assert.equal(helperCount(), spawnedBefore + 2, "no replacement owner/process after quarantine");

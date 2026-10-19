@@ -1,20 +1,24 @@
 import { writeFileSync, readFileSync } from "node:fs";
-import { DatabaseSync } from "node:sqlite";
-import { createCwdProjectionReadCore } from "../../src/orchestrator/projections/stable-directory-read-core.js";
-import { releaseOwnedReadLock } from "../../src/orchestrator/verified-read/cleanup.js";
-import { decodeCleanupBootstrap, decodeReadBootstrap } from "../../src/orchestrator/verified-read/protocol.js";
-import { executeVerifiedRead, executeFullNoteVerifiedRead } from "../../src/orchestrator/verified-read/child.js";
-import { decodeFullNoteReadBootstrap } from "../../src/orchestrator/verified-read/full-note-protocol.js";
 
 // Fault selection exists only in this test executable, never production argv/env/bootstrap.
 const kind = process.argv[2];
 if (kind === "writer") {
-  const database = new DatabaseSync("independent-writer.sqlite");
-  database.exec("CREATE TABLE sentinel(value TEXT); INSERT INTO sentinel VALUES('independent-owned-writer');");
-  writeFileSync("writer-ready", "sqlite-open");
-  process.on("message", value => { if (value === "stop") { database.close(); process.disconnect(); } });
+  let stopRequested = false;
+  process.on("message", value => { if (value === "stop") stopRequested = true; });
+  void (async () => {
+    const { DatabaseSync } = await import("node:sqlite");
+    const database = new DatabaseSync("independent-writer.sqlite");
+    database.exec("CREATE TABLE sentinel(value TEXT); INSERT INTO sentinel VALUES('independent-owned-writer');");
+    writeFileSync("writer-ready", "sqlite-open");
+    if (stopRequested) { database.close(); process.disconnect(); return; }
+    process.on("message", value => { if (value === "stop") { database.close(); process.disconnect(); } });
+  })();
 } else if (kind === "read-hang") {
-  process.once("message", value => {
+  process.once("message", async value => {
+    const [{ decodeReadBootstrap }, { createCwdProjectionReadCore }] = await Promise.all([
+      import("../../src/orchestrator/verified-read/protocol.js"),
+      import("../../src/orchestrator/projections/stable-directory-read-core.js"),
+    ]);
     const bootstrap = decodeReadBootstrap(value);
     const core = createCwdProjectionReadCore(bootstrap.binding.projectionDirectory);
     if (core.acquireLock(bootstrap.lockToken) !== "acquired") throw new Error("fixture lock unavailable");
@@ -26,6 +30,11 @@ if (kind === "writer") {
   });
 } else if (kind === "query-hang" || kind === "workflow-query-hang" || kind === "workflow-packing-hang") {
   process.once("message", async value => {
+    const [{ DatabaseSync }, { decodeReadBootstrap }, { executeVerifiedRead }] = await Promise.all([
+      import("node:sqlite"),
+      import("../../src/orchestrator/verified-read/protocol.js"),
+      import("../../src/orchestrator/verified-read/child.js"),
+    ]);
     const bootstrap = decodeReadBootstrap(value); let queryObserved = false;
     const prepare = DatabaseSync.prototype.prepare;
     DatabaseSync.prototype.prepare = function (sql) {
@@ -65,6 +74,14 @@ if (kind === "writer") {
   // Protocol4/executor4 only. Build identity is read from the independently measured current dist manifest.
   const measured = (JSON.parse(readFileSync(new URL("../../../dist/v2-build.json", import.meta.url), "utf8")) as { buildIdentityHash: string }).buildIdentityHash;
   process.once("message", async value => {
+    let late: { reply?: unknown; cancelled: boolean } = { cancelled: false };
+    const deliver = (reply: unknown) => process.send!(reply, sendError => { if (sendError) process.exitCode = 1; process.disconnect(); });
+    if (kind === "full-note-late-success") process.on("message", () => { late.cancelled = true; if (late.reply !== undefined) deliver(late.reply); });
+    const [{ DatabaseSync }, { decodeFullNoteReadBootstrap }, { executeFullNoteVerifiedRead }] = await Promise.all([
+      import("node:sqlite"),
+      import("../../src/orchestrator/verified-read/full-note-protocol.js"),
+      import("../../src/orchestrator/verified-read/child.js"),
+    ]);
     const bootstrap = decodeFullNoteReadBootstrap(value); let queryObserved = false, revalidateObserved = false;
     const owned = (label: string) => { if (!queryObserved || revalidateObserved || readFileSync(".projection-manifest.publish.lock", "utf8") !== bootstrap.lockToken) throw new Error(`${label} boundary not owned`); };
     const prepare = DatabaseSync.prototype.prepare;
@@ -87,9 +104,6 @@ if (kind === "writer") {
       }
       return byteLength(input, encoding);
     };
-    let late: { reply?: unknown; cancelled: boolean } = { cancelled: false };
-    const deliver = (reply: unknown) => process.send!(reply, sendError => { if (sendError) process.exitCode = 1; process.disconnect(); });
-    if (kind === "full-note-late-success") process.on("message", () => { late.cancelled = true; if (late.reply !== undefined) deliver(late.reply); });
     const reply = await executeFullNoteVerifiedRead(bootstrap, { inspectBuild: () => measured, now: () => performance.now(),
       wait: async ms => { await new Promise(resolve => setTimeout(resolve, ms)); }, signal: new AbortController().signal,
       emitStage(stage) {
@@ -110,19 +124,28 @@ if (kind === "writer") {
     deliver(reply);
   });
 } else if (kind === "cleanup-hang") {
-  process.once("message", value => {
+  process.once("message", async value => {
+    const { decodeCleanupBootstrap } = await import("../../src/orchestrator/verified-read/protocol.js");
     decodeCleanupBootstrap(value); writeFileSync("cleanup-blocked", "cleanup-bootstrap-decoded-no-reply");
     Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0);
     throw new Error("infinite cleanup wait unexpectedly returned");
   });
 } else if (kind === "cleanup") {
-  process.once("message", value => {
+  process.once("message", async value => {
+    const [{ decodeCleanupBootstrap }, { releaseOwnedReadLock }] = await Promise.all([
+      import("../../src/orchestrator/verified-read/protocol.js"),
+      import("../../src/orchestrator/verified-read/cleanup.js"),
+    ]);
     const bootstrap = decodeCleanupBootstrap(value);
     const reply = releaseOwnedReadLock(bootstrap, "a".repeat(64));
     process.send!(reply, sendError => { if (sendError) process.exitCode = 1; process.disconnect(); });
   });
 } else if (kind === "cleanup-measured") {
-  process.once("message", value => {
+  process.once("message", async value => {
+    const [{ decodeCleanupBootstrap }, { releaseOwnedReadLock }] = await Promise.all([
+      import("../../src/orchestrator/verified-read/protocol.js"),
+      import("../../src/orchestrator/verified-read/cleanup.js"),
+    ]);
     const bootstrap = decodeCleanupBootstrap(value);
     const measured = (JSON.parse(readFileSync(new URL("../../../dist/v2-build.json", import.meta.url), "utf8")) as { buildIdentityHash: string }).buildIdentityHash;
     const reply = releaseOwnedReadLock(bootstrap, measured);
