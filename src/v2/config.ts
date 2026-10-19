@@ -4,9 +4,34 @@ import { FreshStartError } from "../orchestrator/fresh-start/contracts.js";
 import type { FreshStartPaths } from "../orchestrator/fresh-start/fresh-start-paths.js";
 import { canonicalJson } from "../orchestrator/serialization/canonical-json.js";
 
+import {
+  V2_CAPABILITIES,
+  V2_RECOVERY_POLICY,
+  V2_SUPPORTED_V1_TOOLS,
+  V2_SUPERSEDED_V1_TOOLS,
+  V2_UNAVAILABLE_V1_TOOLS,
+  V2_V1_PARITY_CLASSIFICATION,
+  V2_NATIVE_TOOLS,
+  V2_PRODUCTION_CAPABILITIES,
+  V2_PRODUCTION_RECOVERY_POLICY,
+  isProductionReleaseManifest,
+  type V1ToolParityEntry,
+} from "./capabilities.js";
+
 export type V2LaunchConfig = FreshStartPaths & Readonly<{ releaseId: string }>;
-export const V2_CAPABILITIES = Object.freeze({ profile: "fresh-start", version: 1, tools: Object.freeze(["memory_v2Status"]), content: "unavailable" });
-export const V2_RECOVERY_POLICY = Object.freeze({ profile: "fresh-start", version: 1, productionReady: false, promotion: "closed" });
+export {
+  V2_CAPABILITIES,
+  V2_RECOVERY_POLICY,
+  V2_SUPPORTED_V1_TOOLS,
+  V2_SUPERSEDED_V1_TOOLS,
+  V2_UNAVAILABLE_V1_TOOLS,
+  V2_V1_PARITY_CLASSIFICATION,
+  V2_NATIVE_TOOLS,
+  V2_PRODUCTION_CAPABILITIES,
+  V2_PRODUCTION_RECOVERY_POLICY,
+  isProductionReleaseManifest,
+  type V1ToolParityEntry,
+};
 export const configurationDigest = (value: unknown): string => createHash("sha256").update(canonicalJson(value)).digest("hex");
 
 export function loadV2LaunchConfig(env: Readonly<Record<string, string | undefined>>): V2LaunchConfig {

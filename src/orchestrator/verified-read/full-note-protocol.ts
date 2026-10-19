@@ -1,9 +1,10 @@
 import { types } from "node:util";
 import { FreshStartError } from "../fresh-start/contracts.js";
 import type { GovernedNoteKind } from "../governed-notes/contracts.js";
+import { GOVERNED_NOTE_V1_MARKERS, GOVERNED_NOTE_V2_MARKERS } from "../projections/contracts.js";
 import type { NativeGetConflict, NativeGetResult } from "./content-contracts.js";
 import { assertNativeContentMatchesRequest } from "./content-protocol.js";
-import { decodeNativeContentConflict, decodeNativeContentItem, decodeNativeSelectionScope } from "./content-data-protocol.js";
+import { decodeNativeContentItem, decodeNativeContentConflict, decodeNativeSelectionScope } from "./content-data-protocol.js";
 import type { TrustedReadSession, FullNoteReadBootstrapV1, FullNoteReadCancelV1, FullNoteReadReplyV1, VerifiedReadBinding } from "./contracts.js";
 import type { FullNoteVerifiedReadReceiptV1, GetFullNoteRequest, NativeFullNoteItem, NativeFullNoteResultV1 } from "./full-note-contracts.js";
 import { assertReadReplyEnvelope, decodeReadBootstrap, decodeReadCancel, decodeReadReply, decodeVerifiedReadReceipt, decodeVerifiedReadRequest } from "./protocol.js";
@@ -59,9 +60,9 @@ export function decodeNativeFullNoteResult(value: unknown): NativeFullNoteResult
       status: raw.status, confidence: raw.confidence, verificationMethod: raw.verificationMethod, validFrom: raw.validFrom, validTo: raw.validTo,
       knownFromEventPosition: raw.knownFromEventPosition, sourceEventPosition: raw.sourceEventPosition, textKind: raw.textKind,
       text: raw.text, conflictGroupId: raw.conflictGroupId, supersedingItemId: raw.supersedingItemId }, false);
-    if (inherited.verificationMethod === "governed-note-unverified-v2") {
+    if (GOVERNED_NOTE_V2_MARKERS.has(inherited.verificationMethod)) {
       if (raw.bodyAvailability !== "present") invalid();
-    } else if (inherited.verificationMethod === "governed-note-unverified-v1") {
+    } else if (GOVERNED_NOTE_V1_MARKERS.has(inherited.verificationMethod)) {
       if (raw.bodyAvailability !== "absent" || raw.recordKind === null) invalid();
     } else if (inherited.verificationMethod.startsWith("governed-note-") || raw.bodyAvailability !== "absent" || raw.recordKind !== null) invalid();
     item = raw.bodyAvailability === "present"
