@@ -149,6 +149,16 @@ test("governed_lifecycle_promotion_and_verification_policy_enforcement", async (
       fixture.rootContext,
     ).response;
 
+    const migrationInsightCmd = fixture.commandV2({
+      recordKind: "insight",
+      summary: "[migration] Enforce forward-only migration checksums on event store startup",
+      content: { format: "markdown", body: "# Migration Insight\n\nNever mutate historical migration SQL.\n" },
+    });
+    const migrationInsight = fixture.service().createV2(
+      fixture.prepareCreateV2(migrationInsightCmd),
+      fixture.rootContext,
+    ).response;
+
     const governance = new GovernedLifecycleService({
       connection: fixture.connection,
       context: fixture.rootContext,
@@ -197,7 +207,7 @@ test("governed_lifecycle_promotion_and_verification_policy_enforcement", async (
     assert.equal(verifiedInsightReceipt.targetStatus, "verified");
     assert.equal(verifiedInsightReceipt.verificationMethod, "governed-note-test-verified-v2");
 
-    // 2. High-risk records (ADR and security-tagged insight) reject cross-session-observation for verified
+    // 2. High-risk records (ADR, security-tagged, migration-tagged) reject cross-session-observation or blank verificationAnchor for verified
     assert.throws(
       () =>
         governance.promote({
@@ -230,7 +240,39 @@ test("governed_lifecycle_promotion_and_verification_policy_enforcement", async (
         error instanceof GovernedLifecycleError && error.code === "GOVERNED_VERIFICATION_POLICY_DENIED",
     );
 
-    // 3. High-risk ADR succeeds when promoted with accepted-adr
+    assert.throws(
+      () =>
+        governance.promote({
+          commandId: "20000000-0000-4000-8000-000000000006",
+          idempotencyKey: "promote-migration-cross-session-denied",
+          sessionId,
+          recordId: migrationInsight.recordId,
+          targetStatus: "verified",
+          verificationMethod: "cross-session-observation",
+          verificationAnchor: "repeated-migration-obs",
+          occurredAt: "2026-10-19T12:03:40.000Z",
+        }),
+      (error: unknown) =>
+        error instanceof GovernedLifecycleError && error.code === "GOVERNED_VERIFICATION_POLICY_DENIED",
+    );
+
+    assert.throws(
+      () =>
+        governance.promote({
+          commandId: "20000000-0000-4000-8000-000000000007",
+          idempotencyKey: "promote-migration-blank-anchor-denied",
+          sessionId,
+          recordId: migrationInsight.recordId,
+          targetStatus: "verified",
+          verificationMethod: "source-anchored",
+          verificationAnchor: "   ",
+          occurredAt: "2026-10-19T12:03:50.000Z",
+        }),
+      (error: unknown) =>
+        error instanceof GovernedLifecycleError && error.code === "GOVERNED_VERIFICATION_POLICY_DENIED",
+    );
+
+    // 3. High-risk ADR succeeds when promoted with accepted-adr and non-empty verificationAnchor
     const verifiedAdrReceipt = governance.promote({
       commandId: "20000000-0000-4000-8000-000000000005",
       idempotencyKey: "promote-adr-accepted",
@@ -244,10 +286,24 @@ test("governed_lifecycle_promotion_and_verification_policy_enforcement", async (
     assert.equal(verifiedAdrReceipt.targetStatus, "verified");
     assert.equal(verifiedAdrReceipt.verificationMethod, "governed-note-accepted-adr-v2");
 
-    // 4. Publish Projection Schema 3 and verify folded canonical_items & governed_notes
+    // 4. High-risk migration insight succeeds when promoted with source-anchored and non-empty verificationAnchor
+    const sourceAnchoredReceipt = governance.promote({
+      commandId: "20000000-0000-4000-8000-000000000008",
+      idempotencyKey: "promote-migration-source-anchored",
+      sessionId,
+      recordId: migrationInsight.recordId,
+      targetStatus: "verified",
+      verificationMethod: "source-anchored",
+      verificationAnchor: "src/orchestrator/storage/migration-runner.ts#L1-L40",
+      occurredAt: "2026-10-19T12:04:30.000Z",
+    });
+    assert.equal(sourceAnchoredReceipt.targetStatus, "verified");
+    assert.equal(sourceAnchoredReceipt.verificationMethod, "governed-note-source-anchored-v2");
+
+    // 5. Publish Projection Schema 3 and verify folded canonical_items & governed_notes
     const projectionDir = join(fixture.retained.root, "projections-promote");
     const { coordinator, integrity, binding } = buildCoordinator(fixture, projectionDir);
-    const published = await coordinator.ensurePublishedV3(binding, verifiedAdrReceipt.globalPosition, 5_000);
+    const published = await coordinator.ensurePublishedV3(binding, sourceAnchoredReceipt.globalPosition, 5_000);
     assert.equal(published.manifest.schemaVersion, 3);
     const verifyReport = await integrity.verify(binding, published.manifest);
     assert.equal(verifyReport.status, "passed");

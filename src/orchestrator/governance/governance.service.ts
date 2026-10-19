@@ -106,16 +106,19 @@ function deterministicUuidV4(namespace: string, value: string): string {
 
 function normalizePolicyKind(
   method: GovernedVerificationPolicyMethodV1,
-): "test-verified" | "source-verified" | "user-confirmed" | "accepted-adr" | "cross-session-observation" {
+): "test-verified" | "source-anchored" | "user-confirmed" | "accepted-adr" | "cross-session-observation" {
   switch (method) {
     case "test-verified":
     case "governed-note-test-verified-v1":
     case "governed-note-test-verified-v2":
       return "test-verified";
+    case "source-anchored":
+    case "governed-note-source-anchored-v1":
+    case "governed-note-source-anchored-v2":
     case "source-verified":
     case "governed-note-source-verified-v1":
     case "governed-note-source-verified-v2":
-      return "source-verified";
+      return "source-anchored";
     case "user-confirmed":
     case "governed-note-user-confirmed-v1":
     case "governed-note-user-confirmed-v2":
@@ -128,19 +131,21 @@ function normalizePolicyKind(
     case "governed-note-cross-session-v1":
     case "governed-note-cross-session-v2":
       return "cross-session-observation";
+    default:
+      throw new GovernedLifecycleError("GOVERNED_LIFECYCLE_INVALID", "Unsupported verificationMethod");
   }
 }
 
 function resolveMarkerForRecord(
-  policyKind: "test-verified" | "source-verified" | "user-confirmed" | "accepted-adr" | "cross-session-observation",
+  policyKind: "test-verified" | "source-anchored" | "user-confirmed" | "accepted-adr" | "cross-session-observation",
   noteVersion: 1 | 2 | null,
 ): string {
   if (noteVersion === 2) {
     switch (policyKind) {
       case "test-verified":
         return "governed-note-test-verified-v2";
-      case "source-verified":
-        return "governed-note-source-verified-v2";
+      case "source-anchored":
+        return "governed-note-source-anchored-v2";
       case "user-confirmed":
         return "governed-note-user-confirmed-v2";
       case "accepted-adr":
@@ -153,8 +158,8 @@ function resolveMarkerForRecord(
     switch (policyKind) {
       case "test-verified":
         return "governed-note-test-verified-v1";
-      case "source-verified":
-        return "governed-note-source-verified-v1";
+      case "source-anchored":
+        return "governed-note-source-anchored-v1";
       case "user-confirmed":
         return "governed-note-user-confirmed-v1";
       case "accepted-adr":
@@ -166,11 +171,14 @@ function resolveMarkerForRecord(
   return policyKind;
 }
 
+const HIGH_RISK_PATTERN =
+  /\[(?:security|auth|secrets|deployment|schema|migration|destructive-ops)\]|\b(?:security|auth|secrets|deployment|schema|migration|destructive-ops)\b/iu;
+
 function isHighRiskRecord(record: StoredRecordState): boolean {
   if (record.recordKind === "adr" || record.normalizedKey.startsWith("governed-note/adr/")) {
     return true;
   }
-  return /\[security\]|\bsecurity\b/iu.test(record.summary);
+  return HIGH_RISK_PATTERN.test(record.summary) || HIGH_RISK_PATTERN.test(record.normalizedKey);
 }
 
 export class GovernedLifecycleService {
@@ -199,11 +207,19 @@ export class GovernedLifecycleService {
     }
 
     const policyKind = normalizePolicyKind(input.verificationMethod);
-    if (input.targetStatus === "verified" && isHighRiskRecord(record) && policyKind === "cross-session-observation") {
-      throw new GovernedLifecycleError(
-        "GOVERNED_VERIFICATION_POLICY_DENIED",
-        `High-risk record ${input.recordId} cannot be promoted to verified via cross-session-observation`,
-      );
+    if (input.targetStatus === "verified" && isHighRiskRecord(record)) {
+      if (policyKind === "cross-session-observation") {
+        throw new GovernedLifecycleError(
+          "GOVERNED_VERIFICATION_POLICY_DENIED",
+          `High-risk record ${input.recordId} cannot be promoted to verified via cross-session-observation`,
+        );
+      }
+      if (typeof input.verificationAnchor !== "string" || input.verificationAnchor.trim().length === 0) {
+        throw new GovernedLifecycleError(
+          "GOVERNED_VERIFICATION_POLICY_DENIED",
+          "High-risk verified promotion requires a non-empty verificationAnchor",
+        );
+      }
     }
 
     const verificationMethod = resolveMarkerForRecord(policyKind, record.noteVersion);
@@ -555,7 +571,8 @@ export class GovernedLifecycleService {
       );
     }
 
-    const primaryRecord = this.#loadRecordState(derivedRecordIds[0]!, input.commandId);
+    const derivedRecords = derivedRecordIds.map((id) => this.#loadRecordState(id, input.commandId));
+    const primaryRecord = derivedRecords[0]!;
     const occurredAt = input.occurredAt ?? this.#now();
     const eventId = deterministicUuidV4("governed-lifecycle-event/v1", input.commandId);
 
