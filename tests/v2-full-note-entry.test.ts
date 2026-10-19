@@ -489,11 +489,13 @@ test("native_same_position_upgrade", { timeout: 120000 }, async t => {
     const corpus = await f.appendCorpus(); const before = await f.publish(); assert.equal(before.schemaVersion, 2); started = true;
     const tailBefore = f.eventTail(); assert.equal(tailBefore.position, before.terminalEventPosition); assert.equal(tailBefore.hash, before.terminalEventHash);
     adapter = createVerifiedReadAdapter(f.binding);
-    const request = fullNote(corpus.ids.canonical, before.terminalEventPosition, "project-strong");
+    const request = fullNote(corpus.ids.canonical, before.terminalEventPosition, "project-strong", 10000);
     // A sufficient-position schema2 image alone never yields full-note success or a summary.
     await assert.rejects(adapter.queryFullNote({ ...request, budgetMs: 1000 }), (error: { code?: string }) => ["PROJECTION_LAG", "WORKER_TIMEOUT"].includes(error.code ?? ""));
+    await until(() => adapter!.diagnostic().cleanup === "complete", 5000, "schema2 timeout cleanup");
+    const priorRead = lastFork(isRead);
     let settled = false; const pending = adapter.queryFullNote(request).finally(() => { settled = true; });
-    await until(() => { const current = lastFork(isRead); return !!current && current.stages.includes("projection-wait") && current.ids !== null && current.close === null; }, 3000, "projection wait");
+    await until(() => { const current = lastFork(isRead); return !!current && current !== priorRead && current.stages.includes("projection-wait") && current.ids !== null && current.close === null; }, 6000, "projection wait");
     await new Promise(resolve => setTimeout(resolve, 300)); assert.equal(settled, false, "sufficient schema2 must keep waiting");
     const after = await f.publishV3(); const tailAfter = f.eventTail();
     assert.equal(after.schemaVersion, 3); assert.notEqual(after.generation, before.generation);
