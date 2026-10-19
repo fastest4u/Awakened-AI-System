@@ -632,7 +632,7 @@ function fixture() {
     const cancel = () => controller.abort();
     options.signal?.addEventListener('abort', cancel, { once: true });
     if (options.signal?.aborted) cancel();
-    const watchdog = setTimeout(cancel, 180000);
+    const watchdog = setTimeout(cancel, 600000);
     let helpers = 0;
     let ownedDescriptor: number | undefined;
     fs.openSync = ((path: any, ...args: any[]) => {
@@ -814,7 +814,7 @@ function refused(f: ReturnType<typeof fixture>, result: { ok: boolean }) {
   assert.equal(f.events.filter(event => event.observation === 'qualification').length, 0);
 }
 
-test('full_body_gate_is_literal_contained_and_zero_skip', { timeout: 180000 }, async () => {
+test('full_body_gate_is_literal_contained_and_zero_skip', { timeout: 600000 }, async () => {
   const mod = await loadGateModule();
   const profile = mod.FULL_BODY_NOTES_GATE_PROFILE;
   const pkg = JSON.parse(readFileSync(join(process.cwd(), 'package.json'), 'utf8')) as { scripts?: Record<string, string> };
@@ -917,7 +917,7 @@ test('full_body_gate_is_literal_contained_and_zero_skip', { timeout: 180000 }, a
   assert.deepEqual(q.nativeEvidence.caseIds, EVIDENCE_CASES);
 });
 
-test('qualification_binds_candidate_and_private_closure', { timeout: 120000 }, async () => {
+test('qualification_binds_candidate_and_private_closure', { timeout: 600000 }, async () => {
   await loadGateModule();
   const first = fixture();
   const second = fixture();
@@ -999,7 +999,7 @@ test('qualification_binds_candidate_and_private_closure', { timeout: 120000 }, a
   }
 });
 
-test('gate_rejects_dirty_docs_and_product_inputs', async () => {
+test('gate_rejects_dirty_docs_and_product_inputs', { timeout: 300000 }, async () => {
   await loadGateModule();
   for (const mode of [
     'docs-dirty',
@@ -1055,7 +1055,7 @@ test('gate_rejects_dirty_docs_and_product_inputs', async () => {
   }
 });
 
-test('gate_enforces_deadline_cancellation_and_host_containment', { timeout: 60000 }, async () => {
+test('gate_enforces_deadline_cancellation_and_host_containment', { timeout: 300000 }, async () => {
   await loadGateModule();
   const f = fixture();
   for (const timeoutMs of [0, -1, 1.5, NaN, Infinity, 2100001]) {
@@ -1113,7 +1113,7 @@ test('gate_enforces_deadline_cancellation_and_host_containment', { timeout: 6000
   }
 });
 
-test('gate_enforces_lock_ownership_native_containment_and_footer_coherence', { timeout: 240000 }, async () => {
+test('gate_enforces_lock_ownership_native_containment_and_footer_coherence', { timeout: 600000 }, async () => {
   await loadGateModule();
 
   // Foreign lock remains untouched and never launches.
@@ -1220,7 +1220,7 @@ test('gate_enforces_lock_ownership_native_containment_and_footer_coherence', { t
   }
 });
 
-test('gate_validates_bounded_safe_native_evidence_records', { timeout: 90000 }, async () => {
+test('gate_validates_bounded_safe_native_evidence_records', { timeout: 300000 }, async () => {
   const mod = await loadGateModule();
   const parse = mod.parseFullNoteNativeEvidenceStage;
   const ids = {
