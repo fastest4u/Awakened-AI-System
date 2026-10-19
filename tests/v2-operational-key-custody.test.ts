@@ -215,6 +215,23 @@ test("OperationalKeyCustodyProvider provisions all 11 capability and 3 evidence 
       );
     }
 
+    // Also reject overlapping MEMORY_V2_KEYRING_PATH when paths is omitted and roots are supplied via env
+    assert.throws(
+      () =>
+        new OperationalKeyCustodyProvider({
+          storeRoot: ws.storeRoot,
+          projectId: TEST_PROJECT_ID,
+          storeId: TEST_STORE_ID,
+          env: {
+            MEMORY_PROJECT_ROOT: ws.projectRoot,
+            MEMORY_V2_VAULT_ROOT: ws.v2VaultRoot,
+            MEMORY_V2_V1_ARCHIVE_ROOT: ws.v1ArchiveRoot,
+            MEMORY_V2_KEYRING_PATH: join(ws.v2VaultRoot, "nested", "env-leaked.key"),
+          },
+        }),
+      (err: unknown) => err instanceof FreshStartError && err.code === "FRESH_START_PATH_OVERLAP",
+    );
+
     // Also reject symlink / junction inside externalSecretsDir pointing into projectRoot
     const targetInProject = join(ws.projectRoot, "secret-target.key");
     writeFileSync(targetInProject, randomBytes(48));
@@ -284,10 +301,16 @@ test("rotateEvidenceWrapKey rewraps stored data-key envelopes to version 2 and r
       version: "2",
     });
 
+    // Reject rotating backwards or resurrecting retired version 1
+    assert.throws(
+      () => custody.rotateEvidenceWrapKey("1", "2026-10-19T12:06:00.000Z"),
+      (err: unknown) => err instanceof RetainedEvidenceError && err.code === "RETAINED_EVIDENCE_INPUT_INVALID",
+    );
+
     // Verify EncryptedEvidenceItemV1 is completely untouched
     assert.equal(canonicalJson(sealedItem), sealedCanonicalBefore);
 
-    // Verify version 1 KEK material was shredded in custody-recovery.sqlite
+    // Verify version 1 KEK material remains shredded in custody-recovery.sqlite
     const db = new DatabaseSync(join(ws.storeRoot, "custody-recovery.sqlite"));
     try {
       const v1Row = db

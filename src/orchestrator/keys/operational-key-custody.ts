@@ -11,6 +11,7 @@ import {
   lstatSync,
   mkdirSync,
   readFileSync,
+  readlinkSync,
   realpathSync,
 } from "node:fs";
 import { arch, hostname, platform, userInfo } from "node:os";
@@ -129,11 +130,18 @@ const LOCAL_CUSTODY_DOMAIN = "project-memory/v2-operational-local-custody/v1\n";
 const PURPOSE_KEK_DOMAIN = "project-memory/v2-operational-purpose-kek/v1\0";
 const HISTORICAL_COVERAGE_DOMAIN = "pm-evidence-coverage-v1";
 
-function resolveCanonicalTargetPath(inputPath: string): {
+function resolveCanonicalTargetPath(
+  inputPath: string,
+  depth = 0,
+): {
   readonly lexical: string;
   readonly canonicalAncestorResolved: string;
   readonly realTarget: string | null;
+  readonly symlinkTargets: readonly string[];
 } {
+  if (depth > 8) {
+    throw new FreshStartError("FRESH_START_PATH_INVALID");
+  }
   if (
     typeof inputPath !== "string"
     || inputPath.trim() !== inputPath
@@ -170,26 +178,63 @@ function resolveCanonicalTargetPath(inputPath: string): {
       throw new FreshStartError("FRESH_START_PATH_INVALID");
     }
   }
-  return { lexical, canonicalAncestorResolved, realTarget };
+  const symlinkTargets: string[] = [];
+  try {
+    const stat = lstatSync(lexical);
+    if (stat.isSymbolicLink()) {
+      const linkDest = resolve(dirname(lexical), readlinkSync(lexical));
+      symlinkTargets.push(linkDest);
+      const resolvedLinkDest = resolveCanonicalTargetPath(linkDest, depth + 1);
+      symlinkTargets.push(
+        resolvedLinkDest.lexical,
+        resolvedLinkDest.canonicalAncestorResolved,
+        ...(resolvedLinkDest.realTarget !== null ? [resolvedLinkDest.realTarget] : []),
+        ...resolvedLinkDest.symlinkTargets,
+      );
+    }
+  } catch (error) {
+    if (error instanceof FreshStartError) {
+      throw error;
+    }
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      throw new FreshStartError("FRESH_START_PATH_INVALID");
+    }
+  }
+  return { lexical, canonicalAncestorResolved, realTarget, symlinkTargets };
 }
 
 function assertKeyringPathDisjoint(
   keyringPath: string,
   storeRoot: string,
   paths?: FreshStartPaths,
+  env?: NodeJS.ProcessEnv,
 ): string {
   const resolvedKeyring = resolveCanonicalTargetPath(keyringPath);
   const candidateTargets = [
     resolvedKeyring.lexical,
     resolvedKeyring.canonicalAncestorResolved,
     ...(resolvedKeyring.realTarget !== null ? [resolvedKeyring.realTarget] : []),
+    ...resolvedKeyring.symlinkTargets,
   ];
+
+  const envCandidateRoots = [
+    env?.MEMORY_PROJECT_ROOT,
+    env?.MEMORY_V2_PROJECT_ROOT,
+    env?.MEMORY_V2_VAULT_PATH,
+    env?.MEMORY_V2_VAULT_ROOT,
+    env?.MEMORY_V1_ARCHIVE_PATH,
+    env?.MEMORY_V2_V1_ARCHIVE_ROOT,
+    env?.MEMORY_V2_DATA_ROOT,
+    env?.MEMORY_V2_RECOVERY_ROOT,
+    env?.MEMORY_V2_STAGING_ROOT,
+  ].filter((value): value is string => typeof value === "string" && value.trim().length > 0);
 
   const rawRoots = [
     storeRoot,
     ...(paths !== undefined
       ? [paths.projectRoot, paths.v2VaultRoot, paths.v1ArchiveRoot]
       : []),
+    ...envCandidateRoots,
   ];
 
   const forbiddenRoots = new Set<string>();
@@ -234,7 +279,7 @@ export function loadOperationalKeyringSeed(options: OperationalKeyCustodyOptions
   const env = options.env ?? process.env;
   const rawPath = env.MEMORY_V2_KEYRING_PATH;
   if (rawPath !== undefined) {
-    const safePath = assertKeyringPathDisjoint(rawPath, options.storeRoot, options.paths);
+    const safePath = assertKeyringPathDisjoint(rawPath, options.storeRoot, options.paths, env);
     let fileBytes: Buffer | undefined;
     try {
       if (!existsSync(safePath) || lstatSync(safePath).isDirectory()) {
@@ -438,12 +483,43 @@ export class OperationalKeyCustodyProvider implements HistoricalEvidenceIntegrit
     now = new Date().toISOString(),
   ): { readonly rotatedEnvelopes: number; readonly activeKeyRef: EvidenceKeyRefV1 } {
     this.#assertOpen();
-    assertPositiveDecimalVersion(nextVersion);
+    try {
+      assertPositiveDecimalVersion(nextVersion);
+    } catch {
+      throw new RetainedEvidenceError("RETAINED_EVIDENCE_INPUT_INVALID");
+    }
     const keyId = "op-ev-data-key-wrap";
     const activeKeyRef: EvidenceKeyRefV1 = Object.freeze({ keyId, version: nextVersion });
 
     this.#db.exec("BEGIN IMMEDIATE");
     try {
+      const currentRow = this.#db
+        .prepare(
+          `SELECT version
+           FROM key_versions
+           WHERE project_id = ? AND store_id = ? AND family = 'evidence' AND purpose = 'data-key-wrap' AND is_current = 1`,
+        )
+        .get(this.#projectId, this.#storeId) as { version: string } | undefined;
+      if (currentRow === undefined || BigInt(nextVersion) <= BigInt(currentRow.version)) {
+        throw new RetainedEvidenceError("RETAINED_EVIDENCE_INPUT_INVALID");
+      }
+
+      const existingTargetRow = this.#db
+        .prepare(
+          `SELECT retired_at, secret_material_b64
+           FROM key_versions
+           WHERE project_id = ? AND store_id = ? AND family = 'evidence' AND purpose = 'data-key-wrap' AND version = ?`,
+        )
+        .get(this.#projectId, this.#storeId, nextVersion) as
+        | { retired_at: string | null; secret_material_b64: string | null }
+        | undefined;
+      if (
+        existingTargetRow !== undefined
+        && (existingTargetRow.retired_at !== null || existingTargetRow.secret_material_b64 === null)
+      ) {
+        throw new RetainedEvidenceError("RETAINED_EVIDENCE_INPUT_INVALID");
+      }
+
       this.#ensureKeyVersionRow("evidence", "data-key-wrap", keyId, nextVersion, 1, now);
       this.#db
         .prepare(
@@ -991,14 +1067,17 @@ export class OperationalKeyCustodyProvider implements HistoricalEvidenceIntegrit
   ): void {
     const existing = this.#db
       .prepare(
-        `SELECT secret_material_b64 FROM key_versions
+        `SELECT secret_material_b64, retired_at FROM key_versions
          WHERE project_id = ? AND store_id = ? AND family = ? AND purpose = ? AND version = ?`,
       )
       .get(this.#projectId, this.#storeId, family, purpose, version) as
-      | { secret_material_b64: string | null }
+      | { secret_material_b64: string | null; retired_at: string | null }
       | undefined;
 
-    if (existing !== undefined && existing.secret_material_b64 !== null) {
+    if (
+      existing !== undefined
+      && (existing.retired_at !== null || existing.secret_material_b64 === null || existing.secret_material_b64 !== null)
+    ) {
       return;
     }
 
@@ -1011,12 +1090,7 @@ export class OperationalKeyCustodyProvider implements HistoricalEvidenceIntegrit
              project_id, store_id, family, purpose, key_id, version,
              is_current, status, secret_material_b64, created_at, retired_at
            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'available', ?, ?, NULL)
-           ON CONFLICT(project_id, store_id, family, purpose, version) DO UPDATE SET
-             key_id = excluded.key_id,
-             is_current = excluded.is_current,
-             status = 'available',
-             secret_material_b64 = excluded.secret_material_b64,
-             retired_at = NULL`,
+           ON CONFLICT(project_id, store_id, family, purpose, version) DO NOTHING`,
         )
         .run(this.#projectId, this.#storeId, family, purpose, keyId, version, isCurrent, secretMaterialB64, now);
     } finally {
