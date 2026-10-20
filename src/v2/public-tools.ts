@@ -1,5 +1,5 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, renameSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
@@ -60,18 +60,19 @@ import { retainedEvidenceProofTarget } from "../orchestrator/privacy/retained-ev
 import { RetainedEvidenceRuntimeFactory } from "../orchestrator/privacy/retained-evidence-runtime.factory.js";
 import { ImmutableProjectionBuilder } from "../orchestrator/projections/builder.js";
 import type { ProjectBinding } from "../orchestrator/projections/contracts.js";
+import { V2ProjectionBuildCoordinator } from "../orchestrator/projections/coordinator.js";
 import { SqliteProjectionEventReader } from "../orchestrator/projections/event-reader.js";
 import { openImmutableProjectionImage } from "../orchestrator/projections/immutable-image.js";
 import {
   parseRichProjectionManifest,
   type ProjectionManifestV3,
 } from "../orchestrator/projections/manifest-codec.js";
-import { publishProjectionManifest } from "../orchestrator/projections/manifest.js";
 import type { ProjectionDirectoryIdentity } from "../orchestrator/projections/stable-directory.js";
 import { decodeLifecycleWorkerOperationWire } from "../orchestrator/runtime/lifecycle-worker-protocol.js";
 import { LifecycleWorkerRuntimeFactory } from "../orchestrator/runtime/lifecycle-worker-runtime.factory.js";
 import { canonicalJson } from "../orchestrator/serialization/canonical-json.js";
 import { ChildTransferRepository } from "../orchestrator/storage/child-transfer.repository.js";
+import { GENESIS_GLOBAL_HASH } from "../orchestrator/storage/event-chain-constants.js";
 import { EvidenceCoverageRepository } from "../orchestrator/storage/evidence-coverage.repository.js";
 import { LifecycleApprovalRepository } from "../orchestrator/storage/lifecycle-approval.repository.js";
 import { SqliteLifecycleProjectionRepository } from "../orchestrator/storage/lifecycle-projection.repository.js";
@@ -81,7 +82,19 @@ import { NodeSqliteDriver } from "../orchestrator/storage/node-sqlite-driver.js"
 import { SessionAuthorityRepository } from "../orchestrator/storage/session-authority.repository.js";
 import { SessionLeaseRepository } from "../orchestrator/storage/session-lease.repository.js";
 import type { SqliteConnection } from "../orchestrator/storage/sqlite-driver.js";
+import { queryNativeContent } from "../orchestrator/verified-read/content-query.js";
+import { buildNativeContentResult } from "../orchestrator/verified-read/content-result.js";
 import type { VerifiedReadBinding } from "../orchestrator/verified-read/contracts.js";
+import {
+  decodeFullNoteVerifiedReadReceipt,
+  decodeGetFullNoteRequest,
+} from "../orchestrator/verified-read/full-note-protocol.js";
+import { queryNativeFullNote } from "../orchestrator/verified-read/full-note-query.js";
+import { buildNativeFullNoteResult } from "../orchestrator/verified-read/full-note-result.js";
+import {
+  decodeVerifiedReadReceipt,
+  decodeVerifiedReadRequest,
+} from "../orchestrator/verified-read/protocol.js";
 import { createVerifiedReadAdapter } from "../orchestrator/verified-read/supervisor.js";
 import type { NativeCanonicalPageResult } from "../orchestrator/verified-read/workflow-contracts.js";
 import {
@@ -129,6 +142,7 @@ const READ_ONLY_PUBLIC_TOOLS = new Set<string>([
   "memory_recent",
   "memory_contextPack",
   "memory_followUpRadar",
+  "memory_awaken",
   "memory_verifyVault",
   "memory_verifyNote",
   "memory_verifySourceTruth",
@@ -589,7 +603,7 @@ export class V2PublicToolRouter {
       throw new FreshStartError("FRESH_START_ADMISSION_DENIED");
     }
 
-    if (!this.#admissionContextBound) {
+    if (state.mode === "active" && !this.#admissionContextBound) {
       bindFreshStartAdmissionContext(this.#connection, {
         identity: this.#identity,
         releaseId: release.releaseId,
@@ -607,7 +621,7 @@ export class V2PublicToolRouter {
       case "memory_lifecycleStatus":
         return this.#handleLifecycleStatus(args, state);
       case "memory_selfCheck":
-        return this.#handleSelfCheck(args);
+        return this.#handleSelfCheck(args, state);
       case "memory_writeInsight":
         return this.#handleWriteGovernedNote("insight", args);
       case "memory_writeMistake":
@@ -872,7 +886,6 @@ export class V2PublicToolRouter {
       sessionId,
       "Session started on V2 governed MCP surface",
     );
-    await this.#publishProjectionV3();
     return {
       sessionId,
       conversationId: retained.conversationId,
@@ -940,11 +953,10 @@ export class V2PublicToolRouter {
     }
   }
 
-  async #publishProjectionV3(force = true): Promise<ProjectionManifestV3> {
+  async #publishProjectionV3(force = false): Promise<ProjectionManifestV3> {
     const projectionDir = join(this.#route.storeRoot, "projections");
     mkdirSync(projectionDir, { recursive: true });
     const manifestPath = join(projectionDir, "projection-manifest.json");
-    let nextGeneration = 1;
     let activeProjectionBinding: ProjectBinding = this.#projectionBinding;
     if (existsSync(manifestPath)) {
       try {
@@ -975,9 +987,8 @@ export class V2PublicToolRouter {
         ) {
           return prior;
         }
-        nextGeneration = Math.max(prior.generation, prior.highestObservedGeneration) + 1;
       } catch {
-        nextGeneration = 1;
+        // Proceed to coordinator-governed build/reconciliation.
       }
     }
 
@@ -1001,42 +1012,40 @@ export class V2PublicToolRouter {
     }
 
     const driver = new NodeSqliteDriver({ DatabaseSync });
-    const source = await new SqliteProjectionEventReader({
+    const eventReader = new SqliteProjectionEventReader({
       driver,
       eventStorePath: this.#route.eventsPath,
       busyTimeoutMs: 5000,
-    }).openCommittedSnapshotV3(activeProjectionBinding);
-    try {
-      const staged = await new ImmutableProjectionBuilder({
-        driver,
-        projectionDirectory: projectionDir,
-        now: () => new Date().toISOString(),
-      }).buildV3(source, nextGeneration);
-      publishProjectionManifest(
-        {
-          projectionDirectory: projectionDir,
-          manifest: staged.manifest,
-          expectedBinding: activeProjectionBinding,
-        },
-        {
-          beforeManifestInstall: {
-            install(directory) {
-              renameSync(staged.temporaryDatabasePath, join(directory, staged.manifest.databaseFile));
-            },
-          },
-        },
-      );
-      return staged.manifest;
-    } finally {
-      source.close();
-    }
+    });
+    const builder = new ImmutableProjectionBuilder({
+      driver,
+      projectionDirectory: projectionDir,
+      now: () => new Date().toISOString(),
+    });
+    const coordinator = new V2ProjectionBuildCoordinator({
+      eventReader,
+      builder,
+      projectionDirectory: projectionDir,
+      schema3: {
+        eventReader,
+        builder,
+      },
+    });
+    const published = await coordinator.ensurePublishedV3(
+      activeProjectionBinding,
+      BigInt(this.#currentGlobalPosition()),
+      30_000,
+    );
+    return published.manifest;
   }
 
   async #withVerifiedReadAdapter<T>(
     state: FreshStartState,
     release: FreshStartRelease,
     sessionId: string | null,
-    fn: (adapter: ReturnType<typeof createVerifiedReadAdapter>) => Promise<T>,
+    fn: (
+      adapter: Pick<ReturnType<typeof createVerifiedReadAdapter>, "query" | "queryFullNote">,
+    ) => Promise<T>,
   ): Promise<T> {
     const manifest = await this.#publishProjectionV3(false);
     const projectionDirectory = resolveDirectoryIdentity(
@@ -1071,6 +1080,128 @@ export class V2PublicToolRouter {
       deploymentDirectory,
       compositionEpoch: `v2-mcp-${state.generation.toString()}`,
     });
+    if (state.mode === "read-only-recovery") {
+      const tailRow = this.#connection
+        .prepare(
+          `SELECT global_position, event_hash FROM events
+           WHERE project_id = $projectId
+           ORDER BY global_position DESC LIMIT 1`,
+        )
+        .get({ $projectId: this.#identity.projectId }) as
+        | { global_position?: bigint; event_hash?: string }
+        | undefined;
+      const tailPosition = tailRow?.global_position ?? 0n;
+      const tailHash = tailRow?.event_hash ?? GENESIS_GLOBAL_HASH;
+      if (
+        state.recoveryPosition === null
+        || state.recoveryHash === null
+        || state.recoveryPosition !== tailPosition
+        || state.recoveryHash !== tailHash
+      ) {
+        throw new FreshStartError("FRESH_START_RECOVERY_REQUIRED");
+      }
+      const bytes = readFileSync(
+        join(this.#route.storeRoot, "projections", manifest.databaseFile),
+      );
+      const sha256 = createHash("sha256").update(bytes).digest("hex");
+      if (sha256 !== manifest.databaseSha256) {
+        throw new FreshStartError("FRESH_START_STORAGE_FAILURE");
+      }
+      const image = openImmutableProjectionImage(bytes);
+      const fence = Object.freeze({
+        releaseId: release.releaseId,
+        controlGeneration: state.generation.toString(),
+        capturedPosition: manifest.terminalEventPosition.toString(),
+        capturedHash: manifest.terminalEventHash,
+        requiredPosition: manifest.terminalEventPosition.toString(),
+      });
+      const ids = Object.freeze({
+        requestId: randomUUID(),
+        attemptId: randomUUID(),
+        laneEpoch: binding.compositionEpoch,
+      });
+      const closed = Object.freeze({ image: true, reader: true, lock: true } as const);
+      try {
+        return await fn({
+          queryFullNote: async (rawReq) => {
+            const req = decodeGetFullNoteRequest(rawReq, binding.session);
+            const receipt = decodeFullNoteVerifiedReadReceipt({
+              operation: "get-full-note",
+              consistency: req.consistency,
+              scope: {
+                ...binding.projectionBinding,
+                sessionId: req.consistency === "session-strong" ? binding.session!.sessionId : null,
+              },
+              releaseId: fence.releaseId,
+              controlGeneration: fence.controlGeneration,
+              requiredEventPosition: fence.requiredPosition,
+              projectionGeneration: manifest.generation,
+              projectionEventPosition: manifest.terminalEventPosition.toString(),
+              projectionEventHash: manifest.terminalEventHash,
+              imageSha256: sha256,
+              verification: "image-scope-position-and-active-admission",
+              projectionSchemaVersion: 3,
+            });
+            const base = Object.freeze({
+              version: 4 as const,
+              ids,
+              kind: "success" as const,
+              receipt,
+              fence,
+              closed,
+            });
+            const candidate = queryNativeFullNote(image, manifest, {
+              request: req,
+              binding,
+              receipt,
+              remainingMs: req.budgetMs,
+            });
+            const content = buildNativeFullNoteResult(candidate, base);
+            return Object.freeze({ receipt, content });
+          },
+          query: async (rawReq) => {
+            const req = decodeVerifiedReadRequest(rawReq, binding.session);
+            if (req.operation === "verify-published-view") {
+              throw new FreshStartError("FRESH_START_INPUT_INVALID");
+            }
+            const receipt = decodeVerifiedReadReceipt({
+              operation: req.operation,
+              consistency: req.consistency,
+              scope: {
+                ...binding.projectionBinding,
+                sessionId: req.consistency === "session-strong" ? binding.session!.sessionId : null,
+              },
+              releaseId: fence.releaseId,
+              controlGeneration: fence.controlGeneration,
+              requiredEventPosition: fence.requiredPosition,
+              projectionGeneration: manifest.generation,
+              projectionEventPosition: manifest.terminalEventPosition.toString(),
+              projectionEventHash: manifest.terminalEventHash,
+              imageSha256: sha256,
+              verification: "image-scope-position-and-active-admission",
+            });
+            const base = Object.freeze({
+              version: 3 as const,
+              ids,
+              kind: "success" as const,
+              receipt,
+              fence,
+              closed,
+            });
+            const candidate = queryNativeContent(image, manifest, {
+              request: req,
+              binding,
+              receipt,
+              remainingMs: req.budgetMs,
+            });
+            const content = buildNativeContentResult(candidate, base);
+            return Object.freeze({ receipt, content });
+          },
+        });
+      } finally {
+        image.close();
+      }
+    }
     const adapter = createVerifiedReadAdapter(binding);
     try {
       return await fn(adapter);
@@ -1099,8 +1230,13 @@ export class V2PublicToolRouter {
     args: Record<string, unknown>,
     state: FreshStartState,
   ): Promise<Record<string, unknown>> {
-    const sessionId = await this.#ensureActiveRootSession(args.sessionId);
-    const row = this.#authorityRepo.get(this.#connection, this.#identity.projectId, sessionId);
+    const sessionId =
+      state.mode === "read-only-recovery"
+        ? this.#resolveActiveRootSessionId(args.sessionId)
+        : await this.#ensureActiveRootSession(args.sessionId);
+    const row = sessionId
+      ? this.#authorityRepo.get(this.#connection, this.#identity.projectId, sessionId)
+      : null;
     return {
       ok: true,
       sessionId,
@@ -1112,13 +1248,20 @@ export class V2PublicToolRouter {
     };
   }
 
-  async #handleSelfCheck(args: Record<string, unknown>): Promise<Record<string, unknown>> {
-    const sessionId = await this.#ensureActiveRootSession(args.sessionId);
+  async #handleSelfCheck(
+    args: Record<string, unknown>,
+    state: FreshStartState,
+  ): Promise<Record<string, unknown>> {
+    const sessionId =
+      state.mode === "read-only-recovery"
+        ? this.#resolveActiveRootSessionId(args.sessionId)
+        : await this.#ensureActiveRootSession(args.sessionId);
     return {
       ok: true,
       sessionId,
       status: "healthy",
       taskSummary: typeof args.taskSummary === "string" ? args.taskSummary : null,
+      mode: state.mode,
     };
   }
 
@@ -1152,11 +1295,33 @@ export class V2PublicToolRouter {
         ? args.confidence
         : ("high" as const);
 
-    const retained = this.#retainEvidenceForSession(
-      sessionId,
-      `${title}\n${rawSummary}`,
-    );
-    const evidenceId = retained.evidenceIds[0]!;
+    const explicitProvenance =
+      Array.isArray(args.provenance) && args.provenance.length > 0
+        ? args.provenance
+        : null;
+    let provenance: unknown;
+    let evidenceId: string | null = null;
+    if (explicitProvenance !== null) {
+      provenance = explicitProvenance;
+      for (const entry of explicitProvenance) {
+        if (
+          typeof entry === "object"
+          && entry !== null
+          && (entry as { kind?: unknown }).kind === "retained-evidence"
+          && typeof (entry as { identity?: unknown }).identity === "string"
+        ) {
+          evidenceId = (entry as { identity: string }).identity;
+          break;
+        }
+      }
+    } else {
+      const retained = this.#retainEvidenceForSession(
+        sessionId,
+        `${title}\n${rawSummary}\n${body}`,
+      );
+      evidenceId = retained.evidenceIds[0]!;
+      provenance = [{ kind: "retained-evidence", identity: evidenceId }];
+    }
 
     const command = decodeGovernedNoteCommandV2({
       version: 2,
@@ -1166,7 +1331,7 @@ export class V2PublicToolRouter {
       recordKind,
       summary: rawSummary,
       confidence,
-      provenance: [{ kind: "retained-evidence", identity: evidenceId }],
+      provenance,
       content: {
         format: "markdown",
         body,
@@ -1243,7 +1408,7 @@ export class V2PublicToolRouter {
     return this.#withVerifiedReadAdapter(state, release, sessionId, async (adapter) => {
       const res = await adapter.queryFullNote({
         operation: "get-full-note",
-        consistency: "session-strong",
+        consistency: sessionId ? "session-strong" : "project-strong",
         minimumEventPosition: "0",
         budgetMs: 5000,
         parameters: { id },
@@ -1396,8 +1561,15 @@ export class V2PublicToolRouter {
     state: FreshStartState,
     release: FreshStartRelease,
   ): Promise<Record<string, unknown>> {
-    const sessionId = await this.#ensureActiveRootSession(args.sessionId);
-    const contextPack = await this.#handleContextPack({ ...args, sessionId }, state, release);
+    const sessionId =
+      state.mode === "read-only-recovery"
+        ? this.#resolveActiveRootSessionId(args.sessionId)
+        : await this.#ensureActiveRootSession(args.sessionId);
+    const contextPack = await this.#handleContextPack(
+      sessionId ? { ...args, sessionId } : args,
+      state,
+      release,
+    );
     return {
       ok: true,
       sessionId,
@@ -1574,7 +1746,6 @@ export class V2PublicToolRouter {
       reason: typeof args.reason === "string" ? args.reason : undefined,
       conflictKey: typeof args.conflictKey === "string" ? args.conflictKey : null,
     });
-    await this.#publishProjectionV3();
     return {
       ok: true,
       ...serializeMutationReceipt(receipt),
@@ -1600,7 +1771,6 @@ export class V2PublicToolRouter {
       declareConflict: args.declareConflict === true,
       conflictKey: typeof args.conflictKey === "string" ? args.conflictKey : null,
     });
-    await this.#publishProjectionV3();
     return {
       ok: true,
       ...serializeMutationReceipt(receipt),
@@ -1617,7 +1787,6 @@ export class V2PublicToolRouter {
       recordId,
       reason,
     });
-    await this.#publishProjectionV3();
     return {
       ok: true,
       ...serializeMutationReceipt(receipt),
@@ -1636,7 +1805,6 @@ export class V2PublicToolRouter {
       validTo,
       reason,
     });
-    await this.#publishProjectionV3();
     return {
       ok: true,
       ...serializeMutationReceipt(receipt),
@@ -1684,7 +1852,6 @@ export class V2PublicToolRouter {
         recordIds,
         reason,
       });
-      await this.#publishProjectionV3();
       return {
         ok: true,
         forgotten: true,
@@ -1795,7 +1962,6 @@ export class V2PublicToolRouter {
       this.#rootContext,
     );
     const updated = this.#authorityRepo.get(this.#connection, b.projectId, sessionId)!;
-    await this.#publishProjectionV3();
     return {
       ok: true,
       sessionId,

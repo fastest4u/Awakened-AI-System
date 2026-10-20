@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -11,6 +11,7 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 import { McpError } from "@modelcontextprotocol/sdk/types.js";
 import type { FreshStartRelease } from "../src/orchestrator/fresh-start/contracts.js";
 import { FreshStartInitializer } from "../src/orchestrator/fresh-start/fresh-start-initializer.js";
+import { SqliteFreshStartRepository } from "../src/orchestrator/fresh-start/fresh-start.repository.js";
 import { NodeSqliteDriver } from "../src/orchestrator/storage/node-sqlite-driver.js";
 import { expectedSchemaFingerprint } from "../src/orchestrator/storage/schema-fingerprint.js";
 import { PROJECT_STORE_MIGRATIONS } from "../src/orchestrator/storage/migrations/registry.js";
@@ -666,6 +667,273 @@ test("end-to-end public V2 MCP stdio server executes supported V1 tools, V2-nati
       }));
       assert.equal(verifyAfterRestart.ok, true);
     });
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("read-only-recovery mode, coordinator V3 reconciliation journal, and governed note provenance/body evidence work end-to-end", async () => {
+  const fixture = await createStoreFixture({ productionProfile: true, promoteMode: "active" });
+  try {
+    const foundation = await createV2Foundation(fixture.config, { entryUrl: V2_DIST_ENTRY_URL });
+    try {
+      const started = (await foundation.content.invoke("memory_sessionStart", {
+        agentName: "recovery-test-agent",
+      })) as { sessionId: string };
+      const sessionId = started.sessionId;
+
+      // 1. Explicit provenance is honored (and invalid explicit provenance fails closed)
+      const explicitBatch = (await foundation.content.invoke("memory_recordEvidenceBatch", {
+        sessionId,
+        content: "Explicit evidence frame backing ADR note",
+      })) as { evidenceIds: string[] };
+      const explicitEvidenceId = explicitBatch.evidenceIds[0]!;
+
+      const noteWithExplicitProvenance = (await foundation.content.invoke("memory_writeADR", {
+        sessionId,
+        title: "ADR with Explicit Provenance",
+        summary: "Caller-supplied provenance must not be overwritten.",
+        content: "# Explicit Provenance\n\nBody text.",
+        provenance: [{ kind: "retained-evidence", identity: explicitEvidenceId }],
+      })) as { recordId: string; evidenceId: string };
+      assert.equal(noteWithExplicitProvenance.evidenceId, explicitEvidenceId);
+
+      // 2. Coordinator V3 publication creates projection-reconciliation-v2.json in projections/
+      const projectionDir = join(fixture.v2VaultRoot, ".memory-mcp", "v2", "projections");
+      assert.equal(existsSync(join(projectionDir, "projection-reconciliation-v2.json")), true);
+
+      await assert.rejects(
+        () =>
+          foundation.content.invoke("memory_writeInsight", {
+            sessionId,
+            title: "Invalid Explicit Provenance",
+            summary: "Should fail because retained-evidence identity does not exist.",
+            content: "# Invalid\n\nBody.",
+            provenance: [{ kind: "retained-evidence", identity: randomUUID() }],
+          }),
+      );
+
+      // 3. Auto-retained evidence when provenance is omitted includes the note body
+      const autoNote = (await foundation.content.invoke("memory_writeInsight", {
+        sessionId,
+        title: "Auto Evidence Body Coverage",
+        summary: "Auto-retained evidence covers body claims.",
+        content: "# Body Coverage\n\nDistinctive body marker: body_evidence_marker_98765",
+      })) as { recordId: string; evidenceId: string };
+      assert.notEqual(autoNote.evidenceId, explicitEvidenceId);
+
+      // 4. Transition store into read-only-recovery mode at the current committed event tail
+      const identity = {
+        projectId: fixture.release.projectId,
+        vaultId: fixture.release.vaultId,
+        storeId: fixture.release.storeId,
+      };
+      const driver = new NodeSqliteDriver({ DatabaseSync });
+      const controlConn = driver.open(fixture.eventsPath, { mode: "existing", busyTimeoutMs: 5000 });
+      try {
+        const repo = new SqliteFreshStartRepository(controlConn);
+        repo.transact(identity, (tx) => {
+          const current = tx.state()!;
+          const fence = tx.captureRecoveryFence(current.generation);
+          tx.transition({
+            transitionId: randomUUID(),
+            expectedMode: "active",
+            expectedGeneration: current.generation,
+            expectedReleaseId: current.releaseId,
+            nextMode: "read-only-recovery",
+            nextReleaseId: current.releaseId,
+            authorization: {
+              kind: "automatic-stop",
+              reasonCode: "integrity-failure",
+            },
+            evidenceDigest: sha("recovery-stop-test"),
+            recoveryPosition: fence.eventPosition,
+            recoveryHash: fence.eventHash,
+            recordedAt: "2026-07-01T00:05:00.000Z",
+          });
+        });
+      } finally {
+        controlConn.close();
+      }
+
+      const recoveryStatus = await foundation.status();
+      assert.equal(recoveryStatus.mode, "read-only-recovery");
+      assert.equal(recoveryStatus.productionReady, false);
+
+      // Mutating tools fail closed with FRESH_START_ADMISSION_DENIED in read-only-recovery
+      for (const writeTool of [
+        "memory_sessionStart",
+        "memory_writeInsight",
+        "memory_promote",
+        "memory_recordEvidenceBatch",
+        "memory_checkpoint",
+      ]) {
+        await assert.rejects(
+          () => foundation.content.invoke(writeTool, {}),
+          { code: "FRESH_START_ADMISSION_DENIED" },
+          `Expected ${writeTool} to be denied in read-only-recovery mode`,
+        );
+      }
+
+      // All read-only & verification tools succeed in read-only-recovery mode
+      const gotNote = (await foundation.content.invoke("memory_get", {
+        id: autoNote.recordId,
+      })) as { ok: boolean; id: string; content: { body: string } };
+      assert.equal(gotNote.ok, true);
+      assert.equal(gotNote.id, autoNote.recordId);
+      assert.ok(gotNote.content.body.includes("body_evidence_marker_98765"));
+
+      const searched = (await foundation.content.invoke("memory_search", {
+        query: "Auto Evidence Body Coverage",
+      })) as { ok: boolean; items: Array<{ id: string }> };
+      assert.equal(searched.ok, true);
+      assert.ok(searched.items.some((item) => item.id === autoNote.recordId));
+
+      const listed = (await foundation.content.invoke("memory_list", { limit: 10 })) as {
+        ok: boolean;
+        items: Array<{ id: string }>;
+      };
+      assert.equal(listed.ok, true);
+      assert.ok(listed.items.length >= 2);
+
+      const recent = (await foundation.content.invoke("memory_recent", { limit: 10 })) as {
+        ok: boolean;
+        items: Array<{ id: string }>;
+      };
+      assert.equal(recent.ok, true);
+      assert.ok(recent.items.length >= 2);
+
+      const contextPack = (await foundation.content.invoke("memory_contextPack", {
+        area: "Provenance",
+      })) as { ok: boolean };
+      assert.equal(contextPack.ok, true);
+
+      const radar = (await foundation.content.invoke("memory_followUpRadar", {
+        limit: 5,
+      })) as { ok: boolean };
+      assert.equal(radar.ok, true);
+
+      const awakened = (await foundation.content.invoke("memory_awaken", {
+        area: "Provenance",
+      })) as { ok: boolean; mode: string };
+      assert.equal(awakened.ok, true);
+      assert.equal(awakened.mode, "read-only-recovery");
+
+      const lifecycleStatus = (await foundation.content.invoke("memory_lifecycleStatus", {})) as {
+        ok: boolean;
+        mode: string;
+      };
+      assert.equal(lifecycleStatus.ok, true);
+      assert.equal(lifecycleStatus.mode, "read-only-recovery");
+
+      const selfCheck = (await foundation.content.invoke("memory_selfCheck", {
+        taskSummary: "Read-only recovery inspection",
+      })) as { ok: boolean; mode: string };
+      assert.equal(selfCheck.ok, true);
+      assert.equal(selfCheck.mode, "read-only-recovery");
+
+      const verifyVault = (await foundation.content.invoke("memory_verifyVault", {})) as {
+        ok: boolean;
+      };
+      assert.equal(verifyVault.ok, true);
+
+      const verifyNote = (await foundation.content.invoke("memory_verifyNote", {
+        id: autoNote.recordId,
+      })) as { ok: boolean; verified: boolean };
+      assert.equal(verifyNote.ok, true);
+      assert.equal(verifyNote.verified, true);
+
+      const verifySourceTruth = (await foundation.content.invoke("memory_verifySourceTruth", {})) as {
+        ok: boolean;
+      };
+      assert.equal(verifySourceTruth.ok, true);
+
+      const duplicates = (await foundation.content.invoke("memory_findDuplicates", {})) as {
+        ok: boolean;
+      };
+      assert.equal(duplicates.ok, true);
+
+      const staleness = (await foundation.content.invoke("memory_checkStaleness", {})) as {
+        ok: boolean;
+      };
+      assert.equal(staleness.ok, true);
+
+      // 5. If recovery_hash mismatches the committed event tail, read tools fail closed with FRESH_START_RECOVERY_REQUIRED
+      const mismatchConn = driver.open(fixture.eventsPath, { mode: "existing", busyTimeoutMs: 5000 });
+      try {
+        const repo = new SqliteFreshStartRepository(mismatchConn);
+        repo.transact(identity, (tx) => {
+          const current = tx.state()!;
+          tx.transition({
+            transitionId: randomUUID(),
+            expectedMode: "read-only-recovery",
+            expectedGeneration: current.generation,
+            expectedReleaseId: current.releaseId,
+            nextMode: "read-only-recovery",
+            nextReleaseId: current.releaseId,
+            authorization: {
+              kind: "automatic-stop",
+              reasonCode: "integrity-failure",
+            },
+            evidenceDigest: sha("recovery-mismatch-test"),
+            recoveryPosition: current.recoveryPosition,
+            recoveryHash: "f".repeat(64),
+            recordedAt: "2026-07-01T00:06:00.000Z",
+          });
+        });
+      } finally {
+        mismatchConn.close();
+      }
+
+      await assert.rejects(
+        () => foundation.content.invoke("memory_search", { query: "Provenance" }),
+        { code: "FRESH_START_RECOVERY_REQUIRED" },
+      );
+
+      // 6. Recover store back to active mode at a new generation and verify writes succeed again
+      const recoverConn = driver.open(fixture.eventsPath, { mode: "existing", busyTimeoutMs: 5000 });
+      try {
+        const repo = new SqliteFreshStartRepository(recoverConn);
+        repo.transact(identity, (tx) => {
+          const current = tx.state()!;
+          tx.transition({
+            transitionId: randomUUID(),
+            expectedMode: "read-only-recovery",
+            expectedGeneration: current.generation,
+            expectedReleaseId: current.releaseId,
+            nextMode: "active",
+            nextReleaseId: current.releaseId,
+            authorization: {
+              kind: "operator",
+              approvalId: randomUUID(),
+              nonceDigest: sha(randomUUID()),
+              actorFingerprint: sha("recovery-operator"),
+              requestDigest: sha("recover-to-active"),
+            },
+            evidenceDigest: sha("recovered-to-active"),
+            recoveryPosition: null,
+            recoveryHash: null,
+            recordedAt: "2026-07-01T00:07:00.000Z",
+          });
+        });
+      } finally {
+        recoverConn.close();
+      }
+
+      const activeAgainStatus = await foundation.status();
+      assert.equal(activeAgainStatus.mode, "active");
+      assert.equal(activeAgainStatus.productionReady, true);
+
+      const postRecoveryNote = (await foundation.content.invoke("memory_writeInsight", {
+        sessionId,
+        title: "Post-Recovery Governed Note",
+        summary: "Write succeeds on new active generation after read-only-recovery.",
+        content: "# Post-Recovery\n\nSuccessfully written on new generation.",
+      })) as { ok: boolean; recordId: string };
+      assert.equal(postRecoveryNote.ok, true);
+    } finally {
+      await foundation.close();
+    }
   } finally {
     fixture.cleanup();
   }

@@ -93,12 +93,14 @@ export async function createV2Foundation(
   );
   const route = new ProjectStoreRouter().route(descriptor.descriptor, paths.v2VaultRoot, workspace);
   assertFreshStartOwnedDirectory(route.storeRoot, paths.v1ArchiveRoot);
-  const connection = new NodeSqliteDriver({ DatabaseSync }).open(route.eventsPath, {
-    mode: "existing",
-    busyTimeoutMs: 5000,
-    bindFileIdentity: true,
-  });
-  const repository = new SqliteFreshStartRepository(connection);
+  const openEventsConnection = () =>
+    new NodeSqliteDriver({ DatabaseSync }).open(route.eventsPath, {
+      mode: "existing",
+      busyTimeoutMs: 5000,
+      bindFileIdentity: true,
+    });
+  let connection = openEventsConnection();
+  let repository = new SqliteFreshStartRepository(connection);
   const identity = {
     projectId: receipt.projectId,
     vaultId: receipt.vaultId,
@@ -106,8 +108,24 @@ export async function createV2Foundation(
   };
   let closed = false;
   let router: V2PublicToolRouter | undefined;
+  let routerActiveGeneration: bigint | undefined;
 
-  const getRouter = (): V2PublicToolRouter => {
+  const getRouter = (state: {
+    readonly mode: FreshStartMode;
+    readonly generation: bigint;
+  }): V2PublicToolRouter => {
+    if (
+      state.mode === "active"
+      && routerActiveGeneration !== undefined
+      && routerActiveGeneration !== state.generation
+    ) {
+      router?.close();
+      router = undefined;
+      connection.close();
+      connection = openEventsConnection();
+      repository = new SqliteFreshStartRepository(connection);
+      routerActiveGeneration = undefined;
+    }
     if (!router) {
       router = new V2PublicToolRouter({
         connection,
@@ -117,6 +135,9 @@ export async function createV2Foundation(
         workspace,
         route,
       });
+    }
+    if (state.mode === "active") {
+      routerActiveGeneration = state.generation;
     }
     return router;
   };
@@ -168,7 +189,7 @@ export async function createV2Foundation(
         if (state.mode === "disabled") {
           throw new FreshStartError("FRESH_START_ADMISSION_DENIED");
         }
-        return getRouter().invoke(name, argumentsValue, state, release);
+        return getRouter(state).invoke(name, argumentsValue, state, release);
       },
     }),
     async close(): Promise<void> {
