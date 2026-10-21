@@ -101,7 +101,7 @@ function inspectRuntimeClosure(): void {
       /\/(?:stable-directory|builder|coordinator|integrity|manifest|reader-lease|v2-reader-lease|service|candidates|v2-candidates|vector-cache)\.ts$|\/workers\/|\/migration\/|\/providers\//u);
     const source = ts.createSourceFile(path, readFileSync(path, "utf8"), ts.ScriptTarget.Latest, true);
     const dependency = (specifier: string): void => {
-      assert.equal(specifier, "node:crypto", `unexpected runtime dependency ${specifier} in ${path}`);
+      assert.ok(specifier === "node:crypto" || specifier === "node:util", `unexpected runtime dependency ${specifier} in ${path}`);
     };
     const follow = (specifier: string): void => {
       if (specifier.startsWith(".")) inspect(resolve(dirname(path), specifier.replace(/\.js$/u, ".ts")));

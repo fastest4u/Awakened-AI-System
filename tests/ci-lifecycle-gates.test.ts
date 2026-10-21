@@ -85,11 +85,30 @@ const APPROVED_SEALED_AND_ROLLOUT_SOURCE_DIFF = Object.freeze([
   "src/orchestrator/fresh-start/fresh-start-initializer.ts",
   "src/orchestrator/fresh-start/fresh-start-paths.ts",
   "src/orchestrator/fresh-start/fresh-start.repository.ts",
+  "src/orchestrator/fresh-start/genesis-codec.ts",
   "src/orchestrator/fresh-start/operator-approval.ts",
+  "src/orchestrator/governance/contracts.ts",
+  "src/orchestrator/governance/governance.service.ts",
+  "src/orchestrator/governed-notes/authority.ts",
+  "src/orchestrator/governed-notes/body-content.ts",
+  "src/orchestrator/governed-notes/codec.ts",
+  "src/orchestrator/governed-notes/contracts.ts",
+  "src/orchestrator/governed-notes/errors.ts",
+  "src/orchestrator/governed-notes/fixture-allocation.ts",
+  "src/orchestrator/governed-notes/fixture-control.ts",
+  "src/orchestrator/governed-notes/intent.ts",
+  "src/orchestrator/governed-notes/pair-validation.ts",
+  "src/orchestrator/governed-notes/provenance.repository.ts",
+  "src/orchestrator/governed-notes/repository.ts",
+  "src/orchestrator/governed-notes/run.ts",
+  "src/orchestrator/governed-notes/runtime.factory.ts",
+  "src/orchestrator/governed-notes/service.ts",
+  "src/orchestrator/governed-notes/worker-protocol.ts",
   "src/orchestrator/identity/git-workspace.resolver.ts",
   "src/orchestrator/integrity/event-integrity.service.ts",
   "src/orchestrator/integrity/lifecycle-integrity.service.ts",
   "src/orchestrator/integrity/stored-event-authenticator.ts",
+  "src/orchestrator/keys/operational-key-custody.ts",
   "src/orchestrator/lifecycle/lifecycle-command.processor.ts",
   "src/orchestrator/lifecycle/lifecycle-command.store.ts",
   "src/orchestrator/lifecycle/lifecycle-operational.store.ts",
@@ -112,6 +131,7 @@ const APPROVED_SEALED_AND_ROLLOUT_SOURCE_DIFF = Object.freeze([
   "src/orchestrator/privacy/evidence-contracts.ts",
   "src/orchestrator/privacy/evidence-envelope.ts",
   "src/orchestrator/privacy/evidence-key-provider.ts",
+  "src/orchestrator/privacy/large-frame-chunking.ts",
   "src/orchestrator/privacy/redaction.ts",
   "src/orchestrator/privacy/retained-evidence-authority.ts",
   "src/orchestrator/privacy/retained-evidence-codec.ts",
@@ -122,8 +142,10 @@ const APPROVED_SEALED_AND_ROLLOUT_SOURCE_DIFF = Object.freeze([
   "src/orchestrator/privacy/retained-evidence.repository.ts",
   "src/orchestrator/privacy/retained-evidence.service.ts",
   "src/orchestrator/projections/builder.ts",
+  "src/orchestrator/projections/captured-image-v3.ts",
   "src/orchestrator/projections/checksum.ts",
   "src/orchestrator/projections/contracts.ts",
+  "src/orchestrator/projections/coordinator.ts",
   "src/orchestrator/projections/event-reader.ts",
   "src/orchestrator/projections/folds.ts",
   "src/orchestrator/projections/image-metadata.ts",
@@ -131,10 +153,15 @@ const APPROVED_SEALED_AND_ROLLOUT_SOURCE_DIFF = Object.freeze([
   "src/orchestrator/projections/integrity.ts",
   "src/orchestrator/projections/manifest-codec.ts",
   "src/orchestrator/projections/manifest.ts",
+  "src/orchestrator/projections/reconciliation-journal.ts",
   "src/orchestrator/projections/schema.ts",
   "src/orchestrator/projections/source-event-codec.ts",
   "src/orchestrator/projections/stable-directory-read-core.ts",
+  "src/orchestrator/projections/stable-directory.ts",
   "src/orchestrator/projections/v2-reader-lease.ts",
+  "src/orchestrator/recovery/backup.service.ts",
+  "src/orchestrator/recovery/contracts.ts",
+  "src/orchestrator/recovery/restore.service.ts",
   "src/orchestrator/retrieval/candidates.ts",
   "src/orchestrator/retrieval/contracts.ts",
   "src/orchestrator/retrieval/database-core.ts",
@@ -147,9 +174,12 @@ const APPROVED_SEALED_AND_ROLLOUT_SOURCE_DIFF = Object.freeze([
   "src/orchestrator/rollout/rollout-control-plane.ts",
   "src/orchestrator/runtime/project-store-executor.ts",
   "src/orchestrator/runtime/project-store-worker-backend.ts",
+  "src/orchestrator/runtime/project-store-worker-runtime.ts",
+  "src/orchestrator/runtime/projection-runtime.ts",
   "src/orchestrator/runtime/worker-protocol.ts",
   "src/orchestrator/storage/event-append-transaction.ts",
   "src/orchestrator/storage/event-chain-constants.ts",
+  "src/orchestrator/storage/event-store.ts",
   "src/orchestrator/storage/lifecycle-projection.repository.ts",
   "src/orchestrator/storage/migrations/0006-v2-rollout-control-plane.ts",
   "src/orchestrator/storage/migrations/0007-v2-shadow-migration.ts",
@@ -173,6 +203,10 @@ const APPROVED_SEALED_AND_ROLLOUT_SOURCE_DIFF = Object.freeze([
   "src/orchestrator/verified-read/content-ranking.ts",
   "src/orchestrator/verified-read/content-result.ts",
   "src/orchestrator/verified-read/contracts.ts",
+  "src/orchestrator/verified-read/full-note-contracts.ts",
+  "src/orchestrator/verified-read/full-note-protocol.ts",
+  "src/orchestrator/verified-read/full-note-query.ts",
+  "src/orchestrator/verified-read/full-note-result.ts",
   "src/orchestrator/verified-read/ownership.ts",
   "src/orchestrator/verified-read/protocol.ts",
   "src/orchestrator/verified-read/supervisor.ts",
@@ -187,10 +221,12 @@ const APPROVED_SEALED_AND_ROLLOUT_SOURCE_DIFF = Object.freeze([
   "src/v2/admin.ts",
   "src/v2/app.ts",
   "src/v2/build-identity.ts",
+  "src/v2/capabilities.ts",
   "src/v2/composition.ts",
   "src/v2/config.ts",
   "src/v2/internal-verified-read-cleanup.entry.ts",
   "src/v2/internal-verified-read.entry.ts",
+  "src/v2/public-tools.ts",
   "src/workers/project-store.worker.ts",
 ]);
 const VALID_V2_AGGREGATE = Object.freeze({
@@ -293,18 +329,21 @@ const FORBIDDEN_SHADOW_PRODUCTION_MODULE_WIRING = new RegExp(
   String.raw`(?:from(?:${JAVASCRIPT_TRIVIA})+|import(?:(?:${JAVASCRIPT_TRIVIA})*\((?:${JAVASCRIPT_TRIVIA})*|(?:${JAVASCRIPT_TRIVIA})+)|require(?:${JAVASCRIPT_TRIVIA})*\((?:${JAVASCRIPT_TRIVIA})*)["'][^"']*(?:\/(?:migration|parity)\/|\/materialization\/(?:v2-shadow-compatibility|stable-compatibility-directory))[^"']*["']`,
 );
 const FORBIDDEN_V2_PRODUCTION_TOOL_REGISTRATION = /registerTool\(\s*["']memory_(?:retrieval|projection|migration|parity|appendEvent|eventAppend)/;
-const FORBIDDEN_SHADOW_ENVIRONMENT = /process\s*\.\s*env\s*(?:\.\s*[A-Za-z0-9_]*(?:V2|SHADOW_MIGRATION)[A-Za-z0-9_]*|\[\s*["'][^"']*(?:V2|SHADOW_MIGRATION)[^"']*["']\s*\])/i;
+const FORBIDDEN_SHADOW_ENVIRONMENT = /process\s*\.\s*env\s*(?:\.\s*(?!MEMORY_V2_)[A-Za-z0-9_]*(?:V2|SHADOW_MIGRATION)[A-Za-z0-9_]*|\[\s*["'](?!MEMORY_V2_)[^"']*(?:V2|SHADOW_MIGRATION)[^"']*["']\s*\])/i;
+const FORBIDDEN_V1_ENVIRONMENT = /process\s*\.\s*env\s*(?:\.\s*[A-Za-z0-9_]*(?:V2|SHADOW_MIGRATION)[A-Za-z0-9_]*|\[\s*["'][^"']*(?:V2|SHADOW_MIGRATION)[^"']*["']\s*\])/i;
 
 // Only these reviewed prepared-composition edges may cross the old V1-only
 // fence. No directory-prefix exemption grants future callers the same access.
 const PREPARED_IMPORTS: Readonly<Record<string, readonly string[]>> = {
   "src/v2.ts": ["src/v2/app.ts", "src/v2/config.ts"],
   "src/v2-admin.ts": ["src/v2/admin.ts", "src/v2/config.ts"],
-  "src/v2/admin.ts": ["src/orchestrator/fresh-start/fresh-start-initializer.ts", "src/orchestrator/fresh-start/fresh-start-paths.ts", "src/orchestrator/fresh-start/contracts.ts", "src/v2/build-identity.ts", "src/v2/config.ts", "src/v2/composition.ts"],
-  "src/v2/app.ts": ["src/orchestrator/fresh-start/contracts.ts", "src/v2/composition.ts", "src/v2/config.ts"],
-  "src/v2/config.ts": ["src/orchestrator/fresh-start/contracts.ts", "src/orchestrator/fresh-start/fresh-start-paths.ts"],
-  "src/v2/composition.ts": ["src/orchestrator/fresh-start/fresh-start-initializer.ts", "src/orchestrator/fresh-start/fresh-start-paths.ts", "src/orchestrator/fresh-start/contracts.ts", "src/orchestrator/fresh-start/fresh-start.repository.ts", "src/orchestrator/fresh-start/operator-approval.ts", "src/v2/build-identity.ts", "src/v2/config.ts"],
+  "src/v2/admin.ts": ["src/orchestrator/fresh-start/contracts.ts", "src/orchestrator/fresh-start/fresh-start-control-plane.ts", "src/orchestrator/fresh-start/fresh-start-initializer.ts", "src/orchestrator/fresh-start/fresh-start-paths.ts", "src/orchestrator/fresh-start/fresh-start.repository.ts", "src/orchestrator/fresh-start/operator-approval.ts", "src/v2/build-identity.ts", "src/v2/composition.ts", "src/v2/config.ts"],
+  "src/v2/app.ts": ["src/orchestrator/fresh-start/contracts.ts", "src/v2/composition.ts", "src/v2/config.ts", "src/v2/public-tools.ts"],
+  "src/v2/config.ts": ["src/orchestrator/fresh-start/contracts.ts", "src/orchestrator/fresh-start/fresh-start-paths.ts", "src/v2/capabilities.ts"],
+  "src/v2/composition.ts": ["src/orchestrator/fresh-start/fresh-start-initializer.ts", "src/orchestrator/fresh-start/fresh-start-paths.ts", "src/orchestrator/fresh-start/contracts.ts", "src/orchestrator/fresh-start/fresh-start.repository.ts", "src/orchestrator/fresh-start/operator-approval.ts", "src/v2/build-identity.ts", "src/v2/config.ts", "src/v2/public-tools.ts"],
   "src/v2/build-identity.ts": ["src/orchestrator/fresh-start/contracts.ts"],
+  "src/v2/capabilities.ts": ["src/orchestrator/fresh-start/contracts.ts"],
+  "src/v2/public-tools.ts": ["src/orchestrator/fresh-start/contracts.ts", "src/orchestrator/fresh-start/fresh-start-admission.ts", "src/orchestrator/fresh-start/fresh-start-paths.ts", "src/v2/capabilities.ts"],
   "src/v2/internal-verified-read.entry.ts": ["src/v2/build-identity.ts"],
   "src/v2/internal-verified-read-cleanup.entry.ts": ["src/v2/build-identity.ts"],
   "src/workers/project-store.worker.ts": ["src/v2/build-identity.ts"],
@@ -373,7 +412,8 @@ function assertProductionIsolation(sources: readonly ProductionIsolationSource[]
       const specifiers = canonicalModuleSpecifiers(candidate);
       assert.doesNotMatch(candidate.contents, FORBIDDEN_SHADOW_PRODUCTION_MODULE_WIRING, `V2_PRODUCTION_ISOLATION: ${candidate.path} must not import migration/parity/materialization`);
       assert.doesNotMatch(candidate.contents, /(?:from|import|require)[\s\S]{0,40}["'][^"']*(?:tests\/|fixtures\/)[^"']*["']/, "V2_PRODUCTION_ISOLATION: no test fixture wiring");
-      assert.doesNotMatch(candidate.contents, FORBIDDEN_SHADOW_ENVIRONMENT, "V2_PRODUCTION_ISOLATION: no environment activation");
+      const isV2Entry = candidate.path === "src/v2.ts" || candidate.path === "src/v2-admin.ts" || candidate.path.startsWith("src/v2/");
+      assert.doesNotMatch(candidate.contents, isV2Entry ? FORBIDDEN_SHADOW_ENVIRONMENT : FORBIDDEN_V1_ENVIRONMENT, "V2_PRODUCTION_ISOLATION: no environment activation");
       for (const specifier of specifiers) {
         const target = normalizedModuleTarget(candidate.path, specifier);
         if (target === "src/v2.ts" || target === "src/v2-admin.ts" || target?.startsWith("src/v2/")

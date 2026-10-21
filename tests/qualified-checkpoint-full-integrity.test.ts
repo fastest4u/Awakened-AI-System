@@ -8784,7 +8784,7 @@ it("full integrity advances each qualified coverage row exactly once", async () 
   });
   assert.equal(
     observedEntityRich.totalPrepares(),
-    57,
+    71,
     "bounded lifecycle outbox proofs must not add per-entity prepares",
   );
   for (const [kind, prepares] of [

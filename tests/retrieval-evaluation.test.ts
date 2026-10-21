@@ -954,7 +954,7 @@ function createAuthenticatedSourceStore(
       PRAGMA application_id = ${PROJECT_MEMORY_APPLICATION_ID};
       PRAGMA journal_mode = WAL;
       PRAGMA synchronous = FULL;
-      CREATE TABLE project_meta(singleton INTEGER PRIMARY KEY, project_id TEXT, vault_id TEXT, store_id TEXT) STRICT;
+      CREATE TABLE project_meta(singleton INTEGER PRIMARY KEY, project_id TEXT, vault_id TEXT, store_id TEXT) STRICT; CREATE TABLE command_dedup(project_id TEXT, command_id TEXT, idempotency_key TEXT, command_type TEXT) STRICT;
       CREATE TABLE events(
         global_position INTEGER PRIMARY KEY, event_id TEXT, project_id TEXT, vault_id TEXT,
         store_id TEXT, workspace_id TEXT, branch_scope_id TEXT, branch_ref TEXT,
