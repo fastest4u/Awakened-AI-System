@@ -248,7 +248,12 @@ function createFixture(options: {
   });
   const connection = new RecordingConnection(nativeConnection);
   connections.push(connection);
-  new MigrationRunner().apply(connection, [eventCoreMigration], NOW);
+  new MigrationRunner().apply(
+    connection,
+    [eventCoreMigration],
+    NOW,
+    { kind: "bootstrap-empty", beforeMigration: () => undefined },
+  );
   connection.exec("BEGIN IMMEDIATE");
   connection.prepare(`
     INSERT INTO project_meta(

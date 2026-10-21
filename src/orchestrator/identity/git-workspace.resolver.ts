@@ -21,8 +21,10 @@ export interface GitCommandRunner {
 }
 
 export class SpawnSyncGitCommandRunner implements GitCommandRunner {
+  constructor(private readonly gitSpawn: typeof spawnSync = spawnSync) {}
+
   run(cwd: string, args: string[]): GitCommandResult {
-    const result = spawnSync("git", args, {
+    const runGit = () => this.gitSpawn("git", args, {
       cwd,
       encoding: "utf8",
       shell: false,
@@ -30,6 +32,10 @@ export class SpawnSyncGitCommandRunner implements GitCommandRunner {
       timeout: 5000,
       maxBuffer: 1024 * 1024,
     });
+    const firstResult = runGit();
+    const result = (firstResult.error as NodeJS.ErrnoException | undefined)?.code === "ETIMEDOUT"
+      ? runGit()
+      : firstResult;
     return {
       exitCode: result.status ?? 1,
       stdout: result.stdout ?? "",

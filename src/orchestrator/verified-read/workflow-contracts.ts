@@ -1,0 +1,27 @@
+import type { ContentReadBase, NativeContentFilters, NativeContentItem, NativeGetConflict, NativeSearchItem, NativeSearchConflict, NativeSelectionScope } from "./content-contracts.js";
+import type { NATIVE_CONTENT_RANKING_VERSION } from "./content-contracts.js";
+
+export const NATIVE_WORKFLOW_BOUNDS_VERSION = "v2-native-read-workflow-bounds-1";
+export type NativePagedOperation = "list-canonical-records" | "recent-canonical-records" | "follow-up-radar";
+export type NativePageParameters = NativeContentFilters & Readonly<{ limit?: number; cursor?: string }>;
+export type ListCanonicalRecordsRequest = ContentReadBase & Readonly<{ operation: "list-canonical-records"; parameters: NativePageParameters }>;
+export type RecentCanonicalRecordsRequest = ContentReadBase & Readonly<{ operation: "recent-canonical-records"; parameters: NativePageParameters }>;
+export type FollowUpRadarRequest = ContentReadBase & Readonly<{ operation: "follow-up-radar"; parameters: NativePageParameters }>;
+export type BuildContextPackRequest = ContentReadBase & Readonly<{ operation: "build-context-pack"; parameters: NativeContentFilters & Readonly<{ query: string }> }>;
+export type NativeWorkflowRequest = ListCanonicalRecordsRequest | RecentCanonicalRecordsRequest | FollowUpRadarRequest | BuildContextPackRequest;
+export type NativeWorkflowCursor = Readonly<{ version: 1; operation: NativePagedOperation; selectionHash: string; schemaVersion: 2 | 3;
+  projectionGeneration: number; projectionEventPosition: string; imageSha256: string; lastId: string; lastEventPosition: string | null }>;
+export type WorkflowCursorBinding = Readonly<Omit<NativeWorkflowCursor, "lastId" | "lastEventPosition">>;
+export type NativeCanonicalPageEntry = Readonly<{ item: NativeContentItem; conflict: NativeGetConflict | null }>;
+export type NativeCanonicalPageResult = Readonly<{ operation: "list-canonical-records" | "recent-canonical-records";
+  selectionScope: NativeSelectionScope; workflowBoundsVersion: typeof NATIVE_WORKFLOW_BOUNDS_VERSION;
+  order: "item-id-binary-asc" | "source-event-position-desc-id-binary-asc";
+  items: readonly NativeCanonicalPageEntry[]; hasMore: boolean; nextCursor: string | null; byteBounded: boolean }>;
+export type NativeRadarResult = Readonly<{ operation: "follow-up-radar"; selectionScope: NativeSelectionScope;
+  workflowBoundsVersion: typeof NATIVE_WORKFLOW_BOUNDS_VERSION; order: "source-event-position-desc-id-binary-asc";
+  items: readonly NativeContentItem[]; hasMore: boolean; nextCursor: string | null; byteBounded: boolean }>;
+export type NativeContextResult = Readonly<{ operation: "build-context-pack"; selectionScope: NativeSelectionScope;
+  rankingPolicyVersion: typeof NATIVE_CONTENT_RANKING_VERSION; workflowBoundsVersion: typeof NATIVE_WORKFLOW_BOUNDS_VERSION;
+  items: readonly NativeSearchItem[]; conflicts: readonly NativeSearchConflict[]; followUps: readonly NativeContentItem[];
+  candidateBounded: boolean; selectionTruncated: boolean; byteBounded: boolean }>;
+export type NativeWorkflowResult = NativeCanonicalPageResult | NativeRadarResult | NativeContextResult;

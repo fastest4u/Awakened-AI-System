@@ -1,0 +1,56 @@
+name: V2 legacy regression
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  legacy-regression:
+    name: V2 legacy regression Node ${{ matrix.node-version }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
+        node-version:
+          - "24.16.0"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      - name: Check installation policy
+        run: node scripts/check-build-installation.js before
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts --include=dev --include=optional
+
+      - name: Check installation capability
+        run: node scripts/check-build-installation.js after
+
+      - name: Check runtime capabilities
+        run: npm run check:runtime
+
+      - name: Run V2 shadow migration gate
+        env:
+          V2_SHADOW_MIGRATION_TEST_EVIDENCE_OUTPUT: ${{ runner.temp }}/v2-shadow-migration-functional/evidence.json
+        run: npm run test:migration
+
+      - name: Upload V2 shadow migration functional synthetic evidence
+        uses: actions/upload-artifact@v7
+        with:
+          name: v2-shadow-migration-functional-synthetic-${{ matrix.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/v2-shadow-migration-functional/evidence.json
+          if-no-files-found: error
+          retention-days: 14

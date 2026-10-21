@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import type { PreparedRetainedEvidenceCommandV1 } from "../src/orchestrator/privacy/retained-evidence-worker-protocol.js";
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import {
@@ -74,8 +75,23 @@ import {
 import { MaintenanceFence } from "../src/orchestrator/storage/maintenance-fence.js";
 import { EventStore, EventStoreError } from "../src/orchestrator/storage/event-store.js";
 import { NodeSqliteDriver } from "../src/orchestrator/storage/node-sqlite-driver.js";
+import type { SqliteConnection } from "../src/orchestrator/storage/sqlite-driver.js";
 import { DEFAULT_BUSY_TIMEOUT_MS } from "../src/orchestrator/runtime/runtime-capabilities.js";
 import { canonicalMkdtemp } from "./support/canonical-temp.js";
+import {
+  encodeSessionAmbiguitySummaries,
+  LifecycleError,
+} from "../src/orchestrator/lifecycle/errors.js";
+import type { CapabilityKeyProvider } from "../src/orchestrator/lifecycle/authority/capability-key-provider.js";
+import type {
+  LifecycleWorkerRuntimeCreateInput,
+  LifecycleWorkerRuntimeFactoryPort,
+} from "../src/orchestrator/runtime/lifecycle-worker-runtime.factory.js";
+import type { LifecycleWorkerRuntime } from "../src/orchestrator/runtime/lifecycle-worker-runtime.js";
+import type {
+  LifecycleWorkerOperationWire,
+  LifecycleWorkerSuccessWire,
+} from "../src/orchestrator/runtime/lifecycle-worker-protocol.js";
 
 const roots: string[] = [];
 const PROJECT_ID = "11111111-1111-4111-8111-111111111111" as ProjectId;
@@ -197,6 +213,96 @@ class ManualScheduler implements ExecutorScheduler {
     while (this.#timeouts.size > 0) this.runNext();
   }
 }
+
+function retainedPrepared(): PreparedRetainedEvidenceCommandV1 {
+  const sessionId = "33333333-3333-4333-8333-333333333333";
+  return { command: { version: 1, commandType: "retain-evidence-batch", commandId: COMMAND_ID,
+    idempotencyKey: "22222222-2222-4222-8222-222222222222", targetSessionId: sessionId,
+    conversationId: "44444444-4444-4444-8444-444444444444", frames: [{ frameId: "55555555-5555-4555-8555-555555555555",
+      ordinal: "0", role: "user", category: "user-message", occurredAt: NOW, mediaType: "text/plain; charset=utf-8",
+      content: "visible synthetic frame", previousFrameId: null, toolCorrelationId: null, artifactHashes: [] }] },
+    authorization: { kind: "protected", authoritySessionId: sessionId as never, targetSessionId: sessionId as never,
+      proof: { proofVersion: 1, target: "semantic-command", proofNonce: "66666666-6666-4666-8666-666666666666", proofFingerprint: "a".repeat(64) }, approval: null, childBindingGrant: null } };
+}
+
+describe("private retained executor outcomes", () => {
+  it("before-post weakened preparation refuses with zero posts", async () => {
+    const { executor, worker } = await fakeExecutor();
+    const before = worker.posted.length, original = retainedPrepared();
+    assert.throws(() => executor.retainEvidence({ ...original, authorization: { ...original.authorization, proof: null } } as PreparedRetainedEvidenceCommandV1), { code: "SESSION_CAPABILITY_INVALID" });
+    assert.equal(worker.posted.length, before);
+    worker.emit("exit", 1); await executor.close();
+  });
+  it("worker replacement recovery IDs and malformed delivery preserve the local original identity", async () => {
+    for (const mode of ["unknown", "unsafe-failure", "messageerror", "bad-success"] as const) {
+      const { executor, worker } = await fakeExecutor();
+      const original = retainedPrepared(), pending = executor.retainEvidence(original); void pending.catch(() => undefined);
+      const request = worker.posted.at(-1)!;
+      if (mode === "messageerror") worker.emit("messageerror", new Error("synthetic private delivery failure"));
+      else if (mode === "bad-success") worker.respond(request, { accepted: true });
+      else worker.emit("message", { id: request.id, ok: false, error: { code: mode === "unknown" ? "COMMAND_OUTCOME_UNKNOWN" : "NATIVE_SECRET",
+        message: mode === "unknown" ? "COMMAND_OUTCOME_UNKNOWN" : "unsafe synthetic detail", details: { commandId: randomUUID(), idempotencyKey: randomUUID() } } });
+      await assert.rejects(pending, error => {
+        assert.ok(error instanceof ProjectStoreWorkerError); assert.equal(error.code, "COMMAND_OUTCOME_UNKNOWN");
+        assert.equal(error.details.commandId, original.command.commandId); assert.equal(error.details.idempotencyKey, original.command.idempotencyKey); return true;
+      });
+      assert.throws(() => executor.retainEvidence(original)); await executor.close();
+    }
+  });
+  it("retained response delivery fault after success returns original unknown IDs and poison", async () => {
+    const { executor, worker } = await fakeExecutor({}, { lifecycleFaultInjector: { hit(boundary, _point, context) {
+      if (boundary === "response-delivery" && context.commandId === COMMAND_ID) throw new Error("synthetic delivery fault");
+    } } });
+    const original = retainedPrepared(), pending = executor.retainEvidence(original);
+    worker.respond(worker.posted.at(-1)!, { deduplicated: false, firstGlobalPosition: "1", lastGlobalPosition: "1", finalStreamVersion: "1",
+      eventIds: ["77777777-7777-4777-8777-777777777777"], responseHash: "b".repeat(64), response: {
+        resultVersion: 1, operation: "retain-evidence-batch", retentionFormat: "redacted-encrypted-v1", targetSessionId: original.command.targetSessionId,
+        conversationId: original.command.conversationId, commandId: original.command.commandId, idempotencyKey: original.command.idempotencyKey,
+        evidenceIds: ["88888888-8888-4888-8888-888888888888"], eventPosition: "1", finalStreamVersion: "1" } });
+    await assert.rejects(pending, error => {
+      assert.ok(error instanceof ProjectStoreWorkerError); assert.equal(error.code, "COMMAND_OUTCOME_UNKNOWN");
+      assert.equal(error.details.commandId, original.command.commandId); assert.equal(error.details.idempotencyKey, original.command.idempotencyKey); return true;
+    });
+    assert.throws(() => executor.retainEvidence(original)); await executor.close();
+  });
+  it("queue full posts nothing", async () => {
+    const { executor, worker } = await fakeExecutor({ maxPending: 1 });
+    const first = executor.retainEvidence(retainedPrepared());
+    void first.catch(() => undefined);
+    const posts = worker.posted.length;
+    await assert.rejects(executor.retainEvidence(retainedPrepared()), errorCode("STORE_QUEUE_FULL"));
+    assert.equal(worker.posted.length, posts);
+    worker.emit("exit", 1);
+    await assert.rejects(first, errorCode("COMMAND_OUTCOME_UNKNOWN"));
+    await executor.close();
+  });
+  it("posted retention timeout is outcome unknown with original IDs and poison", async () => {
+    const { executor, worker, scheduler } = await fakeExecutor();
+    const original = retainedPrepared();
+    const pending = executor.retainEvidence(original);
+    void pending.catch(() => undefined);
+    assert.equal(worker.posted.at(-1)?.type, "retained-evidence");
+    scheduler.runNext();
+    await assert.rejects(pending, error => {
+      assert.ok(error instanceof ProjectStoreWorkerError);
+      assert.equal(error.code, "COMMAND_OUTCOME_UNKNOWN");
+      assert.equal(error.details.commandId, original.command.commandId);
+      assert.equal(error.details.idempotencyKey, original.command.idempotencyKey);
+      return true;
+    });
+    assert.equal(worker.terminateCalls, 1);
+    assert.throws(() => executor.retainEvidence(original));
+    await executor.close();
+  });
+  it("unposted failure is not a committed result and poisons older posted retention", async () => {
+    const { executor, worker } = await fakeExecutor();
+    const older = executor.retainEvidence(retainedPrepared()); void older.catch(() => undefined);
+    worker.throwOnPost = true;
+    await assert.rejects(executor.retainEvidence(retainedPrepared()), errorCode("WORKER_UNAVAILABLE"));
+    await assert.rejects(older, errorCode("COMMAND_OUTCOME_UNKNOWN"));
+    await executor.close();
+  });
+});
 
 class FakeWorker extends EventEmitter implements WorkerLike {
   readonly posted: WorkerRequest[] = [];
@@ -1406,6 +1512,40 @@ describe("ProjectStoreExecutor bounded lifecycle", () => {
     }
   });
 
+  it("preserves the bounded ambiguity scalar through executor detail sanitization", async () => {
+    const { executor, worker } = await fakeExecutor();
+    const candidateSummariesJson = encodeSessionAmbiguitySummaries([{
+      sessionId: "00000000-0000-4000-8000-000000000010",
+      state: "active",
+      ownerGeneration: "1",
+      latestCheckpointEventPosition: null,
+      checkpointRequired: false,
+    }, {
+      sessionId: "00000000-0000-4000-8000-000000000011",
+      state: "suspended",
+      ownerGeneration: "2",
+      latestCheckpointEventPosition: "9",
+      checkpointRequired: true,
+    }], false);
+    const pending = executor.quickIntegrity();
+    const request = worker.posted.at(-1)!;
+    worker.emit("message", {
+      id: request.id,
+      ok: false,
+      error: {
+        code: "SESSION_AMBIGUOUS",
+        message: "SESSION_AMBIGUOUS",
+        details: { candidateSummariesJson },
+      },
+    });
+    await assert.rejects(pending, (error) => {
+      assert.ok(error instanceof ProjectStoreWorkerError);
+      assert.equal(error.code, "SESSION_AMBIGUOUS");
+      assert.deepEqual(error.details, { candidateSummariesJson });
+      return true;
+    });
+  });
+
   it("reports only the original command recovery identity after a posted mutation becomes ambiguous", async () => {
     const { executor, scheduler, context } = await fakeExecutor();
     const command = appendCommand(context);
@@ -1653,6 +1793,7 @@ describe("ProjectStoreExecutor bounded lifecycle", () => {
     const { executor, worker } = await fakeExecutor();
     const read = executor.quickIntegrity();
     const close = executor.close();
+    assert.strictEqual(executor.close(), close);
     assert.equal(worker.posted.some((request) => request.type === "close"), false);
     const readRequest = worker.posted.find((request) => request.type === "quickIntegrity")!;
     worker.respond(readRequest, {
@@ -1676,6 +1817,10 @@ describe("ProjectStoreExecutor bounded lifecycle", () => {
     await close;
     assert.equal(worker.terminateCalls, 1);
     assert.ok(worker.lifecycle.lastIndexOf("post") < worker.lifecycle.lastIndexOf("terminate"));
+    const observation = executor.closeForGovernedNoteController();
+    assert.equal((await observation).disposition, "graceful-confirmed");
+    assert.strictEqual(executor.closeForGovernedNoteController(), observation);
+    assert.strictEqual(executor.close(), close);
   });
 
   it("uses one bounded forced termination and makes repeated close idempotent", async () => {
@@ -1689,6 +1834,8 @@ describe("ProjectStoreExecutor bounded lifecycle", () => {
     await first;
     await executor.close();
     assert.equal(worker.terminateCalls, 1);
+    assert.equal((await executor.closeForGovernedNoteController()).disposition, "ownership-uncertain");
+    assert.strictEqual(executor.close(), first);
   });
 
   it("terminates and clears the close deadline after a negative close acknowledgement", async () => {
@@ -1955,6 +2102,46 @@ describe("primary SQLite busy retry", () => {
 });
 
 describe("ProjectStoreWorkerRuntime FIFO and heartbeat", () => {
+  it("preserves the bounded ambiguity scalar through worker error sanitization and wire decoding", async () => {
+    const context = contextFixture();
+    const candidateSummariesJson = encodeSessionAmbiguitySummaries([{
+      sessionId: "00000000-0000-4000-8000-000000000010",
+      state: "active",
+      ownerGeneration: "1",
+      latestCheckpointEventPosition: null,
+      checkpointRequired: false,
+    }, {
+      sessionId: "00000000-0000-4000-8000-000000000011",
+      state: "suspended",
+      ownerGeneration: "2",
+      latestCheckpointEventPosition: "9",
+      checkpointRequired: true,
+    }], false);
+    const posted: unknown[] = [];
+    const runtime = new ProjectStoreWorkerRuntime({
+      backend: {
+        async dispatch() {
+          throw new LifecycleError("SESSION_AMBIGUOUS", { candidateSummariesJson });
+        },
+        async heartbeat() { return { mode: "idle" }; },
+        async quiesceAndClose() { throw new Error("unused"); },
+        async quiesceObservedAndClose() { throw new Error("unused"); },
+        async close() {},
+      },
+      port: { postMessage(value) { posted.push(value); }, close() {} },
+      scheduler: { setInterval() { return {}; }, clearInterval() {} },
+      heartbeatIntervalMs: 5_000,
+    });
+    runtime.receive({ id: "ambiguity-wire", type: "open", binding: workerBinding(context) });
+    await turn();
+
+    const decoded = decodeWorkerResponse(posted[0]);
+    assert.equal(decoded.ok, false);
+    if (decoded.ok) assert.fail("expected worker failure");
+    assert.equal(decoded.error.code, "SESSION_AMBIGUOUS");
+    assert.deepEqual(decoded.error.details, { candidateSummariesJson });
+  });
+
   it("coalesces a matching explicit quiesce after heartbeat observation", async () => {
     const context = contextFixture();
     const observedClose = deferred<{
@@ -2460,6 +2647,9 @@ describe("real project-store worker", () => {
     assert.equal(closedAndAcknowledged, true);
     assert.equal(ownerConfirmations, 1);
     assert.throws(() => executor.quickIntegrity(), errorCode("WORKER_CLOSED"));
+    await executor.quiesce(lease);
+    await executor.quiesce(lease);
+    assert.equal(ownerConfirmations, 1);
 
     const releasedAt = new Date().toISOString();
     connection.exec("BEGIN IMMEDIATE");
@@ -2545,6 +2735,689 @@ describe("real project-store worker", () => {
 });
 
 describe("ProjectStoreWorkerBackend open identity", () => {
+  function lifecycleOperationFixture(): LifecycleWorkerOperationWire {
+    return Object.freeze({
+      kind: "fenced",
+      operation: "workflow-recovery",
+      input: Object.freeze({
+        operation: "workflow-recovery",
+        workId: "recovery-scan-1",
+        ownerId: "coordinator-a",
+        fencingToken: "1",
+        dueBefore: "2026-07-17T00:00:00.000Z",
+        limit: 25,
+      }),
+    }) as LifecycleWorkerOperationWire;
+  }
+
+  class RecordingLifecycleRuntime implements LifecycleWorkerRuntime {
+    readonly executions: Array<readonly [LifecycleWorkerOperationWire, ProjectContext]> = [];
+    disposeCalls = 0;
+
+    constructor(
+      readonly result: LifecycleWorkerSuccessWire | Error,
+      readonly disposeError: Error | null = null,
+      readonly lifecycle: string[] | null = null,
+    ) {}
+
+    async execute(
+      operation: LifecycleWorkerOperationWire,
+      context: ProjectContext,
+    ): Promise<LifecycleWorkerSuccessWire> {
+      this.executions.push([operation, context]);
+      if (this.result instanceof Error) throw this.result;
+      return this.result;
+    }
+
+    dispose(): void {
+      this.disposeCalls += 1;
+      this.lifecycle?.push("runtime-dispose");
+      if (this.disposeError !== null) throw this.disposeError;
+    }
+  }
+
+  class RecordingLifecycleFactory implements LifecycleWorkerRuntimeFactoryPort {
+    readonly inputs: LifecycleWorkerRuntimeCreateInput[] = [];
+
+    constructor(
+      readonly runtime: LifecycleWorkerRuntime,
+      readonly createError: Error | null = null,
+      readonly lifecycle: string[] | null = null,
+    ) {}
+
+    create(input: LifecycleWorkerRuntimeCreateInput): LifecycleWorkerRuntime {
+      this.inputs.push(input);
+      this.lifecycle?.push("factory-create");
+      if (this.createError !== null) throw this.createError;
+      return this.runtime;
+    }
+  }
+
+  class RecordingRegistrationFence extends MaintenanceFence {
+    readonly connections: SqliteConnection[] = [];
+    registerCalls = 0;
+
+    constructor(
+      readonly lifecycle: string[],
+      readonly registerError: Error | null = null,
+    ) {
+      super();
+    }
+
+    override registerExecutor(...args: Parameters<MaintenanceFence["registerExecutor"]>): void {
+      this.registerCalls += 1;
+      this.connections.push(args[0]);
+      this.lifecycle.push("register-executor");
+      super.registerExecutor(...args);
+      if (this.registerError !== null) throw this.registerError;
+    }
+  }
+
+  interface ActiveConnectionProbe {
+    readonly connections: SqliteConnection[];
+    readonly lifecycle: string[];
+    closeCalls: number;
+    readonly eventStoreFactory: (connection: SqliteConnection) => EventStore;
+  }
+
+  function activeConnectionProbe(lifecycle: string[]): ActiveConnectionProbe {
+    const probe: ActiveConnectionProbe = {
+      connections: [],
+      lifecycle,
+      closeCalls: 0,
+      eventStoreFactory(connection) {
+        probe.connections.push(connection);
+        lifecycle.push("event-store-create");
+        const close = connection.close.bind(connection);
+        connection.close = () => {
+          probe.closeCalls += 1;
+          lifecycle.push("connection-close");
+          close();
+        };
+        return {} as EventStore;
+      },
+    };
+    return probe;
+  }
+
+  function backendErrorCode(code: string): (error: unknown) => boolean {
+    return (error: unknown): boolean => {
+      assert.ok(error instanceof ProjectStoreWorkerBackendError);
+      assert.equal(error.code, code);
+      return true;
+    };
+  }
+
+  function sqliteSnapshotValue(value: unknown): JsonValue {
+    if (
+      value === null
+      || typeof value === "string"
+      || typeof value === "number"
+      || typeof value === "boolean"
+    ) return value;
+    if (typeof value === "bigint") return { sqliteBigInt: value.toString() };
+    if (value instanceof Uint8Array) {
+      return { sqliteBytesBase64: Buffer.from(value).toString("base64") };
+    }
+    throw new Error("UNSUPPORTED_SQLITE_SNAPSHOT_VALUE");
+  }
+
+  function applicationTableSnapshot(
+    path: string,
+  ): Record<string, { readonly schema: string; readonly rows: readonly string[] }> {
+    const database = new DatabaseSync(path, { readOnly: true });
+    try {
+      const tables = database.prepare(`
+        SELECT name, sql
+        FROM sqlite_master
+        WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+        ORDER BY name
+      `).all();
+      return Object.fromEntries(tables.map((tableRow) => {
+        const table = String(tableRow.name);
+        const escaped = table.replaceAll('"', '""');
+        const rows = database.prepare(`SELECT * FROM "${escaped}"`).all()
+          .map((row) => JSON.stringify(Object.fromEntries(
+            Object.entries(row)
+              .sort(([left], [right]) => left.localeCompare(right))
+              .map(([key, value]) => [key, sqliteSnapshotValue(value)]),
+          )))
+          .sort();
+        return [table, {
+          schema: String(tableRow.sql ?? ""),
+          rows,
+        }];
+      }));
+    } finally {
+      database.close();
+    }
+  }
+
+  // Production mutation caught: acquire maintenance outside cleanup ownership after opening SQLite.
+  it("closes the authoritative connection when maintenance construction fails", async () => {
+    const context = await realContext();
+    const maintenanceError = new Error("maintenance construction failed first");
+    const originalOpen = NodeSqliteDriver.prototype.open;
+    let authoritativeOpenCalls = 0;
+    let authoritativeCloseCalls = 0;
+    const authoritativeConnections: SqliteConnection[] = [];
+    let maintenanceFactoryCalls = 0;
+    let eventStoreFactoryCalls = 0;
+    let runtimeFactoryCalls = 0;
+
+    NodeSqliteDriver.prototype.open = function instrumentedOpen(path, options): SqliteConnection {
+      const connection = originalOpen.call(this, path, options);
+      if (options.mode === "existing") {
+        authoritativeOpenCalls += 1;
+        authoritativeConnections.push(connection);
+        const close = connection.close.bind(connection);
+        connection.close = () => {
+          authoritativeCloseCalls += 1;
+          close();
+        };
+      }
+      return connection;
+    };
+
+    const backend = new ProjectStoreWorkerBackend({
+      selfUrl: WORKER_URL,
+      executorLeaseMs: 15_000,
+      appendRetryDeadlineMs: 10_000,
+      keyProvider: {} as CapabilityKeyProvider,
+      lifecycleRuntimeFactory: {
+        create() {
+          runtimeFactoryCalls += 1;
+          throw new Error("runtime factory must not run");
+        },
+      },
+      maintenanceFactory: () => {
+        maintenanceFactoryCalls += 1;
+        throw maintenanceError;
+      },
+      eventStoreFactory: () => {
+        eventStoreFactoryCalls += 1;
+        throw new Error("event store factory must not run");
+      },
+    });
+
+    try {
+      await assert.rejects(backend.dispatch({
+        id: "open-maintenance-failure",
+        type: "open",
+        binding: encodeWorkerBinding(context),
+      }), (error: unknown) => {
+        assert.equal(error, maintenanceError);
+        return true;
+      });
+      assert.equal(authoritativeOpenCalls, 1);
+      assert.equal(maintenanceFactoryCalls, 1);
+      assert.equal(eventStoreFactoryCalls, 0);
+      assert.equal(runtimeFactoryCalls, 0);
+      await assert.rejects(backend.dispatch({
+        id: "lifecycle-after-maintenance-failure",
+        type: "lifecycle",
+        binding: encodeWorkerBindingAssertion(context),
+        operation: lifecycleOperationFixture(),
+      }), backendErrorCode("WORKER_CLOSED"));
+
+      const observer = new DatabaseSync(context.binding.storeRoute.eventsPath, { readOnly: true });
+      assert.equal(observer.prepare("SELECT count(*) AS count FROM executor_leases").get()?.count, 0);
+      observer.close();
+
+      await backend.close();
+      assert.equal(authoritativeCloseCalls, 1);
+    } finally {
+      NodeSqliteDriver.prototype.open = originalOpen;
+      if (authoritativeCloseCalls === 0) {
+        authoritativeConnections[0]?.close();
+      }
+    }
+  });
+
+  it("requires both lifecycle factory and the exact provider instance", async () => {
+    const provider = Object.freeze({ marker: "exact-provider" }) as unknown as CapabilityKeyProvider;
+    const operation = lifecycleOperationFixture();
+
+    const providerOnlyContext = await realContext();
+    const providerOnly = new ProjectStoreWorkerBackend({
+      selfUrl: WORKER_URL,
+      executorLeaseMs: 15_000,
+      appendRetryDeadlineMs: 10_000,
+      keyProvider: provider,
+    });
+    await providerOnly.dispatch({ id: "open-provider-only", type: "open", binding: encodeWorkerBinding(providerOnlyContext) });
+    await assert.rejects(providerOnly.dispatch({
+      id: "lifecycle-provider-only",
+      type: "lifecycle",
+      binding: encodeWorkerBindingAssertion(providerOnlyContext),
+      operation,
+    }), backendErrorCode("LIFECYCLE_V2_DISABLED"));
+    await providerOnly.close();
+
+    const factoryOnlyContext = await realContext();
+    const unusedRuntime = new RecordingLifecycleRuntime({
+      operation: "workflow-recovery",
+      nestedContractVersion: null,
+      result: {
+        resultVersion: 1,
+        integrityOk: true,
+        readOnly: false,
+        workflowCandidateCount: 0,
+        outboxCandidateCount: 0,
+        endingSessionCount: 0,
+        expiredRootLeaseCount: 0,
+        invariantFailureCodes: [],
+      },
+    });
+    const unusedFactory = new RecordingLifecycleFactory(unusedRuntime);
+    const factoryOnly = new ProjectStoreWorkerBackend({
+      selfUrl: WORKER_URL,
+      executorLeaseMs: 15_000,
+      appendRetryDeadlineMs: 10_000,
+      lifecycleRuntimeFactory: unusedFactory,
+    });
+    await factoryOnly.dispatch({ id: "open-factory-only", type: "open", binding: encodeWorkerBinding(factoryOnlyContext) });
+    assert.equal(unusedFactory.inputs.length, 0);
+    await assert.rejects(factoryOnly.dispatch({
+      id: "lifecycle-factory-only",
+      type: "lifecycle",
+      binding: encodeWorkerBindingAssertion(factoryOnlyContext),
+      operation,
+    }), backendErrorCode("LIFECYCLE_V2_DISABLED"));
+    await factoryOnly.close();
+
+    const enabledContext = await realContext();
+    const enabledLifecycle: string[] = [];
+    const enabledConnection = activeConnectionProbe(enabledLifecycle);
+    const fence = new RecordingRegistrationFence(enabledLifecycle);
+    const runtime = new RecordingLifecycleRuntime(
+      unusedRuntime.result as LifecycleWorkerSuccessWire,
+      null,
+      enabledLifecycle,
+    );
+    const factory = new RecordingLifecycleFactory(runtime, null, enabledLifecycle);
+    const enabled = new ProjectStoreWorkerBackend({
+      selfUrl: WORKER_URL,
+      executorLeaseMs: 15_000,
+      appendRetryDeadlineMs: 10_000,
+      keyProvider: provider,
+      lifecycleRuntimeFactory: factory,
+      maintenanceFactory: () => fence,
+      eventStoreFactory: enabledConnection.eventStoreFactory,
+    });
+    await enabled.dispatch({ id: "open-enabled", type: "open", binding: encodeWorkerBinding(enabledContext) });
+    assert.equal(factory.inputs.length, 1);
+    assert.equal(enabledConnection.connections.length, 1);
+    assert.equal(fence.registerCalls, 1);
+    assert.equal(factory.inputs[0]?.maintenanceFence, fence);
+    assert.equal(factory.inputs[0]?.keyProvider, provider);
+    assert.equal(factory.inputs[0]?.connection, enabledConnection.connections[0]);
+    assert.equal(fence.connections[0], enabledConnection.connections[0]);
+    assert.equal(new Set([
+      enabledConnection.connections[0],
+      factory.inputs[0]?.connection,
+      fence.connections[0],
+    ]).size, 1);
+    assert.deepEqual(enabledLifecycle, [
+      "event-store-create",
+      "factory-create",
+      "register-executor",
+    ]);
+    assert.deepEqual(await enabled.dispatch({
+      id: "lifecycle-enabled",
+      type: "lifecycle",
+      binding: encodeWorkerBindingAssertion(enabledContext),
+      operation,
+    }), unusedRuntime.result);
+    assert.equal(runtime.executions.length, 1);
+    assert.equal(runtime.executions[0]?.[0], operation);
+    assert.deepEqual(runtime.executions[0]?.[1], enabledContext);
+    await enabled.close();
+    assert.equal(runtime.disposeCalls, 1);
+    assert.equal(enabledConnection.closeCalls, 1);
+    assert.deepEqual(enabledLifecycle, [
+      "event-store-create",
+      "factory-create",
+      "register-executor",
+      "runtime-dispose",
+      "connection-close",
+    ]);
+
+    const factoryFailureContext = await realContext();
+    const factoryFailureLifecycle: string[] = [];
+    const factoryFailureConnection = activeConnectionProbe(factoryFailureLifecycle);
+    const factoryFailureFence = new RecordingRegistrationFence(factoryFailureLifecycle);
+    const factoryFailureRuntime = new RecordingLifecycleRuntime(
+      unusedRuntime.result as LifecycleWorkerSuccessWire,
+      null,
+      factoryFailureLifecycle,
+    );
+    const factoryFailure = new RecordingLifecycleFactory(
+      factoryFailureRuntime,
+      new Error("factory construction failed"),
+      factoryFailureLifecycle,
+    );
+    const failedFactoryBackend = new ProjectStoreWorkerBackend({
+      selfUrl: WORKER_URL,
+      executorLeaseMs: 15_000,
+      appendRetryDeadlineMs: 10_000,
+      keyProvider: provider,
+      lifecycleRuntimeFactory: factoryFailure,
+      maintenanceFactory: () => factoryFailureFence,
+      eventStoreFactory: factoryFailureConnection.eventStoreFactory,
+    });
+    await assert.rejects(failedFactoryBackend.dispatch({
+      id: "open-factory-failure",
+      type: "open",
+      binding: encodeWorkerBinding(factoryFailureContext),
+    }), /factory construction failed/);
+    assert.equal(factoryFailure.inputs.length, 1);
+    assert.equal(factoryFailure.inputs[0]?.connection, factoryFailureConnection.connections[0]);
+    assert.equal(factoryFailure.inputs[0]?.maintenanceFence, factoryFailureFence);
+    assert.equal(factoryFailure.inputs[0]?.keyProvider, provider);
+    assert.equal(factoryFailureFence.registerCalls, 0);
+    assert.equal(factoryFailureConnection.closeCalls, 1);
+    assert.deepEqual(factoryFailureLifecycle, [
+      "event-store-create",
+      "factory-create",
+      "connection-close",
+    ]);
+    const afterFactoryFailure = new DatabaseSync(factoryFailureContext.binding.storeRoute.eventsPath, { readOnly: true });
+    assert.equal(afterFactoryFailure.prepare("SELECT count(*) AS count FROM executor_leases").get()?.count, 0);
+    afterFactoryFailure.close();
+    assert.equal(factoryFailureRuntime.disposeCalls, 0);
+    const factoryFailureMoved = `${factoryFailureContext.binding.storeRoute.eventsPath}.factory-failure-closed`;
+    renameSync(factoryFailureContext.binding.storeRoute.eventsPath, factoryFailureMoved);
+    renameSync(factoryFailureMoved, factoryFailureContext.binding.storeRoute.eventsPath);
+
+    const registrationFailureContext = await realContext();
+    const registrationLifecycle: string[] = [];
+    const registrationConnection = activeConnectionProbe(registrationLifecycle);
+    const registrationFence = new RecordingRegistrationFence(
+      registrationLifecycle,
+      new Error("registration failed first"),
+    );
+    const registrationRuntime = new RecordingLifecycleRuntime(
+      unusedRuntime.result as LifecycleWorkerSuccessWire,
+      new Error("dispose failed second"),
+      registrationLifecycle,
+    );
+    const registrationFactory = new RecordingLifecycleFactory(
+      registrationRuntime,
+      null,
+      registrationLifecycle,
+    );
+    const registrationBackend = new ProjectStoreWorkerBackend({
+      selfUrl: WORKER_URL,
+      executorLeaseMs: 15_000,
+      appendRetryDeadlineMs: 10_000,
+      keyProvider: provider,
+      lifecycleRuntimeFactory: registrationFactory,
+      maintenanceFactory: () => registrationFence,
+      eventStoreFactory: registrationConnection.eventStoreFactory,
+    });
+    await assert.rejects(registrationBackend.dispatch({
+      id: "open-registration-failure",
+      type: "open",
+      binding: encodeWorkerBinding(registrationFailureContext),
+    }), /registration failed first/);
+    assert.equal(registrationFactory.inputs.length, 1);
+    assert.equal(registrationFactory.inputs[0]?.connection, registrationConnection.connections[0]);
+    assert.equal(registrationFactory.inputs[0]?.maintenanceFence, registrationFence);
+    assert.equal(registrationFactory.inputs[0]?.keyProvider, provider);
+    assert.equal(registrationFence.registerCalls, 1);
+    assert.equal(registrationRuntime.disposeCalls, 1);
+    assert.equal(registrationConnection.closeCalls, 1);
+    assert.deepEqual(registrationLifecycle, [
+      "event-store-create",
+      "factory-create",
+      "register-executor",
+      "runtime-dispose",
+      "connection-close",
+    ]);
+    const afterRegistrationFailure = new DatabaseSync(registrationFailureContext.binding.storeRoute.eventsPath, { readOnly: true });
+    assert.equal(afterRegistrationFailure.prepare("SELECT count(*) AS count FROM executor_leases").get()?.count, 0);
+    afterRegistrationFailure.close();
+    const moved = `${registrationFailureContext.binding.storeRoute.eventsPath}.registration-failure-closed`;
+    renameSync(registrationFailureContext.binding.storeRoute.eventsPath, moved);
+    renameSync(moved, registrationFailureContext.binding.storeRoute.eventsPath);
+
+    const disposeFailureContext = await realContext();
+    const disposeLifecycle: string[] = [];
+    const disposeConnection = activeConnectionProbe(disposeLifecycle);
+    const disposeFence = new RecordingRegistrationFence(disposeLifecycle);
+    const disposeRuntime = new RecordingLifecycleRuntime(
+      unusedRuntime.result as LifecycleWorkerSuccessWire,
+      new Error("standalone dispose failed"),
+      disposeLifecycle,
+    );
+    const disposeFactory = new RecordingLifecycleFactory(
+      disposeRuntime,
+      null,
+      disposeLifecycle,
+    );
+    const disposeBackend = new ProjectStoreWorkerBackend({
+      selfUrl: WORKER_URL,
+      executorLeaseMs: 15_000,
+      appendRetryDeadlineMs: 10_000,
+      keyProvider: provider,
+      lifecycleRuntimeFactory: disposeFactory,
+      maintenanceFactory: () => disposeFence,
+      eventStoreFactory: disposeConnection.eventStoreFactory,
+    });
+    await disposeBackend.dispatch({
+      id: "open-dispose-failure",
+      type: "open",
+      binding: encodeWorkerBinding(disposeFailureContext),
+    });
+    assert.equal(disposeFactory.inputs[0]?.connection, disposeConnection.connections[0]);
+    assert.equal(disposeFactory.inputs[0]?.maintenanceFence, disposeFence);
+    assert.equal(disposeFactory.inputs[0]?.keyProvider, provider);
+    assert.deepEqual(disposeLifecycle, [
+      "event-store-create",
+      "factory-create",
+      "register-executor",
+    ]);
+    await assert.rejects(disposeBackend.close(), /standalone dispose failed/);
+    assert.equal(disposeRuntime.disposeCalls, 1);
+    assert.equal(disposeConnection.closeCalls, 1);
+    assert.deepEqual(disposeLifecycle, [
+      "event-store-create",
+      "factory-create",
+      "register-executor",
+      "runtime-dispose",
+      "connection-close",
+    ]);
+    const disposeFailureMoved = `${disposeFailureContext.binding.storeRoute.eventsPath}.dispose-failure-closed`;
+    renameSync(disposeFailureContext.binding.storeRoute.eventsPath, disposeFailureMoved);
+    renameSync(disposeFailureMoved, disposeFailureContext.binding.storeRoute.eventsPath);
+  });
+
+  it("production lifecycle routing stays disabled with zero SQLite effect", async () => {
+    const productionWorkerSource = readFileSync(
+      resolve("src", "workers", "project-store.worker.ts"),
+      "utf8",
+    );
+    const backendConstructions = [...productionWorkerSource.matchAll(
+      /new\s+ProjectStoreWorkerBackend\s*\(\s*\{([\s\S]*?)\}\s*\)/gu,
+    )];
+    assert.equal(backendConstructions.length, 1);
+    const productionBackendOptions = backendConstructions[0]?.[1] ?? "";
+    assert.match(productionBackendOptions, /\bselfUrl\b/u);
+    assert.match(productionBackendOptions, /\bexecutorLeaseMs\b/u);
+    assert.match(productionBackendOptions, /\bappendRetryDeadlineMs\b/u);
+    assert.doesNotMatch(
+      productionBackendOptions,
+      /\b(?:keyProvider|lifecycleRuntimeFactory)\b/u,
+    );
+
+    const context = await realContext();
+    const backend = new ProjectStoreWorkerBackend({
+      selfUrl: WORKER_URL,
+      executorLeaseMs: 15_000,
+      appendRetryDeadlineMs: 10_000,
+    });
+    await backend.dispatch({
+      id: "open-production-disabled",
+      type: "open",
+      binding: encodeWorkerBinding(context),
+    });
+    const before = applicationTableSnapshot(context.binding.storeRoute.eventsPath);
+    const posted: unknown[] = [];
+    const workerRuntime = new ProjectStoreWorkerRuntime({
+      backend,
+      port: {
+        postMessage(value) { posted.push(value); },
+        close() {},
+      },
+      scheduler: {
+        setInterval() { return {}; },
+        clearInterval() {},
+      },
+      heartbeatIntervalMs: 5_000,
+    });
+    workerRuntime.receive({
+      id: "production-disabled-lifecycle",
+      type: "lifecycle",
+      binding: encodeWorkerBindingAssertion(context),
+      operation: lifecycleOperationFixture(),
+    });
+    for (let attempt = 0; attempt < 20 && posted.length === 0; attempt += 1) await turn();
+    assert.deepEqual(posted, [{
+      id: "production-disabled-lifecycle",
+      ok: false,
+      error: {
+        code: "LIFECYCLE_V2_DISABLED",
+        message: "LIFECYCLE_V2_DISABLED",
+        details: {},
+      },
+    }]);
+    const afterResponse = applicationTableSnapshot(context.binding.storeRoute.eventsPath);
+    assert.deepEqual(afterResponse, before);
+    await backend.close();
+    const afterClose = applicationTableSnapshot(context.binding.storeRoute.eventsPath);
+    assert.deepEqual(afterClose, before);
+  });
+
+  it("distinguishes an unavailable lifecycle operation from a disabled runtime", async () => {
+    const disabledContext = await realContext();
+    const disabled = new ProjectStoreWorkerBackend({
+      selfUrl: WORKER_URL,
+      executorLeaseMs: 15_000,
+      appendRetryDeadlineMs: 10_000,
+    });
+    await disabled.dispatch({ id: "open-disabled", type: "open", binding: encodeWorkerBinding(disabledContext) });
+    await assert.rejects(disabled.dispatch({
+      id: "disabled-operation",
+      type: "lifecycle",
+      binding: encodeWorkerBindingAssertion(disabledContext),
+      operation: lifecycleOperationFixture(),
+    }), backendErrorCode("LIFECYCLE_V2_DISABLED"));
+    await disabled.close();
+
+    const enabledContext = await realContext();
+    const unavailable = new LifecycleError("LIFECYCLE_OPERATION_UNAVAILABLE");
+    const provider = {} as CapabilityKeyProvider;
+    const runtime = new RecordingLifecycleRuntime(unavailable);
+    const enabled = new ProjectStoreWorkerBackend({
+      selfUrl: WORKER_URL,
+      executorLeaseMs: 15_000,
+      appendRetryDeadlineMs: 10_000,
+      keyProvider: provider,
+      lifecycleRuntimeFactory: new RecordingLifecycleFactory(runtime),
+    });
+    await enabled.dispatch({ id: "open-unavailable", type: "open", binding: encodeWorkerBinding(enabledContext) });
+    await assert.rejects(enabled.dispatch({
+      id: "unavailable-operation",
+      type: "lifecycle",
+      binding: encodeWorkerBindingAssertion(enabledContext),
+      operation: lifecycleOperationFixture(),
+    }), (error) => {
+      assert.equal(error, unavailable);
+      assert.notEqual((error as LifecycleError).code, "LIFECYCLE_V2_DISABLED");
+      return true;
+    });
+    await enabled.close();
+
+    const semanticOperation = {
+      kind: "semantic",
+      operation: "record-checkpoint",
+      prepared: {},
+    } as unknown as LifecycleWorkerOperationWire;
+    const semanticUnknown: LifecycleWorkerSuccessWire = {
+      operation: "record-checkpoint",
+      nestedContractVersion: 1,
+      result: { kind: "unknown", errorCode: "COMMAND_OUTCOME_UNKNOWN" },
+    };
+    const semanticUnknownContext = await realContext();
+    const semanticUnknownRuntime = new RecordingLifecycleRuntime(semanticUnknown);
+    const semanticUnknownBackend = new ProjectStoreWorkerBackend({
+      selfUrl: WORKER_URL,
+      executorLeaseMs: 15_000,
+      appendRetryDeadlineMs: 10_000,
+      keyProvider: provider,
+      lifecycleRuntimeFactory: new RecordingLifecycleFactory(semanticUnknownRuntime),
+    });
+    await semanticUnknownBackend.dispatch({
+      id: "open-semantic-unknown",
+      type: "open",
+      binding: encodeWorkerBinding(semanticUnknownContext),
+    });
+    assert.equal(await semanticUnknownBackend.dispatch({
+      id: "semantic-unknown",
+      type: "lifecycle",
+      binding: encodeWorkerBindingAssertion(semanticUnknownContext),
+      operation: semanticOperation,
+    }), semanticUnknown);
+    await assert.rejects(
+      semanticUnknownBackend.heartbeat(),
+      backendErrorCode("WORKER_CLOSED"),
+    );
+    await semanticUnknownBackend.close();
+    assert.equal(semanticUnknownRuntime.disposeCalls, 1);
+    const semanticUnknownMoved = `${semanticUnknownContext.binding.storeRoute.eventsPath}.semantic-unknown-closed`;
+    renameSync(semanticUnknownContext.binding.storeRoute.eventsPath, semanticUnknownMoved);
+    renameSync(semanticUnknownMoved, semanticUnknownContext.binding.storeRoute.eventsPath);
+
+    for (const code of ["COMMAND_OUTCOME_UNKNOWN", "OPERATION_OUTCOME_UNKNOWN"] as const) {
+      const thrownUnknownContext = await realContext();
+      const exactUnknown = new LifecycleError(code, {
+        operationId: "77777777-7777-4777-8777-777777777777",
+      });
+      const thrownUnknownRuntime = new RecordingLifecycleRuntime(exactUnknown);
+      const thrownUnknownBackend = new ProjectStoreWorkerBackend({
+        selfUrl: WORKER_URL,
+        executorLeaseMs: 15_000,
+        appendRetryDeadlineMs: 10_000,
+        keyProvider: provider,
+        lifecycleRuntimeFactory: new RecordingLifecycleFactory(thrownUnknownRuntime),
+      });
+      await thrownUnknownBackend.dispatch({
+        id: `open-${code}`,
+        type: "open",
+        binding: encodeWorkerBinding(thrownUnknownContext),
+      });
+      await assert.rejects(thrownUnknownBackend.dispatch({
+        id: `unknown-${code}`,
+        type: "lifecycle",
+        binding: encodeWorkerBindingAssertion(thrownUnknownContext),
+        operation: lifecycleOperationFixture(),
+      }), (error) => {
+        assert.equal(error, exactUnknown);
+        return true;
+      });
+      await assert.rejects(
+        thrownUnknownBackend.heartbeat(),
+        backendErrorCode("WORKER_CLOSED"),
+      );
+      await thrownUnknownBackend.close();
+      assert.equal(thrownUnknownRuntime.disposeCalls, 1);
+      const thrownUnknownMoved = `${thrownUnknownContext.binding.storeRoute.eventsPath}.${code}-closed`;
+      renameSync(thrownUnknownContext.binding.storeRoute.eventsPath, thrownUnknownMoved);
+      renameSync(thrownUnknownMoved, thrownUnknownContext.binding.storeRoute.eventsPath);
+    }
+  });
+
   it("disposes an uncertain append connection before returning exact recovery IDs", async () => {
     const context = await realContext();
     const backend = new ProjectStoreWorkerBackend({
@@ -2750,6 +3623,46 @@ describe("ProjectStoreWorkerBackend open identity", () => {
     const moved = `${context.binding.storeRoute.eventsPath}.child-closed`;
     renameSync(context.binding.storeRoute.eventsPath, moved);
     renameSync(moved, context.binding.storeRoute.eventsPath);
+  });
+
+  it("keeps a broker protocol-failing integrity child tracked until termination proof", async () => {
+    const context = await realContext();
+    const child = new DeferredTerminationWorker();
+    const backend = new ProjectStoreWorkerBackend({
+      selfUrl: WORKER_URL,
+      executorLeaseMs: 15_000,
+      appendRetryDeadlineMs: 10_000,
+      integrityWorkerFactory: () => child,
+    });
+    await backend.dispatch({
+      id: "open-broker-protocol-failure",
+      type: "open",
+      binding: encodeWorkerBinding(context),
+    });
+    const integrity = backend.dispatch({
+      id: "full-broker-protocol-failure",
+      type: "fullIntegrity",
+      binding: encodeWorkerBindingAssertion(context),
+    });
+    child.emit("message", {
+      type: "integrity-provider-request",
+      integrityRequestId: "wrong-integrity-request",
+      providerRequestId: "provider-operation",
+      operation: "status",
+      keyId: "historical-key",
+    });
+    let closeSettled = false;
+    const closing = backend.close().finally(() => { closeSettled = true; });
+    await turn();
+    assert.equal(closeSettled, false);
+    assert.equal(child.terminateCalls, 2);
+    child.termination.resolve(1);
+    await assert.rejects(integrity, (error) => (
+      error instanceof ProjectStoreWorkerBackendError
+      && error.code === "WORKER_PROTOCOL_ERROR"
+      && Object.keys(error.details).length === 0
+    ));
+    await closing;
   });
 
   it("keeps a child tracked and rejects every close retry when termination has no exit proof", async () => {

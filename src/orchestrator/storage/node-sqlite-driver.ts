@@ -1,3 +1,5 @@
+import { lstatSync, realpathSync } from "node:fs";
+import { dirname, isAbsolute, normalize } from "node:path";
 import {
   PROJECT_MEMORY_APPLICATION_ID,
 } from "../runtime/runtime-capabilities.js";
@@ -17,6 +19,35 @@ import {
 type NodeSqliteModule = Pick<typeof import("node:sqlite"), "DatabaseSync">;
 type NativeDatabase = import("node:sqlite").DatabaseSync;
 type NativeStatement = import("node:sqlite").StatementSync;
+
+interface BoundFileIdentity { readonly path: string; readonly device: string; readonly inode: string; }
+const boundConnections = new WeakMap<SqliteConnection, BoundFileIdentity>();
+function bindingFailure(): never { throw new SqliteCapabilityError("SQLite connection file identity is unproven"); }
+function captureBoundFile(path: string): BoundFileIdentity {
+  try {
+    if (typeof path !== "string" || !isAbsolute(path) || normalize(path) !== path || realpathSync.native(path) !== path) bindingFailure();
+    let cursor = path;
+    while (true) {
+      const stat = lstatSync(cursor, { bigint: true });
+      if (stat.isSymbolicLink() || (cursor !== path && !stat.isDirectory())) bindingFailure();
+      const parent = dirname(cursor); if (parent === cursor) break; cursor = parent;
+    }
+    const stat = lstatSync(path, { bigint: true });
+    if (!stat.isFile() || stat.nlink !== 1n) bindingFailure();
+    return Object.freeze({ path, device: String(stat.dev), inode: String(stat.ino) });
+  } catch { bindingFailure(); }
+}
+function assertSameBoundFile(binding: BoundFileIdentity): void {
+  const current = captureBoundFile(binding.path);
+  if (current.device !== binding.device || current.inode !== binding.inode) bindingFailure();
+}
+/** Provenance of an owner-controlled pre/post native-open observation, not SQLite private-fd or ABA attestation. */
+export function assertBoundSqliteConnectionIdentity(connection: SqliteConnection, expectedPath: string,
+  expectedIdentity: { readonly device: string; readonly inode: string }): void {
+  const binding = boundConnections.get(connection);
+  if (!binding || binding.path !== expectedPath || binding.device !== expectedIdentity?.device || binding.inode !== expectedIdentity?.inode) bindingFailure();
+  assertSameBoundFile(binding);
+}
 
 function nativeOptions(
   options: SqliteOpenOptions,
@@ -236,8 +267,19 @@ class NodeSqliteConnection implements SqliteConnection {
   }
 
   close(): void {
+    boundConnections.delete(this);
     this.#database.close();
   }
+}
+
+// Module-owned return path only: an instance's reachable constructor cannot register provenance.
+function validatedConnection(database: NativeDatabase, binding: BoundFileIdentity | undefined): SqliteConnection {
+  const connection = new NodeSqliteConnection(database);
+  if (binding !== undefined) {
+    boundConnections.set(connection, binding);
+    Object.freeze(connection);
+  }
+  return connection;
 }
 
 export class NodeSqliteDriver implements SqliteDriver {
@@ -258,6 +300,7 @@ export class NodeSqliteDriver implements SqliteDriver {
     if (!Number.isSafeInteger(options.busyTimeoutMs) || options.busyTimeoutMs < 0) {
       throw new SqliteCapabilityError("SQLite busy timeout must be a non-negative safe integer");
     }
+    if (options.bindFileIdentity !== undefined && (options.bindFileIdentity !== true || options.mode === "create")) bindingFailure();
 
     if (options.mode === "create") {
       return this.openCreate(path, options);
@@ -278,6 +321,8 @@ export class NodeSqliteDriver implements SqliteDriver {
   }
 
   private openExisting(path: string, options: SqliteOpenOptions): SqliteConnection {
+    // The migration owner must control this pathname throughout synchronous native opening and transactions.
+    const binding = options.bindFileIdentity === true ? captureBoundFile(path) : undefined;
     const readOnlyOptions: SqliteOpenOptions = {
       ...options,
       mode: "read-only-existing",
@@ -285,11 +330,13 @@ export class NodeSqliteDriver implements SqliteDriver {
     let preflight: NativeDatabase | undefined;
     try {
       preflight = new this.#sqlite.DatabaseSync(path, nativeOptions(readOnlyOptions));
+      if (binding !== undefined) assertSameBoundFile(binding);
       configureReadOnlyConnection(preflight, options.busyTimeoutMs);
       verifyProjectIdentity(preflight);
       if (options.mode === "read-only-existing") {
         verifyWal(preflight);
-        return new NodeSqliteConnection(preflight);
+        if (binding !== undefined) assertSameBoundFile(binding);
+        return validatedConnection(preflight, binding);
       }
       preflight.close();
       preflight = undefined;
@@ -301,9 +348,11 @@ export class NodeSqliteDriver implements SqliteDriver {
     let database: NativeDatabase | undefined;
     try {
       database = new this.#sqlite.DatabaseSync(path, nativeOptions(options));
+      if (binding !== undefined) assertSameBoundFile(binding);
       verifyProjectIdentity(database);
       configureWritableConnection(database, options.busyTimeoutMs);
-      return new NodeSqliteConnection(database);
+      if (binding !== undefined) assertSameBoundFile(binding);
+      return validatedConnection(database, binding);
     } catch (error) {
       database?.close();
       throw this.capabilityFailure("SQLite existing-store hardening failed", error);

@@ -1,4 +1,13 @@
+import { decodePreparedGovernedNoteCreateV2, decodePreparedGovernedNoteRecoveryV2, encodePreparedGovernedNoteCreateV2, encodePreparedGovernedNoteRecoveryV2 } from "../governed-notes/codec.js";
+import type { PreparedGovernedNoteCreateV2, PreparedGovernedNoteRecoveryV2, GovernedNoteStoredReceiptV2, GovernedNoteRecoveryResultV2 } from "../governed-notes/contracts.js";
+import { types } from "node:util";
+import { decodePreparedGovernedNoteCreateV1, decodePreparedGovernedNoteRecoveryV1, encodePreparedGovernedNoteCreateV1, encodePreparedGovernedNoteRecoveryV1 } from "../governed-notes/codec.js";
+import type { PreparedGovernedNoteCreateV1, PreparedGovernedNoteRecoveryV1, GovernedNoteStoredReceiptV1, GovernedNoteRecoveryResultV1, GovernedNoteRecoveryIdsV1, GovernedNoteCloseObservationV1 } from "../governed-notes/contracts.js";
+import { assertGovernedNoteEnvelopeSize, isGovernedNoteRequest, sanitizeGovernedNoteError } from "../governed-notes/worker-protocol.js";
 import { randomUUID } from "node:crypto";
+import type { RetainedEvidenceReceiptV1 } from "../privacy/evidence-contracts.js";
+import { encodePreparedRetainedEvidenceCommand, type PreparedRetainedEvidenceCommandV1 } from "../privacy/retained-evidence-worker-protocol.js";
+import { snapshotFreshStartContext, type FreshStartTrustedContext } from "../fresh-start/fresh-start-admission.js";
 import { realpathSync, statSync } from "node:fs";
 import { resolve } from "node:path";
 import { Worker } from "node:worker_threads";
@@ -10,16 +19,55 @@ import type {
 import type { ProjectContext, ProjectId } from "../identity/contracts.js";
 import type { IntegrityReport } from "../integrity/integrity.types.js";
 import type { MaintenanceLease } from "../storage/maintenance-fence.js";
+import type {
+  AuthorityMaterialAdapter,
+  LifecycleExecutionResult,
+  WorkerLifecycleResult,
+} from "../lifecycle/authority/authority-material-adapter.js";
+import type {
+  InternalWorkflowExecutionPlan,
+  LifecycleSemanticCommandDraft,
+  PreparedLifecycleWorkerCommand,
+} from "../lifecycle/contracts/commands.js";
+import type { PendingCommandIdentity } from "../lifecycle/authority/pending-authorization.store.js";
+import {
+  LIFECYCLE_ERROR_CODES,
+  LifecycleError,
+  type LifecycleErrorCode,
+} from "../lifecycle/errors.js";
+import type {
+  LifecycleBoundedMutationForInput,
+  LifecycleBoundedMutationInput,
+  LifecycleBoundedResultFor,
+  LifecycleFencedInput,
+  LifecycleFencedOperationForInput,
+  LifecycleFencedOperationWire,
+  LifecycleFencedResultFor,
+  LifecycleInternalResultFor,
+  LifecycleQueryForInput,
+  LifecycleQueryInput,
+  LifecycleQueryResultFor,
+  LifecycleResultFor,
+  LifecycleSemanticOperationWire,
+} from "./lifecycle-worker-protocol.js";
+import {
+  decodeLifecycleWorkerOperationWire,
+  type LifecycleWorkerOperationWire,
+  type LifecycleWorkerSuccessWire,
+} from "./lifecycle-worker-protocol.js";
+import type { LifecycleFaultInjector } from "../lifecycle/lifecycle-faults.js";
 import {
   decodeAppendResultWire,
   decodeIntegrityReport,
   decodeMaintenanceLeaseWire,
+  decodeWorkerRequest,
   decodeWorkerMessage,
   decodeWorkerResponseForRequest,
   encodeAppendCommandWire,
   encodeMaintenanceLeaseWire,
   encodeWorkerBinding,
   encodeWorkerBindingAssertion,
+  encodeFreshStartContextWire,
   type WorkerMessage,
   type WorkerNotification,
   type WorkerOpenResult,
@@ -51,8 +99,17 @@ const MAINTENANCE_CONFIRMATION_CODES = new Set([
   "EXECUTOR_LEASE_INVALID",
   "EXECUTOR_LEASE_NOT_ACTIVE",
 ]);
+const DEFINITIVE_LIFECYCLE_ERROR_CODES = new Set<string>(
+  LIFECYCLE_ERROR_CODES.filter((code) => (
+    code !== "COMMAND_OUTCOME_UNKNOWN"
+    && code !== "OPERATION_OUTCOME_UNKNOWN"
+    && code !== "WORKER_PROTOCOL_ERROR"
+  )),
+);
 
 export interface ProjectStoreExecutorOptions {
+  /** Trusted composition only; never copied from public tool parameters. */
+  freshStart?: FreshStartTrustedContext;
   workerUrl: URL;
   context: ProjectContext;
   maxPending: number;
@@ -83,17 +140,19 @@ export interface ExecutorScheduler {
 }
 
 export interface ProjectStoreExecutorDependencies {
-  workerFactory: WorkerFactory;
-  scheduler: ExecutorScheduler;
-  randomId: () => string;
+  readonly workerFactory: WorkerFactory;
+  readonly scheduler: ExecutorScheduler;
+  readonly randomId: () => string;
   /**
    * Runs only after the store worker has exited. The implementation must use
    * the maintenance owner's already-open connection; it must not create a
    * short-lived publisher connection that would need to confirm its own close.
    */
-  confirmMaintenanceClosure: (
+  readonly confirmMaintenanceClosure: (
     confirmation: MaintenanceClosureConfirmation,
   ) => void | Promise<void>;
+  readonly authorityMaterialAdapter?: AuthorityMaterialAdapter;
+  readonly lifecycleFaultInjector?: LifecycleFaultInjector;
 }
 
 export interface MaintenanceClosureConfirmation {
@@ -136,6 +195,33 @@ function safeDetails(value: unknown): Record<string, JsonValue> {
   return result;
 }
 
+function assertDecodedLifecycleContextBinding(
+  value: JsonValue,
+  context: ProjectContext,
+): void {
+  if (value === null || typeof value !== "object") return;
+  const expected: Readonly<Record<string, string>> = {
+    projectId: context.binding.projectId,
+    vaultId: context.binding.vaultId,
+    storeId: context.binding.storeId,
+    workspaceId: context.binding.workspaceId,
+    clientNamespace: context.binding.clientNamespace,
+  };
+  for (const key of Reflect.ownKeys(value)) {
+    if (typeof key !== "string") continue;
+    const descriptor = Reflect.getOwnPropertyDescriptor(value, key);
+    if (
+      descriptor === undefined
+      || !descriptor.enumerable
+      || !("value" in descriptor)
+    ) continue;
+    if (Object.hasOwn(expected, key) && descriptor.value !== expected[key]) {
+      throw new ProjectStoreWorkerError("WORKER_PROTOCOL_ERROR");
+    }
+    assertDecodedLifecycleContextBinding(descriptor.value as JsonValue, context);
+  }
+}
+
 export class ProjectStoreWorkerError extends Error {
   constructor(
     readonly code: string,
@@ -146,13 +232,183 @@ export class ProjectStoreWorkerError extends Error {
   }
 }
 
-type RequestKind = "read" | "mutation" | "lifecycle";
+type RequestKind = "read" | "mutation" | "bounded" | "operational" | "control";
+
+type PendingLifecycleIdentity =
+  | {
+      readonly kind: "semantic";
+      readonly projectId: ProjectId;
+      readonly commandId: string;
+      readonly idempotencyKey: string;
+    }
+  | {
+      readonly kind: "bounded";
+      readonly operationId: string;
+      readonly requestId: string;
+    }
+  | {
+      readonly kind: "operational";
+      readonly work: JsonValue;
+    };
+type SemanticPendingIdentity = Extract<PendingLifecycleIdentity, { readonly kind: "semantic" }>;
+
+type ExactInput<I, Shape> = I & Record<Exclude<keyof I, keyof Shape>, never>;
+type ExactBoundedInput<I extends LifecycleBoundedMutationInput> = ExactInput<
+  I,
+  Extract<LifecycleBoundedMutationInput, { readonly operation: I["operation"] }>
+>;
+type ExactQueryInput<I extends LifecycleQueryInput> = ExactInput<
+  I,
+  Extract<LifecycleQueryInput, { readonly operation: I["operation"] }>
+>;
+type ExactFencedInput<I extends LifecycleFencedInput> = ExactInput<
+  I,
+  Extract<LifecycleFencedInput, { readonly operation: I["operation"] }>
+>;
+
+function semanticIdentity(
+  projectId: ProjectId,
+  commandId: string,
+  idempotencyKey: string,
+): SemanticPendingIdentity {
+  return Object.freeze({
+    kind: "semantic" as const,
+    projectId,
+    commandId,
+    idempotencyKey,
+  });
+}
+
+function pendingCommandIdentity(identity: SemanticPendingIdentity): PendingCommandIdentity {
+  return Object.freeze({
+    projectId: identity.projectId,
+    commandId: identity.commandId,
+    idempotencyKey: identity.idempotencyKey,
+  });
+}
+
+function boundedIdentity(
+  operationId: string,
+  requestId: string,
+): PendingLifecycleIdentity {
+  return Object.freeze({ kind: "bounded" as const, operationId, requestId });
+}
+
+function operationalIdentity(
+  projectId: ProjectId,
+  wire: LifecycleFencedOperationWire,
+): PendingLifecycleIdentity {
+  const input = wire.input as unknown as Readonly<Record<string, JsonValue>>;
+  let work: JsonValue;
+  switch (wire.operation) {
+    case "workflow-claim-next":
+      work = Object.freeze({
+        kind: "workflow-selection",
+        projectId,
+        workId: input.workId,
+        operation: "claim-next",
+        ownerId: input.ownerId,
+      });
+      break;
+    case "outbox-claim-next":
+      work = Object.freeze({
+        kind: "outbox-selection",
+        projectId,
+        workId: input.workId,
+        operation: "claim-next",
+        ownerId: input.ownerId,
+      });
+      break;
+    case "workflow-recovery":
+      work = Object.freeze({
+        kind: "workflow-recovery",
+        projectId,
+        workId: input.workId,
+        operation: "recovery",
+        ownerId: input.ownerId,
+        claimToken: input.fencingToken,
+      });
+      break;
+    case "workflow-claim":
+    case "workflow-renew":
+    case "workflow-release":
+    case "workflow-eventless-phase": {
+      const operation = {
+        "workflow-claim": "claim",
+        "workflow-renew": "renew",
+        "workflow-release": "release",
+        "workflow-eventless-phase": "advance-eventless",
+      }[wire.operation];
+      work = Object.freeze({
+        kind: "workflow",
+        projectId,
+        workflowId: input.workflowId,
+        workflowGeneration: String(input.workflowGeneration),
+        operation,
+        ownerId: input.ownerId,
+        claimToken: input.fencingToken,
+      });
+      break;
+    }
+    case "outbox-claim":
+    case "outbox-renew":
+    case "outbox-materialize":
+    case "outbox-failure": {
+      const operation = {
+        "outbox-claim": "claim",
+        "outbox-renew": "renew",
+        "outbox-materialize": "materialize",
+        "outbox-failure": "record-failure",
+      }[wire.operation];
+      work = Object.freeze({
+        kind: "outbox",
+        projectId,
+        targetKey: input.targetKey,
+        materializationRevision: input.materializationRevision,
+        operation,
+        ownerId: input.ownerId,
+        claimToken: input.fencingToken,
+      });
+      break;
+    }
+  }
+  return Object.freeze({ kind: "operational" as const, work });
+}
+
+function identityOutcomeUnknown(identity: PendingLifecycleIdentity): ProjectStoreWorkerError {
+  switch (identity.kind) {
+    case "semantic":
+      return new ProjectStoreWorkerError("COMMAND_OUTCOME_UNKNOWN", Object.freeze({
+        commandId: identity.commandId,
+        idempotencyKey: identity.idempotencyKey,
+      }));
+    case "bounded":
+      return new ProjectStoreWorkerError("OPERATION_OUTCOME_UNKNOWN", Object.freeze({
+        operationId: identity.operationId,
+        requestId: identity.requestId,
+      }));
+    case "operational":
+      return new ProjectStoreWorkerError("OPERATION_OUTCOME_UNKNOWN", Object.freeze({
+        work: identity.work,
+      }));
+  }
+}
+
+function faultWorkId(identity: PendingLifecycleIdentity | null): string | null {
+  if (identity === null || identity.kind !== "operational") return null;
+  if (typeof identity.work !== "object" || identity.work === null || Array.isArray(identity.work)) {
+    return null;
+  }
+  const workId = (identity.work as Readonly<Record<string, unknown>>).workId;
+  return typeof workId === "string" ? workId : null;
+}
 
 interface PendingRequest {
-  request: WorkerRequest;
-  kind: RequestKind;
-  timer: object;
-  mutationIdentity?: { commandId: string; idempotencyKey: string };
+  readonly request: WorkerRequest;
+  readonly kind: RequestKind;
+  readonly identity: PendingLifecycleIdentity | null;
+  readonly timer: object;
+  posted: boolean;
   resolve(value: unknown): void;
   reject(error: ProjectStoreWorkerError): void;
 }
@@ -291,12 +547,17 @@ export class ProjectStoreExecutor {
   #opened: WorkerOpenResult | null = null;
   #sequence = 0;
   #closePromise: Promise<void> | null = null;
+  readonly #governedOwnerId: string;
+  #governedClosePromise: Promise<GovernedNoteCloseObservationV1> | null = null;
+  #governedCloseDisqualified = false;
+  #normalCloseCompleted = false;
   #quiescePromise: Promise<void> | null = null;
   #openPromise: Promise<WorkerOpenResult> | null = null;
   #terminationPromise: Promise<void> | null = null;
   #expectedTermination = false;
   #explicitMaintenanceLease: MaintenanceLease | null = null;
   #quiescedNotification: WorkerNotification | null = null;
+  #observedClosurePromise: Promise<void> | null = null;
   readonly #workerExit: Promise<number>;
   #resolveWorkerExit!: (exitCode: number) => void;
   readonly #poisonedSignal: Promise<ProjectStoreWorkerError>;
@@ -307,7 +568,8 @@ export class ProjectStoreExecutor {
     dependencies: Partial<ProjectStoreExecutorDependencies> = {},
   ) {
     validateOptions(options);
-    this.#options = options;
+    this.#governedOwnerId = randomUUID();
+    this.#options = Object.freeze({ ...options, ...(options.freshStart === undefined ? {} : { freshStart: snapshotFreshStartContext(options.freshStart) }) });
     this.#dependencies = {
       workerFactory: dependencies.workerFactory ?? defaultWorkerFactory,
       scheduler: dependencies.scheduler ?? DEFAULT_SCHEDULER,
@@ -316,6 +578,12 @@ export class ProjectStoreExecutor {
         ?? (() => {
           throw new ProjectStoreWorkerError("MAINTENANCE_CONFIRMATION_REQUIRED");
         }),
+      ...(dependencies.authorityMaterialAdapter === undefined
+        ? {}
+        : { authorityMaterialAdapter: dependencies.authorityMaterialAdapter }),
+      ...(dependencies.lifecycleFaultInjector === undefined
+        ? {}
+        : { lifecycleFaultInjector: dependencies.lifecycleFaultInjector }),
     };
     this.#workerExit = new Promise<number>((resolveExit) => {
       this.#resolveWorkerExit = resolveExit;
@@ -353,7 +621,8 @@ export class ProjectStoreExecutor {
         id: "",
         type: "open",
         binding: encodeWorkerBinding(this.#options.context),
-      }, "lifecycle") as WorkerOpenResult;
+        ...(this.#options.freshStart === undefined ? {} : { freshStart: encodeFreshStartContextWire(this.#options.freshStart) }),
+      }, "control") as WorkerOpenResult;
       const authorityError = openAuthorityError(this.#options.context, result);
       if (authorityError !== null) {
         await this.poison(authorityError);
@@ -375,10 +644,233 @@ export class ProjectStoreExecutor {
       type: "append",
       binding,
       command: encodeAppendCommandWire(command),
-    }, "mutation", {
-      commandId: command.commandId,
-      idempotencyKey: command.idempotencyKey,
-    }).then((value) => decodeAppendResultWire(value) as AppendResult<T>);
+    }, "mutation", semanticIdentity(
+      this.#options.context.binding.projectId,
+      command.commandId,
+      command.idempotencyKey,
+    )).then((value) => decodeAppendResultWire(value) as AppendResult<T>);
+  }
+
+  retainEvidence(prepared: PreparedRetainedEvidenceCommandV1): Promise<AppendResult<RetainedEvidenceReceiptV1>> {
+    this.assertCallable(["open"]);
+    const wire = encodePreparedRetainedEvidenceCommand(prepared);
+    return this.request({ id: "", type: "retained-evidence", binding: encodeWorkerBindingAssertion(this.#options.context), prepared: wire },
+      "mutation", semanticIdentity(this.#options.context.binding.projectId, prepared.command.commandId, prepared.command.idempotencyKey))
+      .then(value => decodeAppendResultWire(value) as AppendResult<RetainedEvidenceReceiptV1>);
+  }
+
+  async createGovernedNote(prepared: PreparedGovernedNoteCreateV1): Promise<AppendResult<GovernedNoteStoredReceiptV1>> {
+    let ids: GovernedNoteRecoveryIdsV1 | null = null;
+    try {
+      const wire = encodePreparedGovernedNoteCreateV1(prepared);
+      const owned = decodePreparedGovernedNoteCreateV1(wire);
+      ids = { commandId: owned.command.commandId, idempotencyKey: owned.command.idempotencyKey };
+      this.assertCallable(["open"]);
+      const result = await this.request({ id: "", type: "governed-note-create", binding: encodeWorkerBindingAssertion(this.#options.context), prepared: wire },
+        "mutation", semanticIdentity(this.#options.context.binding.projectId, ids.commandId, ids.idempotencyKey));
+      return decodeAppendResultWire(result) as AppendResult<GovernedNoteStoredReceiptV1>;
+    } catch (error) { throw sanitizeGovernedNoteError(error, ids); }
+  }
+
+  async recoverGovernedNoteResult(prepared: PreparedGovernedNoteRecoveryV1): Promise<GovernedNoteRecoveryResultV1> {
+    let ids: GovernedNoteRecoveryIdsV1 | null = null;
+    try {
+      const wire = encodePreparedGovernedNoteRecoveryV1(prepared);
+      const owned = decodePreparedGovernedNoteRecoveryV1(wire);
+      ids = { commandId: owned.request.commandId, idempotencyKey: owned.request.idempotencyKey };
+      this.assertCallable(["open"]);
+      return await this.request({ id: "", type: "governed-note-recover", binding: encodeWorkerBindingAssertion(this.#options.context), prepared: wire },
+        "bounded", null) as GovernedNoteRecoveryResultV1;
+    } catch (error) { throw sanitizeGovernedNoteError(error, ids); }
+  }
+
+  async createGovernedNoteV2(prepared: PreparedGovernedNoteCreateV2): Promise<AppendResult<GovernedNoteStoredReceiptV2>> {
+    let ids: GovernedNoteRecoveryIdsV1 | null = null;
+    try {
+      const wire = encodePreparedGovernedNoteCreateV2(prepared);
+      const owned = decodePreparedGovernedNoteCreateV2(wire);
+      ids = { commandId: owned.command.commandId, idempotencyKey: owned.command.idempotencyKey };
+      this.assertCallable(["open"]);
+      const result = await this.request({ id: "", type: "governed-note-create", binding: encodeWorkerBindingAssertion(this.#options.context), prepared: wire },
+        "mutation", semanticIdentity(this.#options.context.binding.projectId, ids.commandId, ids.idempotencyKey));
+      return decodeAppendResultWire(result) as AppendResult<GovernedNoteStoredReceiptV2>;
+    } catch (error) { throw sanitizeGovernedNoteError(error, ids); }
+  }
+
+  async recoverGovernedNoteResultV2(prepared: PreparedGovernedNoteRecoveryV2): Promise<GovernedNoteRecoveryResultV2> {
+    let ids: GovernedNoteRecoveryIdsV1 | null = null;
+    try {
+      const wire = encodePreparedGovernedNoteRecoveryV2(prepared);
+      const owned = decodePreparedGovernedNoteRecoveryV2(wire);
+      ids = { commandId: owned.request.commandId, idempotencyKey: owned.request.idempotencyKey };
+      this.assertCallable(["open"]);
+      return await this.request({ id: "", type: "governed-note-recover", binding: encodeWorkerBindingAssertion(this.#options.context), prepared: wire },
+        "bounded", null) as GovernedNoteRecoveryResultV2;
+    } catch (error) { throw sanitizeGovernedNoteError(error, ids); }
+  }
+
+  executeLifecycleMutation<C extends LifecycleSemanticCommandDraft>(
+    command: PreparedLifecycleWorkerCommand<C>,
+  ): Promise<LifecycleExecutionResult<LifecycleResultFor<C>>> {
+    this.assertCallable(["open"]);
+    const adapter = this.#dependencies.authorityMaterialAdapter;
+    if (adapter === undefined) throw new ProjectStoreWorkerError("LIFECYCLE_V2_DISABLED");
+    const wire = decodeLifecycleWorkerOperationWire({
+      kind: "semantic",
+      operation: command.command.commandType,
+      prepared: command,
+    });
+    if (wire.kind !== "semantic") throw new ProjectStoreWorkerError("WORKER_PROTOCOL_ERROR");
+    const identity = semanticIdentity(
+      this.#options.context.binding.projectId,
+      wire.prepared.command.commandId,
+      wire.prepared.command.idempotencyKey,
+    );
+    return this.executeExternalLifecycle<C>(
+      wire as LifecycleSemanticOperationWire<C>,
+      identity,
+      adapter,
+    );
+  }
+
+  executeLifecycleInternalMutation<I extends InternalWorkflowExecutionPlan>(
+    plan: I,
+  ): Promise<LifecycleInternalResultFor<I>> {
+    this.assertCallable(["open"]);
+    const wire = decodeLifecycleWorkerOperationWire({
+      kind: "internal-semantic",
+      operation: plan.commandType,
+      command: plan,
+    });
+    if (wire.kind !== "internal-semantic") {
+      throw new ProjectStoreWorkerError("WORKER_PROTOCOL_ERROR");
+    }
+    const identity = semanticIdentity(
+      this.#options.context.binding.projectId,
+      wire.command.commandId,
+      wire.command.idempotencyKey,
+    );
+    return this.requestLifecycleResult(wire, "mutation", identity) as Promise<
+      LifecycleInternalResultFor<I>
+    >;
+  }
+
+  executeLifecycleBounded<I extends LifecycleBoundedMutationInput>(
+    operation: ExactBoundedInput<I>,
+  ): Promise<LifecycleBoundedResultFor<LifecycleBoundedMutationForInput<I>>> {
+    this.assertCallable(["open"]);
+    const wire = decodeLifecycleWorkerOperationWire({
+      kind: "bounded",
+      operation: operation.operation,
+      input: operation,
+    });
+    if (wire.kind !== "bounded") throw new ProjectStoreWorkerError("WORKER_PROTOCOL_ERROR");
+    const identity = boundedIdentity(wire.input.operationId, wire.input.requestId);
+    return this.requestLifecycleResult(wire, "bounded", identity) as unknown as Promise<
+      LifecycleBoundedResultFor<LifecycleBoundedMutationForInput<I>>
+    >;
+  }
+
+  queryLifecycle<I extends LifecycleQueryInput>(
+    query: ExactQueryInput<I>,
+  ): Promise<LifecycleQueryResultFor<LifecycleQueryForInput<I>>> {
+    this.assertCallable(["open"]);
+    const wire = decodeLifecycleWorkerOperationWire({
+      kind: "query",
+      operation: query.operation,
+      input: query,
+    });
+    if (wire.kind !== "query") throw new ProjectStoreWorkerError("WORKER_PROTOCOL_ERROR");
+    return this.requestLifecycleResult(wire, "read", null) as unknown as Promise<
+      LifecycleQueryResultFor<LifecycleQueryForInput<I>>
+    >;
+  }
+
+  executeLifecycleFenced<I extends LifecycleFencedInput>(
+    operation: ExactFencedInput<I>,
+  ): Promise<LifecycleFencedResultFor<LifecycleFencedOperationForInput<I>>> {
+    this.assertCallable(["open"]);
+    const wire = decodeLifecycleWorkerOperationWire({
+      kind: "fenced",
+      operation: operation.operation,
+      input: operation,
+    });
+    if (wire.kind !== "fenced") throw new ProjectStoreWorkerError("WORKER_PROTOCOL_ERROR");
+    const identity = operationalIdentity(this.#options.context.binding.projectId, wire);
+    return this.requestLifecycleResult(wire, "operational", identity) as Promise<
+      LifecycleFencedResultFor<LifecycleFencedOperationForInput<I>>
+    >;
+  }
+
+  private requestLifecycleResult(
+    operation: LifecycleWorkerOperationWire,
+    kind: RequestKind,
+    identity: PendingLifecycleIdentity | null,
+  ): Promise<JsonValue> {
+    return this.request({
+      id: "",
+      type: "lifecycle",
+      binding: encodeWorkerBindingAssertion(this.#options.context),
+      operation,
+    }, kind, identity).then((value) => (value as LifecycleWorkerSuccessWire).result);
+  }
+
+  private async executeExternalLifecycle<C extends LifecycleSemanticCommandDraft>(
+    operation: LifecycleSemanticOperationWire<C>,
+    identity: SemanticPendingIdentity,
+    adapter: AuthorityMaterialAdapter,
+  ): Promise<LifecycleExecutionResult<LifecycleResultFor<C>>> {
+    const completionIdentity = pendingCommandIdentity(identity);
+    let result: WorkerLifecycleResult<LifecycleResultFor<C>>;
+    try {
+      result = await this.requestLifecycleResult(
+        operation,
+        "mutation",
+        identity,
+      ) as WorkerLifecycleResult<LifecycleResultFor<C>>;
+    } catch (error) {
+      if (
+        error instanceof ProjectStoreWorkerError
+        && DEFINITIVE_LIFECYCLE_ERROR_CODES.has(error.code)
+      ) {
+        return adapter.complete(completionIdentity, Object.freeze({
+          kind: "rejected" as const,
+          errorCode: error.code as Exclude<
+            LifecycleErrorCode,
+            "COMMAND_OUTCOME_UNKNOWN" | "OPERATION_OUTCOME_UNKNOWN"
+          >,
+        }));
+      }
+      throw error;
+    }
+    let responseDeliveryFault = false;
+    try {
+      return await adapter.complete(completionIdentity, result, {
+        afterAuthorityDeliveryBeforePendingDelete: () => {
+          try {
+            this.#invokeResponseDeliveryFault(identity);
+          } catch (error) {
+            responseDeliveryFault = true;
+            throw error;
+          }
+        },
+      });
+    } catch (error) {
+      if (responseDeliveryFault) {
+        const exactUnknown = identityOutcomeUnknown(identity);
+        await this.poison(exactUnknown);
+        throw exactUnknown;
+      }
+      if (
+        error instanceof LifecycleError
+        && (error.code === "COMMAND_OUTCOME_UNKNOWN" || error.code === "OPERATION_OUTCOME_UNKNOWN")
+      ) {
+        const exactUnknown = identityOutcomeUnknown(identity);
+        await this.poison(exactUnknown);
+        throw exactUnknown;
+      }
+      throw error;
+    }
   }
 
   quickIntegrity(tailLimit = 256): Promise<IntegrityReport> {
@@ -427,14 +919,7 @@ export class ProjectStoreExecutor {
   }
 
   quiesce(lease: MaintenanceLease): Promise<void> {
-    try {
-      this.assertCallable(["open"]);
-      if (this.#explicitMaintenanceLease !== null) {
-        throw new ProjectStoreWorkerError("MAINTENANCE_QUIESCING");
-      }
-    } catch (error) {
-      return Promise.reject(error);
-    }
+    this.#governedCloseDisqualified = true;
     let encodedLease: ReturnType<typeof encodeMaintenanceLeaseWire>;
     let expectedLease: MaintenanceLease;
     try {
@@ -442,11 +927,45 @@ export class ProjectStoreExecutor {
       expectedLease = decodeMaintenanceLeaseWire(encodedLease);
     } catch {
       const failure = new ProjectStoreWorkerError("WORKER_PROTOCOL_ERROR");
-      this.#quiescePromise = (async () => {
+      this.#quiescePromise ??= (async () => {
         await this.poison(failure);
         throw failure;
       })();
       return this.#quiescePromise;
+    }
+    if (this.#quiescePromise !== null) {
+      if (
+        this.#explicitMaintenanceLease !== null
+        && sameMaintenanceLease(this.#explicitMaintenanceLease, expectedLease)
+      ) {
+        return this.#quiescePromise;
+      }
+      return Promise.reject(new ProjectStoreWorkerError("MAINTENANCE_QUIESCING"));
+    }
+    if (this.#quiescedNotification !== null) {
+      const observedLease = decodeMaintenanceLeaseWire({
+        epoch: this.#quiescedNotification.epoch,
+        fencingToken: this.#quiescedNotification.fencingToken,
+        ownerId: this.#quiescedNotification.ownerId,
+        leaseExpiresAt: this.#quiescedNotification.leaseExpiresAt,
+      });
+      if (!sameMaintenanceLease(observedLease, expectedLease)) {
+        return Promise.reject(new ProjectStoreWorkerError("MAINTENANCE_QUIESCING"));
+      }
+      const observed = this.#observedClosurePromise ?? Promise.resolve();
+      return observed.then(() => {
+        if (this.#state !== "quiesced") {
+          throw this.#terminalError ?? new ProjectStoreWorkerError("WORKER_CLOSED");
+        }
+      });
+    }
+    try {
+      this.assertCallable(["open"]);
+      if (this.#explicitMaintenanceLease !== null) {
+        throw new ProjectStoreWorkerError("MAINTENANCE_QUIESCING");
+      }
+    } catch (error) {
+      return Promise.reject(error);
     }
     this.#explicitMaintenanceLease = expectedLease;
     this.#expectedTermination = true;
@@ -465,7 +984,7 @@ export class ProjectStoreExecutor {
         type: "quiesce",
         binding: encodeWorkerBindingAssertion(this.#options.context),
         lease: encodedLease,
-      }, "lifecycle") as { quiesced: true; epoch: string; connectionClosed: true };
+      }, "control") as { quiesced: true; epoch: string; connectionClosed: true };
       if (response.epoch !== expectedLease.epoch.toString()) {
         requestError = new ProjectStoreWorkerError("WORKER_PROTOCOL_ERROR");
       }
@@ -540,6 +1059,7 @@ export class ProjectStoreExecutor {
       ownerError = confirmationError(error);
     }
     if (ownerError !== null) {
+      this.#governedCloseDisqualified = true;
       this.#state = "poisoned";
       this.#terminalError = ownerError;
       this.rejectAll(ownerError);
@@ -563,6 +1083,40 @@ export class ProjectStoreExecutor {
     this.#state = "closing";
     this.#closePromise = this.closeOwned();
     return this.#closePromise;
+  }
+
+  closeForGovernedNoteController(): Promise<GovernedNoteCloseObservationV1> {
+    this.#governedClosePromise ??= this.observeGovernedNoteClose();
+    return this.#governedClosePromise;
+  }
+
+  private async observeGovernedNoteClose(): Promise<GovernedNoteCloseObservationV1> {
+    let failed = false;
+    try {
+      await this.close();
+    } catch {
+      this.#governedCloseDisqualified = true;
+      failed = true;
+    }
+    // Generic close can resolve after an expected exit while termination still
+    // waits. Join existing operations even after failure; never start a second
+    // lifecycle operation or impose another termination deadline.
+    for (const operation of [this.#quiescePromise, this.#observedClosurePromise, this.#terminationPromise]) {
+      try {
+        await operation;
+      } catch {
+        this.#governedCloseDisqualified = true;
+        failed = true;
+      }
+    }
+    if (failed || (this.#observedClosurePromise !== null && this.#state === "poisoned")) {
+      throw new ProjectStoreWorkerError("WORKER_UNAVAILABLE");
+    }
+    return Object.freeze({
+      disposition: this.#normalCloseCompleted && !this.#governedCloseDisqualified
+        ? "graceful-confirmed" : "ownership-uncertain",
+      ownerId: this.#governedOwnerId,
+    });
   }
 
   async invalidateForRebind(next: ProjectContext): Promise<void> {
@@ -589,13 +1143,16 @@ export class ProjectStoreExecutor {
   private request(
     request: WorkerRequest,
     kind: RequestKind,
-    mutationIdentity?: { commandId: string; idempotencyKey: string },
+    identity: PendingLifecycleIdentity | null = null,
   ): Promise<unknown> {
     if (this.#pending.size >= this.#options.maxPending) {
       return Promise.reject(new ProjectStoreWorkerError("STORE_QUEUE_FULL"));
     }
     const id = `${this.#dependencies.randomId()}:${++this.#sequence}`;
-    const completeRequest = { ...request, id } as WorkerRequest;
+    const candidate = { ...request, id } as WorkerRequest;
+    const completeRequest = candidate.type === "lifecycle" || candidate.type === "retained-evidence" || isGovernedNoteRequest(candidate)
+      ? decodeWorkerRequest(candidate)
+      : candidate;
     return new Promise<unknown>((resolveRequest, rejectRequest) => {
       const timer = this.#dependencies.scheduler.setTimeout(() => {
         this.poisonInBackground(new ProjectStoreWorkerError("WORKER_TIMEOUT"));
@@ -603,14 +1160,16 @@ export class ProjectStoreExecutor {
       const pending: PendingRequest = {
         request: completeRequest,
         kind,
+        identity,
         timer,
-        mutationIdentity,
+        posted: false,
         resolve: resolveRequest,
         reject: rejectRequest,
       };
       this.#pending.set(id, pending);
       try {
         this.#worker.postMessage(completeRequest);
+        pending.posted = true;
       } catch {
         this.#pending.delete(id);
         this.#dependencies.scheduler.clearTimeout(timer);
@@ -624,7 +1183,14 @@ export class ProjectStoreExecutor {
   private onMessage(value: unknown): void {
     let message: WorkerMessage;
     try {
-      message = decodeWorkerMessage(value);
+      // Known governed responses are bounded while still raw, including errors and
+      // malformed data that would otherwise enter a generic decoder first.
+      if (types.isProxy(value)) throw new ProjectStoreWorkerError("WORKER_PROTOCOL_ERROR");
+      const id = typeof value === "object" && value !== null ? Object.getOwnPropertyDescriptor(value, "id")?.value as unknown : undefined;
+      const expected = typeof id === "string" ? this.#pending.get(id)?.request : undefined;
+      if (typeof id === "string" && expected === undefined) throw new ProjectStoreWorkerError("WORKER_PROTOCOL_ERROR");
+      if (expected && isGovernedNoteRequest(expected)) assertGovernedNoteEnvelopeSize(value);
+      message = decodeWorkerMessage(value, expected);
     } catch {
       this.poisonInBackground(new ProjectStoreWorkerError("WORKER_PROTOCOL_ERROR"));
       return;
@@ -640,7 +1206,20 @@ export class ProjectStoreExecutor {
     }
     let response: WorkerResponse;
     try {
-      response = decodeWorkerResponseForRequest(message, pending.request);
+      response = decodeWorkerResponseForRequest(value, pending.request);
+      if (response.ok && isGovernedNoteRequest(pending.request)) {
+        assertDecodedLifecycleContextBinding(response.data as unknown as JsonValue, this.#options.context);
+        const data = response.data as { response?: GovernedNoteStoredReceiptV1; receipt?: GovernedNoteStoredReceiptV1 };
+        const scope = (data.response ?? data.receipt)?.scope;
+        const context = this.#options.context;
+        if (scope && (scope.branchRef !== (context.workspace.kind === "git" ? context.workspace.branchRef : null)
+          || (context.branchScopeId !== undefined && scope.branchScopeId !== context.branchScopeId)
+          || (context.workspace.kind !== "git" && scope.branchScopeId !== null))) throw new ProjectStoreWorkerError("WORKER_PROTOCOL_ERROR");
+      }
+      if (response.ok && pending.request.type === "lifecycle") {
+        const success = response.data as LifecycleWorkerSuccessWire;
+        assertDecodedLifecycleContextBinding(success.result, this.#options.context);
+      }
     } catch {
       this.poisonInBackground(new ProjectStoreWorkerError("WORKER_PROTOCOL_ERROR"));
       return;
@@ -652,24 +1231,58 @@ export class ProjectStoreExecutor {
         response.error.code,
         safeDetails(response.error.details),
       );
-      const exactUnknown = reported.code === "COMMAND_OUTCOME_UNKNOWN"
+      const uncertain = reported.code === "COMMAND_OUTCOME_UNKNOWN"
+        || reported.code === "OPERATION_OUTCOME_UNKNOWN"
+        || reported.code === "WORKER_PROTOCOL_ERROR"
+        || (isGovernedNoteRequest(pending.request) && (reported.code === "GOVERNED_NOTE_OWNERSHIP_UNCERTAIN"
+          || (pending.request.type === "governed-note-create" && reported.code === "INTEGRITY_FAILURE")));
+      const exactUnknown = uncertain
         ? this.unknownOutcome(pending)
         : null;
-      const error = reported.code === "COMMAND_OUTCOME_UNKNOWN"
+      const error = uncertain
         ? exactUnknown ?? new ProjectStoreWorkerError("WORKER_PROTOCOL_ERROR")
         : reported;
       pending.reject(error);
       if (
         pending.request.type === "open"
         || ASSERTION_FAILURES.has(error.code)
-        || reported.code === "COMMAND_OUTCOME_UNKNOWN"
+        || uncertain
       ) {
         this.poisonInBackground(error);
       }
     } else {
+      try {
+        if (pending.identity?.kind !== "semantic" || pending.request.type === "retained-evidence" || pending.request.type === "governed-note-create") {
+          this.#invokeResponseDeliveryFault(pending.identity);
+        }
+      } catch {
+        const error = this.unknownOutcome(pending)
+          ?? new ProjectStoreWorkerError("WORKER_PROTOCOL_ERROR");
+        pending.reject(error);
+        this.poisonInBackground(error);
+        this.notifyDrain();
+        return;
+      }
       pending.resolve(response.data);
     }
     this.notifyDrain();
+  }
+
+  #invokeResponseDeliveryFault(identity: PendingLifecycleIdentity | null): void {
+    this.#dependencies.lifecycleFaultInjector?.hit(
+      "response-delivery",
+      "after-commit-before-response",
+      Object.freeze({
+        projectId: this.#options.context.binding.projectId,
+        sessionId: null,
+        workflowId: null,
+        commandId: identity?.kind === "semantic" ? identity.commandId : null,
+        idempotencyKeyHash: null,
+        workId: faultWorkId(identity),
+        eventPosition: null,
+        materializationRevision: null,
+      }),
+    );
   }
 
   private onNotification(notification: WorkerNotification): void {
@@ -699,6 +1312,7 @@ export class ProjectStoreExecutor {
       this.poisonInBackground(new ProjectStoreWorkerError("WORKER_PROTOCOL_ERROR"));
       return;
     }
+    this.#governedCloseDisqualified = true;
     this.#quiescedNotification = notification;
     this.#expectedTermination = true;
   }
@@ -707,6 +1321,7 @@ export class ProjectStoreExecutor {
     this.#resolveWorkerExit(exitCode);
     if (this.#expectedTermination) {
       if (this.#pending.size > 0) {
+        this.#governedCloseDisqualified = true;
         const failure = new ProjectStoreWorkerError("WORKER_UNAVAILABLE", {
           abnormalExit: exitCode !== 0,
         });
@@ -717,7 +1332,10 @@ export class ProjectStoreExecutor {
       if (this.#state === "poisoned" || this.#terminalError !== null) return;
       this.#state = "closed";
       if (this.#explicitMaintenanceLease === null && this.#quiescedNotification !== null) {
-        void this.confirmObservedMaintenanceClosure(this.#quiescedNotification);
+        this.#observedClosurePromise = this.confirmObservedMaintenanceClosure(
+          this.#quiescedNotification,
+        );
+        void this.#observedClosurePromise;
       }
       return;
     }
@@ -727,6 +1345,7 @@ export class ProjectStoreExecutor {
   }
 
   private failMaintenanceClosure(error: ProjectStoreWorkerError): never {
+    this.#governedCloseDisqualified = true;
     this.#state = "poisoned";
     this.#terminalError = error;
     this.rejectAll(error);
@@ -753,6 +1372,7 @@ export class ProjectStoreExecutor {
       this.#terminalError = new ProjectStoreWorkerError("WORKER_CLOSED");
     } catch (error) {
       const failure = confirmationError(error);
+      this.#governedCloseDisqualified = true;
       this.#state = "poisoned";
       this.#terminalError = failure;
       this.rejectAll(failure);
@@ -760,11 +1380,8 @@ export class ProjectStoreExecutor {
   }
 
   private unknownOutcome(pending: PendingRequest): ProjectStoreWorkerError | null {
-    if (pending.kind !== "mutation" || pending.mutationIdentity === undefined) return null;
-    return new ProjectStoreWorkerError("COMMAND_OUTCOME_UNKNOWN", {
-      commandId: pending.mutationIdentity.commandId,
-      idempotencyKey: pending.mutationIdentity.idempotencyKey,
-    });
+    if (!pending.posted || pending.identity === null) return null;
+    return identityOutcomeUnknown(pending.identity);
   }
 
   private rejectAll(readError: ProjectStoreWorkerError): void {
@@ -778,6 +1395,8 @@ export class ProjectStoreExecutor {
   }
 
   private async poison(error: ProjectStoreWorkerError, terminate = true): Promise<void> {
+    // Even a late failure after the closed guard disqualifies release evidence.
+    this.#governedCloseDisqualified = true;
     if (this.#state === "closed") return;
     if (this.#state === "poisoned") {
       if (terminate) await (this.#terminationPromise ?? Promise.resolve());
@@ -813,15 +1432,24 @@ export class ProjectStoreExecutor {
     let deadline!: object;
     const forced = new Promise<{ kind: "forced" }>((resolveForced) => {
       deadline = this.#dependencies.scheduler.setTimeout(
-        () => resolveForced({ kind: "forced" }),
+        () => {
+          this.#governedCloseDisqualified = true;
+          resolveForced({ kind: "forced" });
+        },
         this.#options.closeTimeoutMs,
       );
     });
     const graceful = (async () => {
       await this.waitForDrain();
-      if (this.#state === "poisoned" || this.#state === "quiesced") return;
-      await this.request({ id: "", type: "close" }, "lifecycle");
+      if (this.#state === "poisoned" || this.#state === "quiesced") {
+        this.#governedCloseDisqualified = true;
+        return;
+      }
+      // Resolution here means request-specific correlation/payload decoding and
+      // the delivery fault check both accepted the close posted after FIFO drain.
+      await this.request({ id: "", type: "close" }, "control");
       await this.terminateWorker();
+      this.#normalCloseCompleted = true;
       this.#state = "closed";
     })();
     try {
@@ -853,6 +1481,10 @@ export class ProjectStoreExecutor {
     return this.#state === "new" || this.#state === "open";
   }
 
+  hasRegisteredExecutor(): boolean {
+    return this.#opened !== null;
+  }
+
   private terminateWorker(): Promise<void> {
     if (this.#terminationPromise !== null) return this.#terminationPromise;
     this.#expectedTermination = true;
@@ -862,6 +1494,7 @@ export class ProjectStoreExecutor {
         this.#resolveWorkerExit(exitCode);
       } catch {
         const failure = terminationFailure();
+        this.#governedCloseDisqualified = true;
         this.#state = "poisoned";
         this.#terminalError = failure;
         this.rejectAll(failure);
@@ -876,14 +1509,24 @@ export class ProjectStoreExecutor {
 export class ProjectStoreExecutorRegistry {
   readonly #entries = new Map<string, { key: string; executor: ProjectStoreExecutor }>();
   readonly #acquisitions = new Map<string, Promise<ProjectStoreExecutor>>();
+  readonly #quiescences = new Map<
+    string,
+    { lease: MaintenanceLease; promise: Promise<void> }
+  >();
 
   constructor(private readonly dependencies: Partial<ProjectStoreExecutorDependencies> = {}) {}
 
   async acquire(options: ProjectStoreExecutorOptions): Promise<ProjectStoreExecutor> {
     const reuseKey = storeReuseKey(options.context);
+    if (this.#quiescences.has(reuseKey)) {
+      throw new ProjectStoreWorkerError("MAINTENANCE_QUIESCING");
+    }
     const predecessor = this.#acquisitions.get(reuseKey);
     const acquisition = (async () => {
       if (predecessor !== undefined) await predecessor.catch(() => undefined);
+      if (this.#quiescences.has(reuseKey)) {
+        throw new ProjectStoreWorkerError("MAINTENANCE_QUIESCING");
+      }
       const exactKey = projectStoreExecutorKey(options.context);
       const current = this.#entries.get(reuseKey);
       if (current?.key === exactKey && current.executor.canReuse()) return current.executor;
@@ -899,6 +1542,50 @@ export class ProjectStoreExecutorRegistry {
       if (this.#acquisitions.get(reuseKey) === acquisition) {
         this.#acquisitions.delete(reuseKey);
       }
+    }
+  }
+
+  async quiesceStore(
+    context: ProjectContext,
+    lease: MaintenanceLease,
+  ): Promise<void> {
+    const reuseKey = storeReuseKey(context);
+    const currentQuiescence = this.#quiescences.get(reuseKey);
+    if (currentQuiescence !== undefined) {
+      return sameMaintenanceLease(currentQuiescence.lease, lease)
+        ? currentQuiescence.promise
+        : Promise.reject(new ProjectStoreWorkerError("MAINTENANCE_QUIESCING"));
+    }
+    const quiescence = this.quiesceStoreOwned(reuseKey, lease);
+    const active = { lease, promise: quiescence };
+    this.#quiescences.set(reuseKey, active);
+    try {
+      await quiescence;
+    } finally {
+      if (this.#quiescences.get(reuseKey) === active) this.#quiescences.delete(reuseKey);
+    }
+  }
+
+  private async quiesceStoreOwned(
+    reuseKey: string,
+    lease: MaintenanceLease,
+  ): Promise<void> {
+    for (;;) {
+      const acquiring = this.#acquisitions.get(reuseKey);
+      if (acquiring !== undefined) await acquiring;
+      if (this.#acquisitions.get(reuseKey) !== undefined) continue;
+      const current = this.#entries.get(reuseKey);
+      if (current === undefined) return;
+      if (!current.executor.hasRegisteredExecutor()) {
+        if (this.#entries.get(reuseKey) === current) this.#entries.delete(reuseKey);
+        return;
+      }
+      try {
+        await current.executor.quiesce(lease);
+      } finally {
+        if (this.#entries.get(reuseKey) === current) this.#entries.delete(reuseKey);
+      }
+      if (this.#entries.get(reuseKey) === undefined) return;
     }
   }
 }

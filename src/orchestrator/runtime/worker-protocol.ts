@@ -1,3 +1,10 @@
+import { decodeOwnedGovernedCreate, decodeOwnedGovernedRecovery } from "../governed-notes/worker-protocol.js";
+import { encodePreparedGovernedNoteCreateV2, encodePreparedGovernedNoteRecoveryV2 } from "../governed-notes/codec.js";
+import type { PreparedGovernedNoteCreateWireV2, PreparedGovernedNoteRecoveryWireV2, GovernedNoteRecoveryResultV2 } from "../governed-notes/contracts.js";
+import { types } from "node:util";
+import { decodePreparedGovernedNoteCreateV1, decodePreparedGovernedNoteRecoveryV1, encodePreparedGovernedNoteCreateV1, encodePreparedGovernedNoteRecoveryV1 } from "../governed-notes/codec.js";
+import type { PreparedGovernedNoteCreateWireV1, PreparedGovernedNoteRecoveryWireV1, GovernedNoteRecoveryResultV1 } from "../governed-notes/contracts.js";
+import { assertGovernedNoteEnvelopeSize, decodeGovernedNoteWorkerResponse, isGovernedNoteRequest } from "../governed-notes/worker-protocol.js";
 import type {
   AppendCommand,
   AppendResult,
@@ -5,6 +12,9 @@ import type {
   PendingEvent,
   PendingOutbox,
 } from "../contracts/event.js";
+import { assertRetainedEvidenceWireSize, decodePreparedRetainedEvidenceCommand, decodeRetainedEvidenceWorkerResponse, decodeRetainedEvidenceWorkerSuccess,
+  type PreparedRetainedEvidenceCommandWireV1, type RetainedEvidenceWorkerSuccessV1 } from "../privacy/retained-evidence-worker-protocol.js";
+import { snapshotFreshStartContext, type FreshStartTrustedContext } from "../fresh-start/fresh-start-admission.js";
 import type {
   BranchScopeId,
   ProjectContext,
@@ -24,10 +34,22 @@ import {
   type IntegrityReport,
 } from "../integrity/integrity.types.js";
 import type { MaintenanceLease } from "../storage/maintenance-fence.js";
+import type {
+  ProjectStoreUpgradePlan,
+  ProjectStoreUpgradeResult,
+} from "../storage/project-store-upgrade.service.js";
+import {
+  assertLifecycleWireCanonicalSize,
+  decodeLifecycleWorkerOperationWire,
+  decodeLifecycleWorkerSuccessForOperation,
+  type LifecycleWorkerOperationWire,
+  type LifecycleWorkerSuccessWire,
+} from "./lifecycle-worker-protocol.js";
 
 const SQLITE_INT64_MAX = 9_223_372_036_854_775_807n;
 const UNSIGNED_DECIMAL = /^(0|[1-9]\d*)$/;
 const HASH = /^[0-9a-f]{64}$/;
+const LIFECYCLE_BINDING_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const SOURCES = new Set<ProjectBindingSource>([
   "stdio-explicit-root",
   "mcp-roots",
@@ -55,7 +77,7 @@ function invalid(): never {
 }
 
 function record(value: unknown): Record<string, unknown> {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) invalid();
+  if (typeof value !== "object" || value === null || types.isProxy(value) || Array.isArray(value)) invalid();
   const prototype = Object.getPrototypeOf(value) as unknown;
   if (prototype !== Object.prototype && prototype !== null) invalid();
   for (const key of Reflect.ownKeys(value)) {
@@ -262,24 +284,68 @@ export interface WorkerPingResult {
 
 export interface WorkerOpenResult extends WorkerBindingAssertion {
   executorId: string;
+  freshStart?: FreshStartOpenWire;
 }
+
+export interface FreshStartContextWire {
+  readonly identity: { readonly projectId: string; readonly vaultId: string; readonly storeId: string };
+  readonly releaseId: string; readonly measuredBuildHash: string; readonly generation: string;
+}
+export interface FreshStartOpenWire extends FreshStartContextWire {
+  readonly eventPosition: string; readonly eventHash: string;
+}
+export function decodeFreshStartContextWire(value: unknown): FreshStartTrustedContext {
+  const source = exact(value, ["identity", "releaseId", "measuredBuildHash", "generation"]);
+  try {
+    return snapshotFreshStartContext({ identity: decodeIdentity(source.identity) as FreshStartTrustedContext["identity"],
+      releaseId: string(source.releaseId), measuredBuildHash: string(source.measuredBuildHash), generation: decimal(source.generation) });
+  } catch { return invalid(); }
+}
+export function encodeFreshStartContextWire(value: FreshStartTrustedContext): FreshStartContextWire {
+  const context = snapshotFreshStartContext(value);
+  return Object.freeze({ ...context, generation: context.generation.toString() });
+}
+function decodeFreshStartOpenWire(value: unknown): FreshStartOpenWire {
+  const source = exact(value, ["identity", "releaseId", "measuredBuildHash", "generation", "eventPosition", "eventHash"]);
+  const { eventPosition, eventHash, ...context } = source;
+  if (typeof eventHash !== "string" || !HASH.test(eventHash)) invalid();
+  return Object.freeze({ ...encodeFreshStartContextWire(decodeFreshStartContextWire(context)), eventPosition: decimal(eventPosition).toString(), eventHash });
+}
+
+export const MAX_INTEGRITY_PROVIDER_INPUT_BYTES = 4 * 1024 * 1024;
+
+export type IntegrityProviderRequestWire =
+  | { readonly type: "integrity-provider-request"; readonly integrityRequestId: string; readonly providerRequestId: string; readonly operation: "status"; readonly keyId: string }
+  | { readonly type: "integrity-provider-request"; readonly integrityRequestId: string; readonly providerRequestId: string; readonly operation: "fingerprint"; readonly keyId: string; readonly bytes: Uint8Array };
+
+export type IntegrityProviderResponseWire =
+  | { readonly type: "integrity-provider-response"; readonly integrityRequestId: string; readonly providerRequestId: string; readonly operation: "status"; readonly ok: true; readonly status: "available" | "revoked" | "unavailable" }
+  | { readonly type: "integrity-provider-response"; readonly integrityRequestId: string; readonly providerRequestId: string; readonly operation: "fingerprint"; readonly ok: true; readonly fingerprint: string }
+  | { readonly type: "integrity-provider-response"; readonly integrityRequestId: string; readonly providerRequestId: string; readonly operation: "status" | "fingerprint"; readonly ok: false; readonly code: "EVIDENCE_HISTORICAL_KEY_UNAVAILABLE" | "INTEGRITY_FAILURE" };
 
 export type WorkerRequest =
   | { id: string; type: "ping" }
   | { id: string; type: "verifyIdentity"; route: ProjectStoreRouteWire; expected: StoreIdentityWire }
   | { id: string; type: "inspectExisting"; route: ProjectStoreRouteWire; expected: StoreIdentityExpectationWire }
-  | { id: string; type: "open"; binding: WorkerBinding }
+  | { id: string; type: "open"; binding: WorkerBinding; freshStart?: FreshStartContextWire }
   | { id: string; type: "append"; binding: WorkerBindingAssertion; command: AppendCommandWire }
+  | { id: string; type: "lifecycle"; binding: WorkerBindingAssertion; operation: LifecycleWorkerOperationWire }
+  | { id: string; type: "governed-note-create"; binding: WorkerBindingAssertion; prepared: PreparedGovernedNoteCreateWireV1 | PreparedGovernedNoteCreateWireV2 }
+  | { id: string; type: "governed-note-recover"; binding: WorkerBindingAssertion; prepared: PreparedGovernedNoteRecoveryWireV1 | PreparedGovernedNoteRecoveryWireV2 }
+  | { id: string; type: "retained-evidence"; binding: WorkerBindingAssertion; prepared: PreparedRetainedEvidenceCommandWireV1 }
   | { id: string; type: "quickIntegrity"; binding: WorkerBindingAssertion; tailLimit: number }
   | { id: string; type: "fullIntegrity"; binding: WorkerBindingAssertion }
   | { id: string; type: "quiesce"; binding: WorkerBindingAssertion; lease: MaintenanceLeaseWire }
   | { id: string; type: "close" };
 
 export type WorkerSuccessData =
+  | GovernedNoteRecoveryResultV1 | GovernedNoteRecoveryResultV2
   | WorkerPingResult
   | WorkerOpenResult
   | StoreIdentityWire
   | AppendResultWire
+  | LifecycleWorkerSuccessWire
+  | RetainedEvidenceWorkerSuccessV1
   | IntegrityReport
   | { verified: true }
   | { quiesced: true; epoch: string; connectionClosed: true }
@@ -689,12 +755,46 @@ export function decodeWorkerRequest(value: unknown): WorkerRequest {
       exact(value, ["id", "type", "route", "expected"]);
       return { id, type, route: decodeRoute(request.route), expected: decodeIdentityExpectation(request.expected) };
     case "open":
-      exact(value, ["id", "type", "binding"]);
+      exact(value, Object.hasOwn(request, "freshStart") ? ["id", "type", "binding", "freshStart"] : ["id", "type", "binding"]);
       decodeWorkerBinding(request.binding);
-      return { id, type, binding: request.binding as WorkerBinding };
+      return { id, type, binding: request.binding as WorkerBinding,
+        ...(Object.hasOwn(request, "freshStart") ? { freshStart: encodeFreshStartContextWire(decodeFreshStartContextWire(request.freshStart)) } : {}) };
     case "append":
       exact(value, ["id", "type", "binding", "command"]);
       return { id, type, binding: decodeAssertion(request.binding), command: decodeAppendCommandWireShape(request.command) };
+    case "governed-note-create":
+    case "governed-note-recover": {
+      exact(value, ["id", "type", "binding", "prepared"]);
+      assertGovernedNoteEnvelopeSize(value, 4 * 1024 * 1024);
+      const binding = Object.freeze(decodeAssertion(request.binding));
+      if(type==="governed-note-create") { const p=decodeOwnedGovernedCreate(request.prepared); return Object.freeze({id,type,binding,prepared:p.command.version===2?encodePreparedGovernedNoteCreateV2(p as import("../governed-notes/contracts.js").PreparedGovernedNoteCreateV2):encodePreparedGovernedNoteCreateV1(p as import("../governed-notes/contracts.js").PreparedGovernedNoteCreateV1)}); }
+      const p=decodeOwnedGovernedRecovery(request.prepared);return Object.freeze({id,type,binding,prepared:p.request.version===2?encodePreparedGovernedNoteRecoveryV2(p as import("../governed-notes/contracts.js").PreparedGovernedNoteRecoveryV2):encodePreparedGovernedNoteRecoveryV1(p as import("../governed-notes/contracts.js").PreparedGovernedNoteRecoveryV1)});
+    }
+    case "retained-evidence": {
+      exact(value, ["id", "type", "binding", "prepared"]);
+      assertRetainedEvidenceWireSize(value);
+      const assertion = decodeAssertion(request.binding);
+      if (![assertion.projectId, assertion.vaultId, assertion.storeId].every(item => LIFECYCLE_BINDING_UUID.test(item))) invalid();
+      const prepared = decodePreparedRetainedEvidenceCommand(request.prepared);
+      const physical = exact(request.prepared, ["command", "authorization"]);
+      return Object.freeze({ id, type, binding: Object.freeze(assertion), prepared: Object.freeze({ command: physical.command as string, authorization: prepared.authorization }) });
+    }
+    case "lifecycle":
+      exact(value, ["id", "type", "binding", "operation"]);
+      const binding = decodeAssertion(request.binding);
+      if (
+        !LIFECYCLE_BINDING_UUID.test(binding.projectId)
+        || !LIFECYCLE_BINDING_UUID.test(binding.vaultId)
+        || !LIFECYCLE_BINDING_UUID.test(binding.storeId)
+      ) invalid();
+      const lifecycleRequest = Object.freeze({
+        id,
+        type,
+        binding: Object.freeze(binding),
+        operation: decodeLifecycleWorkerOperationWire(request.operation),
+      });
+      assertLifecycleWireCanonicalSize(lifecycleRequest);
+      return lifecycleRequest;
     case "quickIntegrity":
       exact(value, ["id", "type", "binding", "tailLimit"]);
       return { id, type, binding: decodeAssertion(request.binding), tailLimit: positiveInteger(request.tailLimit) };
@@ -708,6 +808,128 @@ export function decodeWorkerRequest(value: unknown): WorkerRequest {
     default:
       invalid();
   }
+}
+
+function integrityProviderId(value: unknown): string {
+  return string(value);
+}
+
+function integrityProviderKeyId(value: unknown): string {
+  const keyId = string(value);
+  const scalars = Array.from(keyId);
+  if (
+    scalars.length > 128
+    || scalars.some((scalar) => {
+      const codePoint = scalar.codePointAt(0)!;
+      return codePoint >= 0xd800 && codePoint <= 0xdfff;
+    })
+  ) invalid();
+  return keyId;
+}
+
+function integrityProviderBytes(value: unknown): Uint8Array {
+  if (
+    !(value instanceof Uint8Array)
+    || Object.getPrototypeOf(value) !== Uint8Array.prototype
+    || !(value.buffer instanceof ArrayBuffer)
+    || value.byteLength < 1
+    || value.byteLength > MAX_INTEGRITY_PROVIDER_INPUT_BYTES
+    || value.byteOffset !== 0
+    || value.byteLength !== value.buffer.byteLength
+  ) invalid();
+  return value;
+}
+
+export function decodeIntegrityProviderRequestWire(
+  value: unknown,
+): IntegrityProviderRequestWire {
+  const request = record(value);
+  if (request.type !== "integrity-provider-request") invalid();
+  const operation = request.operation;
+  if (operation === "status") {
+    const decoded = exact(value, [
+      "type", "integrityRequestId", "providerRequestId", "operation", "keyId",
+    ]);
+    return {
+      type: "integrity-provider-request",
+      integrityRequestId: integrityProviderId(decoded.integrityRequestId),
+      providerRequestId: integrityProviderId(decoded.providerRequestId),
+      operation,
+      keyId: integrityProviderKeyId(decoded.keyId),
+    };
+  }
+  if (operation === "fingerprint") {
+    const decoded = exact(value, [
+      "type", "integrityRequestId", "providerRequestId", "operation", "keyId", "bytes",
+    ]);
+    return {
+      type: "integrity-provider-request",
+      integrityRequestId: integrityProviderId(decoded.integrityRequestId),
+      providerRequestId: integrityProviderId(decoded.providerRequestId),
+      operation,
+      keyId: integrityProviderKeyId(decoded.keyId),
+      bytes: integrityProviderBytes(decoded.bytes),
+    };
+  }
+  invalid();
+}
+
+export function decodeIntegrityProviderResponseWire(
+  value: unknown,
+): IntegrityProviderResponseWire {
+  const response = record(value);
+  if (response.type !== "integrity-provider-response") invalid();
+  const operation = response.operation;
+  if (operation !== "status" && operation !== "fingerprint") invalid();
+  if (response.ok === false) {
+    const decoded = exact(value, [
+      "type", "integrityRequestId", "providerRequestId", "operation", "ok", "code",
+    ]);
+    if (
+      decoded.code !== "EVIDENCE_HISTORICAL_KEY_UNAVAILABLE"
+      && decoded.code !== "INTEGRITY_FAILURE"
+    ) invalid();
+    return {
+      type: "integrity-provider-response",
+      integrityRequestId: integrityProviderId(decoded.integrityRequestId),
+      providerRequestId: integrityProviderId(decoded.providerRequestId),
+      operation,
+      ok: false,
+      code: decoded.code,
+    };
+  }
+  if (response.ok !== true) invalid();
+  if (operation === "status") {
+    const decoded = exact(value, [
+      "type", "integrityRequestId", "providerRequestId", "operation", "ok", "status",
+    ]);
+    if (
+      decoded.status !== "available"
+      && decoded.status !== "revoked"
+      && decoded.status !== "unavailable"
+    ) invalid();
+    return {
+      type: "integrity-provider-response",
+      integrityRequestId: integrityProviderId(decoded.integrityRequestId),
+      providerRequestId: integrityProviderId(decoded.providerRequestId),
+      operation,
+      ok: true,
+      status: decoded.status,
+    };
+  }
+  const decoded = exact(value, [
+    "type", "integrityRequestId", "providerRequestId", "operation", "ok", "fingerprint",
+  ]);
+  const fingerprint = string(decoded.fingerprint);
+  if (!HASH.test(fingerprint)) invalid();
+  return {
+    type: "integrity-provider-response",
+    integrityRequestId: integrityProviderId(decoded.integrityRequestId),
+    providerRequestId: integrityProviderId(decoded.providerRequestId),
+    operation,
+    ok: true,
+    fingerprint,
+  };
 }
 
 function decodeAppendCommandWireShape(value: unknown): AppendCommandWire {
@@ -747,8 +969,10 @@ function decodePing(value: unknown): WorkerPingResult {
 }
 
 function decodeOpen(value: unknown): WorkerOpenResult {
+  const source = record(value);
   const result = exact(value, [
     "projectId", "vaultId", "storeId", "bindingGeneration", "contextFingerprint", "executorId",
+    ...(Object.hasOwn(source, "freshStart") ? ["freshStart"] : []),
   ]);
   return { ...decodeAssertion({
     projectId: result.projectId,
@@ -756,10 +980,35 @@ function decodeOpen(value: unknown): WorkerOpenResult {
     storeId: result.storeId,
     bindingGeneration: result.bindingGeneration,
     contextFingerprint: result.contextFingerprint,
-  }), executorId: string(result.executorId) };
+  }), executorId: string(result.executorId),
+    ...(Object.hasOwn(source, "freshStart") ? { freshStart: decodeFreshStartOpenWire(source.freshStart) } : {}) };
 }
 
-function decodeSuccessForType(type: WorkerRequest["type"], value: unknown): WorkerSuccessData {
+function assertDecodedLifecycleProjectBinding(
+  value: JsonValue,
+  expectedProjectId: ProjectId,
+  expectedStoreId: StoreId,
+): void {
+  if (value === null || typeof value !== "object") return;
+  for (const key of Reflect.ownKeys(value)) {
+    if (typeof key !== "string") continue;
+    const descriptor = Reflect.getOwnPropertyDescriptor(value, key);
+    if (descriptor === undefined || !descriptor.enumerable || !("value" in descriptor)) continue;
+    if (key === "projectId" && descriptor.value !== expectedProjectId) invalid();
+    if (key === "storeId" && descriptor.value !== expectedStoreId) invalid();
+    assertDecodedLifecycleProjectBinding(
+      descriptor.value as JsonValue,
+      expectedProjectId,
+      expectedStoreId,
+    );
+  }
+}
+
+function decodeSuccessForType(
+  type: WorkerRequest["type"],
+  value: unknown,
+  request?: WorkerRequest,
+): WorkerSuccessData {
   switch (type) {
     case "ping": return decodePing(value);
     case "verifyIdentity": {
@@ -768,8 +1017,48 @@ function decodeSuccessForType(type: WorkerRequest["type"], value: unknown): Work
       return { verified: true };
     }
     case "inspectExisting": return decodeIdentity(value);
-    case "open": return decodeOpen(value);
+    case "open": {
+      const opened = decodeOpen(value);
+      if (request?.type === "open") {
+        if ((request.freshStart === undefined) !== (opened.freshStart === undefined)) invalid();
+        if (request.freshStart && opened.freshStart) {
+          const expected = request.freshStart;
+          const actual = opened.freshStart;
+          if (expected.releaseId !== actual.releaseId || expected.measuredBuildHash !== actual.measuredBuildHash
+            || expected.generation !== actual.generation
+            || expected.identity.projectId !== actual.identity.projectId || expected.identity.vaultId !== actual.identity.vaultId
+            || expected.identity.storeId !== actual.identity.storeId
+            || actual.identity.projectId !== request.binding.projectId || actual.identity.vaultId !== request.binding.vaultId
+            || actual.identity.storeId !== request.binding.storeId) invalid();
+        }
+      }
+      return opened;
+    }
+    case "governed-note-create":
+    case "governed-note-recover": {
+      if (!request || !isGovernedNoteRequest(request)) invalid();
+      const response = decodeGovernedNoteWorkerResponse({ id: request.id, ok: true, data: value }, request);
+      if (!response.ok) invalid();
+      return response.data;
+    }
     case "append": return encodeAppendResultWire(decodeAppendResultWire(value));
+    case "retained-evidence": {
+      if (request?.type !== "retained-evidence") invalid();
+      return decodeRetainedEvidenceWorkerSuccess(value, decodePreparedRetainedEvidenceCommand(request.prepared));
+    }
+    case "lifecycle": {
+      if (request?.type !== "lifecycle") invalid();
+      const decoded = decodeLifecycleWorkerSuccessForOperation(
+        value,
+        request.operation,
+      );
+      assertDecodedLifecycleProjectBinding(
+        decoded.result,
+        request.binding.projectId as ProjectId,
+        request.binding.storeId as StoreId,
+      );
+      return decoded;
+    }
     case "quickIntegrity":
     case "fullIntegrity": return decodeIntegrityReport(value);
     case "quiesce": {
@@ -786,7 +1075,10 @@ function decodeSuccessForType(type: WorkerRequest["type"], value: unknown): Work
   }
 }
 
-function decodeUnknownSuccess(value: unknown): WorkerSuccessData {
+function decodeUnknownSuccess(value: unknown, request?: WorkerRequest): WorkerSuccessData {
+  // Ordinary append responses are arbitrary JSON, including governed-looking
+  // fields. Only the trusted originating request selects the governed union.
+  if (request && isGovernedNoteRequest(request)) return decodeSuccessForType(request.type, value, request);
   const decoders: Array<(input: unknown) => WorkerSuccessData> = [
     decodePing,
     decodeOpen,
@@ -809,6 +1101,22 @@ function decodeUnknownSuccess(value: unknown): WorkerSuccessData {
       if (result.closed !== true) invalid();
       return { closed: true };
     },
+    (input) => {
+      const result = exact(input, ["operation", "nestedContractVersion", "result"]);
+      const nestedContractVersion = result.nestedContractVersion;
+      if (
+        nestedContractVersion !== null
+        && nestedContractVersion !== 1
+        && nestedContractVersion !== 2
+      ) invalid();
+      const lifecycle = {
+        operation: string(result.operation),
+        nestedContractVersion,
+        result: json(result.result),
+      } as LifecycleWorkerSuccessWire;
+      assertLifecycleWireCanonicalSize(lifecycle);
+      return lifecycle;
+    },
   ];
   for (const decode of decoders) {
     try { return decode(value); } catch (error) {
@@ -818,18 +1126,26 @@ function decodeUnknownSuccess(value: unknown): WorkerSuccessData {
   invalid();
 }
 
-export function decodeWorkerResponse(value: unknown): WorkerResponse {
+export function decodeWorkerResponse(value: unknown, request?: WorkerRequest): WorkerResponse {
   const response = record(value);
+  if (request && isGovernedNoteRequest(request)) {
+    // Bound the complete original envelope before generic success normalization.
+    assertGovernedNoteEnvelopeSize(value);
+    if (response.id !== request.id) invalid();
+    if (response.ok === false) return decodeGovernedNoteWorkerResponse(value, request);
+  }
   if (response.ok === false) return decodeFailure(value);
   exact(value, ["id", "ok", "data"]);
   if (response.ok !== true) invalid();
-  return { id: string(response.id), ok: true, data: decodeUnknownSuccess(response.data) };
+  return { id: string(response.id), ok: true, data: decodeUnknownSuccess(response.data, request) };
 }
 
 export function decodeWorkerResponseForRequest(
   value: unknown,
   request: WorkerRequest,
 ): WorkerResponse {
+  if (isGovernedNoteRequest(request)) return decodeGovernedNoteWorkerResponse(value, request);
+  if (request.type === "retained-evidence") return decodeRetainedEvidenceWorkerResponse(value, request.id, decodePreparedRetainedEvidenceCommand(request.prepared));
   const response = record(value);
   if (response.id !== request.id) invalid();
   if (response.ok === false) return decodeFailure(value);
@@ -838,7 +1154,7 @@ export function decodeWorkerResponseForRequest(
   return {
     id: string(response.id),
     ok: true,
-    data: decodeSuccessForType(request.type, response.data),
+    data: decodeSuccessForType(request.type, response.data, request),
   };
 }
 
@@ -865,7 +1181,119 @@ export function decodeWorkerNotification(value: unknown): WorkerNotification {
   };
 }
 
-export function decodeWorkerMessage(value: unknown): WorkerMessage {
+export function decodeWorkerMessage(value: unknown, request?: WorkerRequest): WorkerMessage {
   const message = record(value);
-  return "id" in message ? decodeWorkerResponse(value) : decodeWorkerNotification(value);
+  return "id" in message ? decodeWorkerResponse(value, request) : decodeWorkerNotification(value);
+}
+
+export type UpgradeWorkerCommand =
+  | { id: string; type: "upgrade-inspect" }
+  | { id: string; type: "upgrade-apply" }
+  | {
+      id: string;
+      type: "upgrade-confirm-closure";
+      operationId: string;
+      confirmation: {
+        projectId: string;
+        executorId: string;
+        lease: MaintenanceLeaseWire;
+        connectionClosed: true;
+      };
+    }
+  | { type: "upgrade-quiesce-complete"; operationId: string };
+
+export interface UpgradeQuiesceRequiredNotification {
+  type: "upgrade-quiesce-required";
+  operationId: string;
+  lease: MaintenanceLeaseWire;
+}
+
+export function decodeUpgradeWorkerCommand(value: unknown): UpgradeWorkerCommand {
+  const command = record(value);
+  const type = string(command.type);
+  if (type === "upgrade-inspect" || type === "upgrade-apply") {
+    exact(value, ["id", "type"]);
+    return { id: string(command.id), type };
+  }
+  if (type === "upgrade-quiesce-complete") {
+    exact(value, ["type", "operationId"]);
+    return { type, operationId: string(command.operationId) };
+  }
+  if (type === "upgrade-confirm-closure") {
+    exact(value, ["id", "type", "operationId", "confirmation"]);
+    const confirmation = exact(command.confirmation, [
+      "projectId", "executorId", "lease", "connectionClosed",
+    ]);
+    if (confirmation.connectionClosed !== true) invalid();
+    const lease = decodeMaintenanceLeaseWire(confirmation.lease);
+    return {
+      id: string(command.id),
+      type,
+      operationId: string(command.operationId),
+      confirmation: {
+        projectId: string(confirmation.projectId),
+        executorId: string(confirmation.executorId),
+        lease: encodeMaintenanceLeaseWire(lease),
+        connectionClosed: true,
+      },
+    };
+  }
+  invalid();
+}
+
+export function decodeUpgradeQuiesceRequiredNotification(
+  value: unknown,
+): UpgradeQuiesceRequiredNotification {
+  const notification = exact(value, ["type", "operationId", "lease"]);
+  if (notification.type !== "upgrade-quiesce-required") invalid();
+  const lease = decodeMaintenanceLeaseWire(notification.lease);
+  return {
+    type: "upgrade-quiesce-required",
+    operationId: string(notification.operationId),
+    lease: encodeMaintenanceLeaseWire(lease),
+  };
+}
+
+export function decodeProjectStoreUpgradePlan(value: unknown): ProjectStoreUpgradePlan {
+  const plan = exact(value, [
+    "projectId", "storeId", "appliedVersion", "targetVersion", "pending", "status",
+  ]);
+  const status = string(plan.status);
+  if (status !== "current" && status !== "upgrade-required") invalid();
+  const pending = array(plan.pending).map((item) => {
+    const migration = exact(item, ["version", "name", "checksum"]);
+    const checksum = string(migration.checksum);
+    if (!HASH.test(checksum)) invalid();
+    return {
+      version: positiveInteger(migration.version),
+      name: string(migration.name),
+      checksum,
+    };
+  });
+  const appliedVersion = positiveInteger(plan.appliedVersion);
+  const targetVersion = positiveInteger(plan.targetVersion);
+  if (
+    appliedVersion > targetVersion
+    || pending.some((migration, index) => migration.version !== appliedVersion + index + 1)
+    || (status === "current") !== (pending.length === 0)
+  ) invalid();
+  return {
+    projectId: string(plan.projectId),
+    storeId: string(plan.storeId),
+    appliedVersion,
+    targetVersion,
+    pending,
+    status,
+  };
+}
+
+export function decodeProjectStoreUpgradeResult(value: unknown): ProjectStoreUpgradeResult {
+  const result = exact(value, ["plan", "appliedVersions", "resumedPostCommit", "integrity"]);
+  const appliedVersions = array(result.appliedVersions).map((version) => positiveInteger(version));
+  return {
+    plan: decodeProjectStoreUpgradePlan(result.plan),
+    appliedVersions,
+    resumedPostCommit: boolean(result.resumedPostCommit),
+    integrity: decodeIntegrityReport(result.integrity),
+  };
 }

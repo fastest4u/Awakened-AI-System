@@ -1,0 +1,1314 @@
+import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
+import {
+  copyFileSync,
+  existsSync,
+  lstatSync,
+  readFileSync,
+  readdirSync,
+  realpathSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { basename, dirname, join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
+import { afterEach, describe, type TestContext } from "node:test";
+import {
+  createProjectionFixtureControls,
+  rootEvidence,
+  forwardingInspection,
+  assertRawProjectionRefusal,
+  samePathSpelling,
+  type SpellingEvidence,
+} from "./support/projection-fixture-controls.js";
+import { capturePathSnapshot, createCiDiagnosticCollector } from "./support/ci-path-diagnostics.js";
+
+import type { AppendCommand, JsonValue, PendingEvent } from "../src/orchestrator/contracts/event.js";
+import type {
+  BranchScopeId,
+  GitWorkspaceSnapshot,
+  ProjectBinding as TrustedProjectBinding,
+  ProjectContext,
+  ProjectId,
+  StoreId,
+  VaultId,
+  WorkspaceId,
+} from "../src/orchestrator/identity/contracts.js";
+import { ImmutableProjectionBuilder } from "../src/orchestrator/projections/builder.js";
+import { V2ProjectionBuildCoordinator } from "../src/orchestrator/projections/coordinator.js";
+import {
+  PROJECTION_NAMES,
+  projectionCoreChecksum,
+  type CanonicalProjectionRow,
+  type ProjectionName,
+} from "../src/orchestrator/projections/checksum.js";
+import type { ProjectBinding } from "../src/orchestrator/projections/contracts.js";
+import { SqliteProjectionEventReader, type ProjectionEventSnapshot } from "../src/orchestrator/projections/event-reader.js";
+import {
+  assertUnpublishedProjectionV2Image,
+  openImmutableProjectionImage,
+  ProjectionIntegrityService,
+  readVerifiedCanonicalProjectionSnapshot,
+} from "../src/orchestrator/projections/integrity.js";
+import {
+  parseProjectionManifest,
+  parseProjectionManifestV2,
+  verifyProjectionPublicationPaths,
+  type ProjectionManifestV2,
+} from "../src/orchestrator/projections/manifest.js";
+import { BranchScopeRepository } from "../src/orchestrator/storage/branch-scope.repository.js";
+import {
+  EventStore,
+  SqliteEventStoreStatements,
+} from "../src/orchestrator/storage/event-store.js";
+import { MaintenanceFence } from "../src/orchestrator/storage/maintenance-fence.js";
+import { NodeSqliteDriver } from "../src/orchestrator/storage/node-sqlite-driver.js";
+import { PROJECTION_SCHEMA_SQL_V1, PROJECTION_SCHEMA_SQL_V1_LEGACY, PROJECTION_SCHEMA_SQL_V2, PROJECTION_SCHEMA_SQL_V2_LEGACY } from "../src/orchestrator/projections/schema.js";
+import type {
+  SqliteConnection,
+  SqliteDriver,
+  SqliteOpenOptions,
+  SqliteParams,
+  SqliteRow,
+  SqliteRunResult,
+  SqliteStatement,
+} from "../src/orchestrator/storage/sqlite-driver.js";
+import { applyCurrentProjectStoreSchema } from "./support/current-project-store-schema.js";
+import { ShadowMigrationError } from "../src/orchestrator/migration/v2-shadow-migration.contracts.js";
+import { EventStoreError } from "../src/orchestrator/storage/event-store.js";
+
+const PROJECT_ID = "1".repeat(64) as ProjectId;
+const OTHER_PROJECT_ID = "9".repeat(64) as ProjectId;
+const VAULT_ID = "2".repeat(64) as VaultId;
+const STORE_ID = "3".repeat(64) as StoreId;
+const WORKSPACE_ID = "4".repeat(64) as WorkspaceId;
+const BRANCH_SCOPE_ID = "00000000-0000-4000-8000-000000000401" as BranchScopeId;
+const BRANCH_REF = "refs/heads/projection-integrity";
+const SESSION_ID = "00000000-0000-4000-8000-000000000402";
+const ITEM_A = "00000000-0000-4000-8000-000000000403";
+const ITEM_B = "00000000-0000-4000-8000-000000000404";
+const FEEDBACK_ID = "00000000-0000-4000-8000-000000000405";
+const NOW = "2026-08-23T04:00:00.000Z";
+const driver = new NodeSqliteDriver({ DatabaseSync });
+
+const BINDING: ProjectBinding = Object.freeze({
+  projectId: PROJECT_ID,
+  vaultId: VAULT_ID,
+  storeId: STORE_ID,
+  workspaceId: WORKSPACE_ID,
+  branchScopeId: BRANCH_SCOPE_ID,
+  branchRef: BRANCH_REF,
+  sessionId: null,
+});
+const PRODUCTION_BINDING: ProjectBinding = Object.freeze({
+  projectId: "11111111-1111-4111-8111-111111111111" as ProjectId,
+  vaultId: "22222222-2222-4222-8222-222222222222" as VaultId,
+  storeId: "33333333-3333-4333-8333-333333333333" as StoreId,
+  workspaceId: "a".repeat(64) as WorkspaceId,
+  branchScopeId: null,
+  branchRef: null,
+  sessionId: null,
+});
+
+const { it, fixtureRoot, ownerForPath, cleanupFixtures, roots, trackResource, closeOwned, fixtureDatabase } = createProjectionFixtureControls();
+describe("committed snapshot integrity", () => {
+  it("integrity fixture retains root when source setup cannot close", async () => {
+    const setupError = new Error("controlled source setup failure");
+    const closeError = new Error("controlled uncertainty after native close returned");
+    const originalExec = DatabaseSync.prototype.exec;
+    const originalClose = DatabaseSync.prototype.close;
+    let acquired: DatabaseSync | undefined;
+    let nativeClosed = false;
+    let closeAttempts = 0;
+    let acquiredPath: unknown;
+    try {
+      DatabaseSync.prototype.exec = function (sql) {
+        if (!sql.includes("CREATE TABLE")) return originalExec.call(this, sql);
+        acquired = this;
+        acquiredPath = this.prepare("PRAGMA database_list").get()?.file;
+        throw setupError;
+      };
+      DatabaseSync.prototype.close = function () {
+        closeAttempts += 1;
+        originalClose.call(this);
+        nativeClosed = true;
+        throw closeError;
+      };
+      await assert.rejects(() => createFixture(), error => error === setupError);
+      assert.equal(closeAttempts, 1, "setup failure must attempt its acquired native close");
+      assert.equal(nativeClosed, true, "injected uncertainty follows a returned native close");
+      const owner = roots[0]!;
+      assert.equal(typeof acquiredPath === "string" && [owner.rawRoot, owner.nativeRoot].some(ownedRoot =>
+        samePathSpelling(join(ownedRoot, "events.sqlite"), acquiredPath as string)), true,
+      "source opened against a previously proved spelling of the original owned root");
+      assert.throws(() => owner.cleanup(), /CI_PROJECTION_FIXTURE_CLEANUP_INCOMPLETE/u);
+      assert.equal(existsSync(owner.rawRoot), true, "uncertain fixture remains owned and retained");
+    } finally {
+      DatabaseSync.prototype.exec = originalExec;
+      DatabaseSync.prototype.close = originalClose;
+      if (acquired !== undefined && !nativeClosed) originalClose.call(acquired);
+      roots.splice(0);
+    }
+  });
+  it("exports frozen native seven/eight domain rows only from the verified private image", async () => {
+    const f = await createFixture();
+    const reader = new SqliteProjectionEventReader({ driver, eventStorePath: f.sourcePath });
+    const buildSnapshot = trackResource(await reader.openCommittedSnapshot(BINDING), f.sourcePath);
+    const directory = join(dirname(f.projectionDirectory), "native-v1");
+    const generation = await new ImmutableProjectionBuilder({ driver, projectionDirectory: directory, now: () => NOW }).build(buildSnapshot, 1);
+    closeOwned(buildSnapshot);
+    for (const [manifest, projectionDirectory, version] of [[generation.manifest, directory, 1], [f.manifest, f.projectionDirectory, 2]] as const) {
+      const sourceSnapshot = trackResource(await reader.openCommittedSnapshot(BINDING), f.sourcePath);
+      try {
+        const result = readVerifiedCanonicalProjectionSnapshot(BINDING, manifest, { driver, eventStorePath: "unused", projectionDirectory, sourceSnapshot });
+        assert.equal(result.schemaVersion, version);
+        assert.equal(Object.keys(result.coreChecksums).length, version === 1 ? 7 : 8);
+        assert.equal(Object.hasOwn(result.rows, "sessionCheckpoints"), version === 2);
+        assert.equal(result.rows.canonicalItems.length, 2);
+        assert.equal(Object.isFrozen(result.rows.canonicalItems[0]), true);
+        assert.equal(Object.isFrozen(result.rows.canonicalItems), true);
+        assert.equal(Object.isFrozen(result.rows), true);
+        assert.equal(Object.hasOwn(result, "databasePath"), false);
+        assert.equal(Object.hasOwn(result, "database"), false);
+      } finally { closeOwned(sourceSnapshot); }
+    }
+  });
+  it("verifies exact historical V1 and V2 schema images with authenticated legacy hash bindings", async () => {
+    const f = await createFixture();
+    const historical: SqliteDriver = { open(path, options) {
+      const connection = driver.open(path, options);
+      return { close: () => connection.close(), prepare: sql => connection.prepare(sql),
+        exec(sql) { connection.exec(sql === PROJECTION_SCHEMA_SQL_V1 ? PROJECTION_SCHEMA_SQL_V1_LEGACY : sql === PROJECTION_SCHEMA_SQL_V2 ? PROJECTION_SCHEMA_SQL_V2_LEGACY : sql); } };
+    } };
+    const reader = new SqliteProjectionEventReader({ driver, eventStorePath: f.sourcePath });
+    const snapshot = trackResource(await reader.openCommittedSnapshot(BINDING), f.sourcePath);
+    try {
+      const directory = join(dirname(f.projectionDirectory), "legacy-v1");
+      const generation = await new ImmutableProjectionBuilder({ driver: historical, projectionDirectory: directory, now: () => NOW }).build(snapshot, 1);
+      const verifySnapshot = trackResource(await reader.openCommittedSnapshot(BINDING), f.sourcePath);
+      try {
+        const bytes = readFileSync(generation.databasePath);
+        assert.equal(new ProjectionIntegrityService({ driver, eventStorePath: f.sourcePath, projectionDirectory: directory }).verifyV1Generation(verifySnapshot, generation).status, "passed");
+        assert.deepEqual(readFileSync(generation.databasePath), bytes);
+      } finally { closeOwned(verifySnapshot); }
+    } finally { closeOwned(snapshot); }
+    const directory = join(dirname(f.projectionDirectory), "legacy-v2");
+    const generation = await new V2ProjectionBuildCoordinator({ eventReader: reader, projectionDirectory: directory, now: () => 0,
+      builder: new ImmutableProjectionBuilder({ driver: historical, projectionDirectory: directory, now: () => NOW }) }).ensurePublished(BINDING, BigInt(f.manifest.terminalEventPosition), 10_000);
+    assert.equal(new ProjectionIntegrityService({ driver, eventStorePath: f.sourcePath, projectionDirectory: directory }).verify(BINDING, generation.manifest).status, "passed");
+  });
+  it("authenticates original events and checks the pinned published image without source-path replay", async () => {
+    const f = await createFixture();
+    const snapshot = trackResource(await new SqliteProjectionEventReader({ driver, eventStorePath: f.sourcePath }).openCommittedSnapshot(BINDING), f.sourcePath);
+    try {
+      const service = new ProjectionIntegrityService({ driver, eventStorePath: "unused", projectionDirectory: f.projectionDirectory });
+      const events = [...snapshot.events()];
+      const repeatable = { ...snapshot, events: () => events };
+      assert.equal(service.verifyCommittedSnapshot(BINDING, f.manifest, repeatable).status, "passed");
+      for (const original of [new ShadowMigrationError("MIGRATION_SOURCE_MUTATED", { secret: "sensitive" }),
+        new EventStoreError("SQLITE_BUSY", { sensitive: "value" }), new EventStoreError("COMMAND_TOO_LARGE"), new Error("sensitive unknown failure")]) {
+        assert.throws(() => service.verifyCommittedSnapshot(BINDING, f.manifest, { ...repeatable, events() { throw original; } }),
+          (error: unknown) => {
+            assert.notEqual(error, original);
+            if (original instanceof EventStoreError && original.code === "SQLITE_BUSY") return error instanceof EventStoreError && error.code === "SQLITE_BUSY";
+            return error instanceof ShadowMigrationError && error.code === (original instanceof ShadowMigrationError ? original.code : "MIGRATION_LEDGER_INTEGRITY_FAILURE")
+              && Object.keys(error.safeDetails).length === 0 && error.cause === undefined;
+          });
+      }
+      const cases: ProjectionEventSnapshot[] = [
+        { ...repeatable, eventCount: snapshot.eventCount + 1 },
+        { ...repeatable, aggregateBytes: snapshot.aggregateBytes + 1 },
+        { ...repeatable, terminalEventHash: "a".repeat(64) },
+        { ...repeatable, binding: { ...snapshot.binding, branchRef: "wrong" } },
+        { ...snapshot, events: () => events.map((e, i) => i ? e : { ...e, payloadJson: "{}" }) },
+        { ...snapshot, events: () => events.slice(1) },
+      ];
+      for (const bad of cases) expectIntegrityFailure(() => service.verifyCommittedSnapshot(BINDING, f.manifest, bad));
+      for (const limits of [{ maxReplayEvents: 2 }, { maxReplayBytes: 256 }]) {
+        const bounded = new ProjectionIntegrityService({ driver, eventStorePath: "unused", projectionDirectory: f.projectionDirectory, ...limits });
+        expectIntegrityFailure(() => bounded.verifyCommittedSnapshot(BINDING, f.manifest, repeatable));
+      }
+      mutateDatabase(f, "UPDATE canonical_items SET summary='tampered'");
+      expectIntegrityFailure(() => service.verifyCommittedSnapshot(BINDING, f.manifest, repeatable));
+    } finally { closeOwned(snapshot); }
+  });
+});
+
+function productionIdentityReaderDriver(): SqliteDriver {
+  return {
+    open(): SqliteConnection {
+      return {
+        exec(): void { /* snapshot transaction seam */ },
+        prepare(sql: string): SqliteStatement {
+          return {
+            run(): SqliteRunResult { return { changes: 0n, lastInsertRowid: 0n }; },
+            get(): SqliteRow | undefined {
+              if (sql.includes("FROM project_meta")) {
+                return {
+                  project_id: PRODUCTION_BINDING.projectId,
+                  vault_id: PRODUCTION_BINDING.vaultId,
+                  store_id: PRODUCTION_BINDING.storeId,
+                };
+              }
+              if (sql.includes("count(*) AS event_count")) {
+                return { event_count: 0n, maximum_row_bytes: 0n, aggregate_bytes: 0n };
+              }
+              return undefined;
+            },
+            all(): SqliteRow[] { return []; },
+            *iterate(): IterableIterator<SqliteRow> { /* empty committed snapshot */ },
+          };
+        },
+        close(): void { /* snapshot closes cleanly */ },
+      };
+    },
+  };
+}
+
+afterEach(t => {
+  try { cleanupFixtures(t as TestContext); } finally { activeEvidence = undefined; }
+});
+
+function uuid(index: number): string {
+  return `${index.toString(16).padStart(8, "0")}-0000-4000-8000-${index.toString(16).padStart(12, "0")}`;
+}
+
+function projectionPayload(itemId: string, normalizedKey: string, summary: string): JsonValue {
+  return {
+    sourceVersion: 1,
+    binding: { ...BINDING, sessionId: SESSION_ID },
+    itemId,
+    normalizedKey,
+    status: "verified",
+    confidence: "high",
+    verificationMethod: "production-event-writer",
+    validFrom: NOW,
+    validTo: null,
+    summary,
+    contentHash: createHash("sha256").update(summary, "utf8").digest("hex"),
+  };
+}
+
+function pendingEvent(eventType: string, payload: JsonValue): PendingEvent {
+  return {
+    eventType,
+    eventSchemaVersion: 1,
+    occurredAt: NOW,
+    visibilityScope: "project",
+    sessionId: SESSION_ID,
+    confidence: "high",
+    verificationStatus: "verified",
+    payload,
+    sourceRefs: [],
+    evidenceRefs: [],
+    evidenceDigests: [],
+  };
+}
+
+function trustedContext(root: string): ProjectContext {
+  const workspace: GitWorkspaceSnapshot = {
+    kind: "git",
+    worktreeRoot: root,
+    gitDir: join(root, ".git", "worktrees", "integrity"),
+    gitCommonDir: join(root, ".git"),
+    headCommit: "0123456789abcdef0123456789abcdef01234567",
+    branchRef: BRANCH_REF,
+    detached: false,
+    workspaceId: WORKSPACE_ID,
+  };
+  const binding: TrustedProjectBinding = {
+    projectBindingId: "projection-integrity-binding",
+    generation: 1,
+    contextFingerprint: "projection-integrity-context",
+    source: "explicit-cli",
+    projectId: PROJECT_ID,
+    vaultId: VAULT_ID,
+    storeId: STORE_ID,
+    workspaceId: WORKSPACE_ID,
+    clientNamespace: "projection-integrity-tests",
+    clientInstanceId: "projection-integrity-client",
+    actorRole: "primary",
+    projectRoot: root,
+    vaultRoot: join(root, "memory"),
+    descriptorPath: join(root, "memory", ".project-memory.json"),
+    storeRoute: {
+      kind: "git-common",
+      storeRoot: join(root, ".git", "project-memory"),
+      eventsPath: join(root, ".git", "project-memory", "events.sqlite"),
+      storeManifestPath: join(root, ".git", "project-memory", "store.json"),
+      projectionManifestPath: join(root, ".git", "project-memory", "projection.json"),
+    },
+    workspace,
+    establishedAt: NOW,
+  };
+  return { binding, workspace, checkedAt: NOW };
+}
+
+const TABLES = Object.freeze({
+  sessionTree: ["session_tree", ["project_id", "session_id", "root_session_id", "parent_session_id", "lifecycle_state", "owner_generation", "opened_event_position", "closed_event_position", "latest_checkpoint_id", "latest_checkpoint_event_position", "source_event_id", "source_event_position", "anchor"], "project_id, session_id"],
+  sessionCheckpoints: ["session_checkpoints", ["project_id", "session_id", "checkpoint_id", "checkpoint_version", "base_event_position", "source_event_id", "source_event_position", "occurred_at", "task_summary", "anchor"], "project_id, session_id, source_event_position, checkpoint_id"],
+  canonicalItems: ["canonical_items", ["project_id", "session_id", "item_id", "normalized_key", "conflict_group_id", "superseding_item_id", "status", "confidence", "verification_method", "valid_from", "valid_to", "summary", "content_hash", "known_from_event_position", "source_event_id", "source_event_position", "anchor"], "project_id, item_id"],
+  tasksFollowups: ["tasks_followups", ["project_id", "session_id", "follow_up_id", "status", "summary", "confidence", "source_event_id", "source_event_position", "anchor"], "project_id, follow_up_id"],
+  artifactsFiles: ["artifacts_files", ["project_id", "session_id", "artifact_id", "path", "summary", "action", "content_hash", "branch_ref", "confidence", "symbol", "commit_hash", "heading", "source_event_id", "source_event_position", "anchor"], "project_id, session_id, artifact_id"],
+  lexicalChunks: ["lexical_chunks", ["project_id", "chunk_id", "item_id", "session_id", "section", "normalized_key", "text", "source_event_id", "source_event_position", "anchor"], "project_id, chunk_id"],
+  retrievalFeedback: ["retrieval_feedback", ["project_id", "feedback_id", "item_id", "outcome", "usefulness", "source_item_event_position", "source_event_id", "source_event_position", "anchor"], "project_id, feedback_id"],
+} as const satisfies Record<Exclude<ProjectionName, "entityGraph">, readonly [string, readonly string[], string]>);
+
+const ENTITY_TABLES = Object.freeze([
+  ["node", "entity_nodes", ["project_id", "entity_id", "normalized_name", "entity_type", "valid_from", "valid_to", "source_event_id", "source_event_position", "anchor"], "project_id, entity_id"],
+  ["alias", "entity_aliases", ["project_id", "alias_id", "entity_id", "normalized_alias", "valid_from", "valid_to", "source_event_id", "source_event_position", "anchor"], "project_id, alias_id"],
+  ["edge", "entity_edges", ["project_id", "edge_id", "source_entity_id", "target_entity_id", "edge_type", "valid_from", "valid_to", "source_event_id", "source_event_position", "anchor"], "project_id, edge_id"],
+] as const);
+
+const NUMBER_COLUMNS = new Set(["checkpoint_version", "owner_generation", "usefulness"]);
+
+function canonicalValue(value: unknown, column: string): null | number | string {
+  if (value === null || typeof value === "string") return value;
+  assert.ok(typeof value === "number" && Number.isSafeInteger(value));
+  return NUMBER_COLUMNS.has(column) ? value : String(value);
+}
+
+function databaseSha256(path: string): string {
+  return createHash("sha256").update(readFileSync(path)).digest("hex");
+}
+
+function coreChecksum(path: string, name: ProjectionName, terminal: bigint): string {
+  const database = fixtureDatabase(path, { readOnly: true });
+  try {
+    const rows: CanonicalProjectionRow[] = [];
+    if (name === "entityGraph") {
+      for (const [relation, table, columns, order] of ENTITY_TABLES) {
+        for (const raw of database.prepare(`SELECT ${columns.join(", ")} FROM ${table} ORDER BY ${order}`).all()) {
+          const row: Record<string, null | number | string> = { relation };
+          for (const column of columns) row[column] = canonicalValue(raw[column], column);
+          rows.push(row as CanonicalProjectionRow);
+        }
+      }
+    } else {
+      const [table, columns, order] = TABLES[name];
+      for (const raw of database.prepare(`SELECT ${columns.join(", ")} FROM ${table} ORDER BY ${order}`).all()) {
+        const row: Record<string, null | number | string> = {};
+        for (const column of columns) row[column] = canonicalValue(raw[column], column);
+        rows.push(row as CanonicalProjectionRow);
+      }
+    }
+    return projectionCoreChecksum(name, 2, PROJECT_ID, terminal, rows);
+  } finally {
+    closeOwned(database);
+  }
+}
+
+function assertMainFileOnly(path: string): void {
+  assert.equal(existsSync(`${path}-wal`), false, "tamper fixture must not leave a WAL sidecar");
+  assert.equal(existsSync(`${path}-shm`), false, "tamper fixture must not leave an SHM sidecar");
+}
+
+interface Fixture {
+  readonly sourcePath: string;
+  readonly projectionDirectory: string;
+  readonly databasePath: string;
+  readonly manifest: ProjectionManifestV2;
+  readonly integrity: ProjectionIntegrityService;
+}
+
+interface FixtureOptions {
+  readonly rootSpelling?: "raw" | "native";
+  readonly beforePublish?: (directory: string) => void;
+  readonly events?: readonly PendingEvent[];
+  readonly maxReplayEvents?: number;
+  readonly maxReplayBytes?: number;
+}
+
+async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
+  const root = fixtureRoot("projection-full-integrity-", options.rootSpelling ?? "native");
+  if (activeEvidence !== undefined) Object.assign(activeEvidence, rootEvidence(ownerForPath(root), root, options.rootSpelling ?? "native"));
+  const sourcePath = join(root, "events.sqlite");
+  const projectionDirectory = join(root, "projections");
+  let connection: SqliteConnection;
+  try { connection = trackResource(driver.open(sourcePath, { mode: "create", busyTimeoutMs: 5_000 }), sourcePath); }
+  catch (primary) { ownerForPath(sourcePath).retain(); throw primary; }
+  let expectedStreamVersion = 0n;
+  try {
+  applyCurrentProjectStoreSchema(
+    connection,
+    { projectId: PROJECT_ID, vaultId: VAULT_ID, storeId: STORE_ID },
+    NOW,
+  );
+
+  let nextId = 600;
+  const eventStore = new EventStore(
+    connection,
+    new SqliteEventStoreStatements(connection),
+    new MaintenanceFence(),
+    new BranchScopeRepository({ randomId: () => BRANCH_SCOPE_ID }),
+    () => NOW,
+    () => uuid(nextId++),
+  );
+  const events = options.events ?? [
+    pendingEvent("MemorySourceRecorded", projectionPayload(
+      ITEM_A,
+      "decision:authoritative-replay",
+      "Projection rows are replayed from authoritative events.",
+    )),
+    pendingEvent("MemorySourceRecorded", projectionPayload(
+      ITEM_B,
+      "decision:immutable-generation",
+      "Published generations are immutable.",
+    )),
+    pendingEvent("RetrievalFeedbackRecorded", {
+      feedbackVersion: 1,
+      binding: { ...BINDING, sessionId: SESSION_ID },
+      feedbackId: FEEDBACK_ID,
+      itemId: ITEM_A,
+      outcome: "accepted",
+      usefulness: 9000,
+      sourceItemEventPosition: "1",
+    }),
+  ];
+  for (let offset = 0; offset < events.length; offset += 128) {
+    const batch = events.slice(offset, offset + 128);
+    const commandIndex = Math.floor(offset / 128);
+    const command: AppendCommand<JsonValue> = {
+      context: trustedContext(root),
+      commandId: uuid(900_000 + commandIndex),
+      idempotencyKey: `projection-integrity/build/${commandIndex}`,
+      commandType: "RecordProjectionSources",
+      correlationId: uuid(910_000 + commandIndex),
+      agentId: "projection-integrity-agent",
+      expectedStreamVersion,
+      streamId: `session/${SESSION_ID}`,
+      streamType: "session",
+      events: batch,
+      outbox: [],
+      publicResponse: { recorded: true },
+    };
+    eventStore.append(command);
+    expectedStreamVersion += BigInt(batch.length);
+  }
+
+  } catch (primary) {
+    try { closeOwned(connection); } catch { ownerForPath(sourcePath).retain(); }
+    throw primary;
+  }
+  closeOwned(connection);
+  if (activeEvidence !== undefined) activeEvidence.phase = "coordinator-constructor";
+  const coordinator = new V2ProjectionBuildCoordinator({
+    projectionDirectory,
+    pathInspection: activeEvidence === undefined ? undefined : forwardingInspection(activeEvidence, projectionDirectory),
+    // Semantic fixture setup is independent of wall-clock performance; deadline contracts have dedicated controls.
+    now: () => 0,
+    eventReader: new SqliteProjectionEventReader({ driver, eventStorePath: sourcePath }),
+    builder: new ImmutableProjectionBuilder({ driver, projectionDirectory, now: () => NOW }),
+  });
+  options.beforePublish?.(projectionDirectory);
+  if (activeEvidence !== undefined) activeEvidence.phase = "ensure-published";
+  const generation = await coordinator.ensurePublished(BINDING, expectedStreamVersion, 10_000);
+  return {
+    sourcePath,
+    projectionDirectory,
+    databasePath: generation.databasePath,
+    manifest: generation.manifest,
+    integrity: new ProjectionIntegrityService({
+      driver,
+      eventStorePath: sourcePath,
+      projectionDirectory,
+      maxReplayEvents: options.maxReplayEvents,
+      maxReplayBytes: options.maxReplayBytes,
+    }),
+  };
+}
+
+function mutateDatabase(fixture: Fixture, sql: string): void {
+  const database = fixtureDatabase(fixture.databasePath);
+  try {
+    database.exec(sql);
+    database.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+    assert.equal(database.prepare("PRAGMA journal_mode=DELETE").get()?.journal_mode, "delete");
+  } finally {
+    closeOwned(database);
+  }
+  assertMainFileOnly(fixture.databasePath);
+}
+
+function mutateFtsShadowDatabase(fixture: Fixture, sql: string): void {
+  const database = fixtureDatabase(fixture.databasePath, {
+    defensive: false,
+  });
+  try {
+    database.exec(sql);
+    database.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+    assert.equal(database.prepare("PRAGMA journal_mode=DELETE").get()?.journal_mode, "delete");
+  } finally {
+    closeOwned(database);
+  }
+  assertMainFileOnly(fixture.databasePath);
+}
+
+function resignedManifest(
+  fixture: Fixture,
+  changedChecksums: readonly ProjectionName[] = [],
+): ProjectionManifestV2 {
+  const terminal = BigInt(fixture.manifest.terminalEventPosition);
+  const coreChecksums = { ...fixture.manifest.coreChecksums };
+  for (const name of changedChecksums) {
+    coreChecksums[name] = coreChecksum(fixture.databasePath, name, terminal);
+  }
+  return parseProjectionManifestV2({
+    ...fixture.manifest,
+    databaseSha256: databaseSha256(fixture.databasePath),
+    coreChecksums,
+  }, BINDING);
+}
+
+function resignedUnpublishedImage(fixture: Fixture): Uint8Array {
+  const terminal = BigInt(fixture.manifest.terminalEventPosition);
+  const database = fixtureDatabase(fixture.databasePath);
+  try {
+    const update = database.prepare(`
+      UPDATE projection_core_checksums SET checksum = ? WHERE projection_name = ?
+    `);
+    for (const name of PROJECTION_NAMES) update.run(coreChecksum(fixture.databasePath, name, terminal), name);
+    database.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+    assert.equal(database.prepare("PRAGMA journal_mode=DELETE").get()?.journal_mode, "delete");
+  } finally {
+    closeOwned(database);
+  }
+  assertMainFileOnly(fixture.databasePath);
+  return readFileSync(fixture.databasePath);
+}
+
+function expectUnpublishedImageRejection(
+  fixture: Fixture,
+  bytes: Uint8Array,
+): void {
+  assert.throws(
+    () => assertUnpublishedProjectionV2Image(bytes, basename(fixture.databasePath), BINDING),
+    (error: unknown) => typeof error === "object" && error !== null
+      && (error as { code?: unknown }).code === "INTEGRITY_FAILURE",
+  );
+}
+
+function expectIntegrityFailure(action: () => unknown): void {
+  assert.throws(action, (error: unknown) => {
+    if (typeof error !== "object" || error === null) return false;
+    const candidate = error as { code?: unknown; message?: unknown; safeMessage?: unknown };
+    return candidate.code === "INTEGRITY_FAILURE"
+      && typeof candidate.message === "string"
+      && candidate.message.startsWith("INTEGRITY_FAILURE:")
+      && candidate.safeMessage === "Lifecycle integrity verification failed";
+  });
+}
+
+function ftsDecisionRanks(path: string): readonly Readonly<{ rowid: bigint; rank: number }>[] {
+  const database = fixtureDatabase(path, { readOnly: true });
+  let rows: readonly Readonly<{ rowid: bigint; rank: number }>[];
+  try {
+    const query = database.prepare(`
+      SELECT rowid, rank FROM lexical_chunks_fts
+      WHERE lexical_chunks_fts MATCH 'decision'
+      ORDER BY rowid
+    `);
+    query.setReadBigInts(true);
+    rows = Object.freeze(query.all().map((row) => Object.freeze({
+      rowid: row.rowid as bigint,
+      rank: row.rank as number,
+    })));
+  } finally {
+    closeOwned(database);
+  }
+  assertMainFileOnly(path);
+  return rows;
+}
+
+function observingFullEventRows(onRow: () => void): SqliteDriver {
+  return {
+    open(path: string, options: SqliteOpenOptions): SqliteConnection {
+      const connection = driver.open(path, options);
+      return {
+        exec: (sql) => connection.exec(sql),
+        close: () => connection.close(),
+        prepare(sql: string): SqliteStatement {
+          const prepared = connection.prepare(sql);
+          if (!sql.includes("payload_json, payload_hash") || !sql.includes("FROM events")) {
+            return prepared;
+          }
+          return {
+            run: (params?: SqliteParams) => prepared.run(params),
+            get: (params?: SqliteParams) => prepared.get(params),
+            all: (params?: SqliteParams) => prepared.all(params),
+            iterate(params?: SqliteParams) {
+              const source = prepared.iterate(params);
+              return (function* observedRows() {
+                for (const row of source) {
+                  onRow();
+                  yield row;
+                }
+              })();
+            },
+          };
+        },
+      };
+    },
+  };
+}
+
+
+let activeEvidence: SpellingEvidence | undefined;
+
+async function assertIntegrityReplay(t: TestContext, rootSpelling: "raw" | "native"): Promise<void> {
+  const evidence: SpellingEvidence = { spelling: rootSpelling, nonNative: false, phase: "fixture-setup", inspectionChecks: [], captureAttempts: 0, captureOutcome: "unobserved" };
+  activeEvidence = evidence;
+  const collector = createCiDiagnosticCollector(line => t.diagnostic(line));
+  const fixture = await createFixture({ rootSpelling, beforePublish: directory => {
+    capturePathSnapshot({ family: "integrity", caseId: "integrity-control", directory }, collector);
+    try { t.diagnostic(`CI path diagnostics incomplete=${collector.incomplete}`); } catch { /* Informational only. */ }
+  } });
+  const sourceBefore = databaseSha256(fixture.sourcePath);
+  const generationBefore = databaseSha256(fixture.databasePath);
+  assert.equal(fixture.manifest.databaseSha256, generationBefore);
+
+  evidence.phase = "integrity-verification";
+  const report = fixture.integrity.verify(BINDING, fixture.manifest);
+
+  assert.deepEqual(report, { status: "passed", terminalEventPosition: "3" });
+  assert.ok(Object.isFrozen(report));
+  assert.equal(databaseSha256(fixture.sourcePath), sourceBefore);
+  assert.equal(databaseSha256(fixture.databasePath), generationBefore);
+  evidence.phase = "business-assertions-completed";
+}
+
+describe("full projection integrity replay", () => {
+  it("opens a committed snapshot for production UUID project-store identities", async () => {
+    const snapshot = await new SqliteProjectionEventReader({
+      driver: productionIdentityReaderDriver(),
+      eventStorePath: "production-identities.sqlite",
+    }).openCommittedSnapshot(PRODUCTION_BINDING);
+    assert.deepEqual(snapshot.binding, PRODUCTION_BINDING);
+    assert.equal(snapshot.eventCount, 0);
+    snapshot.close();
+  });
+
+  it("accepts a production UUID project identity in the projection checksum domain", () => {
+    assert.doesNotThrow(() => projectionCoreChecksum(
+      "sessionTree",
+      2,
+      PRODUCTION_BINDING.projectId,
+      0n,
+      [],
+    ));
+  });
+
+  it("returns a frozen pass report only for an exact authoritative replay", t => assertIntegrityReplay(t, "native"));
+
+  it("projection spelling control: integrity", async t => {
+    for (const spelling of ["raw", "native"] as const) {
+      let failure: unknown;
+      try { await assertIntegrityReplay(t, spelling); } catch (original) { failure = original; }
+      const evidence = activeEvidence!;
+      t.diagnostic(`spelling=${spelling} nonNative=${evidence.nonNative} phase=${evidence.phase} inspectionChecks=${JSON.stringify(evidence.inspectionChecks)} captureAttempts=${evidence.captureAttempts} captureOutcome=${evidence.captureOutcome}`);
+      if (spelling === "raw" && evidence.nonNative) {
+        assertRawProjectionRefusal(failure, evidence);
+      } else {
+        if (failure !== undefined) throw failure;
+        assert.equal(evidence.phase, "business-assertions-completed");
+      }
+    }
+  });
+
+  it("rejects a re-signed WAL-only mutation that a pathname reader observes", async () => {
+    const fixture = await createFixture();
+    const mainBefore = databaseSha256(fixture.databasePath);
+    const alteredSummary = "WAL sidecar rows outrank pinned main-file bytes.";
+    const writer = fixtureDatabase(fixture.databasePath, { defensive: false });
+    try {
+      writer.exec("PRAGMA journal_mode = WAL; PRAGMA wal_autocheckpoint = 0");
+      const walMainBefore = databaseSha256(fixture.databasePath);
+      assert.notEqual(walMainBefore, mainBefore, "entering WAL mode changes the main header bytes");
+      writer.prepare(`
+        UPDATE canonical_items SET summary = ? WHERE item_id = ?
+      `).run(alteredSummary, ITEM_A);
+
+      assert.equal(existsSync(`${fixture.databasePath}-wal`), true);
+      assert.equal(databaseSha256(fixture.databasePath), walMainBefore);
+      const pathnameReader = fixtureDatabase(fixture.databasePath, { readOnly: true });
+      try {
+        assert.equal(
+          pathnameReader.prepare(`
+            SELECT summary FROM canonical_items WHERE item_id = ?
+          `).get(ITEM_A)?.summary,
+          alteredSummary,
+        );
+      } finally {
+        closeOwned(pathnameReader);
+      }
+
+      const reSigned = resignedManifest(fixture);
+      assert.equal(reSigned.databaseSha256, walMainBefore);
+      expectIntegrityFailure(() => fixture.integrity.verify(BINDING, reSigned));
+    } finally {
+      closeOwned(writer);
+    }
+  });
+
+  it("maps a published generation sidecar to manifest-path integrity failure", async () => {
+    const fixture = await createFixture();
+    const writer = fixtureDatabase(fixture.databasePath, { defensive: false });
+    try {
+      writer.exec("PRAGMA journal_mode = WAL; PRAGMA wal_autocheckpoint = 0");
+      writer.prepare(`
+        UPDATE canonical_items SET summary = ? WHERE item_id = ?
+      `).run("pathname-visible sidecar tamper", ITEM_A);
+
+      assert.throws(
+        () => verifyProjectionPublicationPaths(
+          fixture.projectionDirectory,
+          fixture.manifest.databaseFile,
+        ),
+        /INTEGRITY_FAILURE/u,
+      );
+    } finally {
+      closeOwned(writer);
+    }
+  });
+
+  it("maps a non-ENOENT exact sidecar lstat failure through integrity verification", async () => {
+    const fixture = await createFixture();
+    const integrity = new ProjectionIntegrityService({
+      driver,
+      eventStorePath: fixture.sourcePath,
+      projectionDirectory: fixture.projectionDirectory,
+      pathInspection: {
+        lstat(path: string) {
+          if (path === `${fixture.databasePath}-wal`) {
+            throw Object.assign(new Error("injected exact-sidecar lstat denial"), { code: "EACCES" });
+          }
+          return lstatSync(path);
+        },
+        realpath: (path: string) => realpathSync(path),
+      },
+    });
+
+    expectIntegrityFailure(() => integrity.verify(BINDING, fixture.manifest));
+  });
+
+  it("rejects a sidecar introduced at either pinned-image inspection boundary", async () => {
+    for (const [boundary, suffix] of [
+      ["after-generation-identity-before-open", "-wal"],
+      ["after-generation-open-before-inspection", "-shm"],
+    ] as const) {
+      const fixture = await createFixture();
+      let injected = false;
+      const integrity = new ProjectionIntegrityService({
+        driver,
+        eventStorePath: fixture.sourcePath,
+        projectionDirectory: fixture.projectionDirectory,
+        faultInjector: {
+          hit(actual): void {
+            if (actual !== boundary || injected) return;
+            injected = true;
+            writeFileSync(`${fixture.databasePath}${suffix}`, "late sidecar entry", "utf8");
+          },
+        },
+      });
+
+      expectIntegrityFailure(() => integrity.verify(BINDING, fixture.manifest));
+      assert.equal(injected, true);
+      assert.equal(readFileSync(`${fixture.databasePath}${suffix}`, "utf8"), "late sidecar entry");
+    }
+  });
+
+  it("replays a scale generation through the bounded linear core", async () => {
+    const events = Array.from({ length: 256 }, (_, index) => pendingEvent(
+      "MemorySourceRecorded",
+      projectionPayload(
+        uuid(20_000 + index),
+        `scale:item:${index.toString().padStart(4, "0")}`,
+        `Authoritative scale item ${index}.`,
+      ),
+    ));
+    const fixture = await createFixture({ events });
+
+    assert.deepEqual(fixture.integrity.verify(BINDING, fixture.manifest), {
+      status: "passed",
+      terminalEventPosition: "256",
+    });
+  });
+
+  it("does not sort the full expected projection while comparing a scale generation", async () => {
+    const events = Array.from({ length: 256 }, (_, index) => pendingEvent(
+      "MemorySourceRecorded",
+      projectionPayload(
+        uuid(30_000 + index),
+        `linear:item:${index.toString().padStart(4, "0")}`,
+        `Linear comparison item ${index}.`,
+      ),
+    ));
+    const fixture = await createFixture({ events });
+    const nativeSort = Array.prototype.sort;
+    Array.prototype.sort = function guardedSort(compareFn) {
+      if (this.length >= 128) throw new Error("FULL_EXPECTED_SORT_FORBIDDEN");
+      return nativeSort.call(this, compareFn) as typeof this;
+    };
+    try {
+      assert.deepEqual(fixture.integrity.verify(BINDING, fixture.manifest), {
+        status: "passed",
+        terminalEventPosition: "256",
+      });
+    } finally {
+      Array.prototype.sort = nativeSort;
+    }
+  });
+
+  it("fails closed when authoritative replay exceeds its configured event bound", async () => {
+    const fixture = await createFixture({ maxReplayEvents: 2 });
+
+    expectIntegrityFailure(() => fixture.integrity.verify(BINDING, fixture.manifest));
+  });
+
+  it("fails closed when authoritative replay exceeds its configured byte bound", async () => {
+    const fixture = await createFixture({ maxReplayBytes: 256 });
+
+    expectIntegrityFailure(() => fixture.integrity.verify(BINDING, fixture.manifest));
+  });
+
+  it("reuses stored-event authentication to reject authoritative metadata tamper", async () => {
+    const fixture = await createFixture();
+    const source = fixtureDatabase(fixture.sourcePath);
+    try {
+      source.exec(`
+        DROP TRIGGER events_no_update;
+        UPDATE events SET agent_id = 'forged-replay-agent' WHERE global_position = 1;
+        PRAGMA wal_checkpoint(TRUNCATE);
+      `);
+    } finally {
+      closeOwned(source);
+    }
+
+    expectIntegrityFailure(() => fixture.integrity.verify(BINDING, fixture.manifest));
+  });
+
+  it("rejects an oversized stored payload before a full event row reaches JavaScript", async () => {
+    const fixture = await createFixture();
+    const source = fixtureDatabase(fixture.sourcePath);
+    try {
+      source.exec(`
+        DROP TRIGGER events_no_update;
+        UPDATE events
+        SET payload_json = '"' || hex(zeroblob(524288)) || '"'
+        WHERE global_position = 1
+      `);
+      source.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+    } finally {
+      closeOwned(source);
+    }
+    let fullRowsDelivered = 0;
+    const integrity = new ProjectionIntegrityService({
+      driver: observingFullEventRows(() => { fullRowsDelivered += 1; }),
+      eventStorePath: fixture.sourcePath,
+      projectionDirectory: fixture.projectionDirectory,
+    });
+
+    expectIntegrityFailure(() => integrity.verify(BINDING, fixture.manifest));
+    assert.equal(fullRowsDelivered, 0);
+  });
+
+  it("rejects a same-byte generation replacement race before opening SQLite", async () => {
+    const fixture = await createFixture();
+    const replacementPath = `${fixture.databasePath}.replacement`;
+    const retiredPath = `${fixture.databasePath}.retired`;
+    copyFileSync(fixture.databasePath, replacementPath);
+    let injected = false;
+    const integrity = new ProjectionIntegrityService({
+      driver,
+      eventStorePath: fixture.sourcePath,
+      projectionDirectory: fixture.projectionDirectory,
+      faultInjector: {
+        hit(boundary): void {
+          if (boundary !== "after-generation-identity-before-open" || injected) return;
+          injected = true;
+          renameSync(fixture.databasePath, retiredPath);
+          renameSync(replacementPath, fixture.databasePath);
+        },
+      },
+    });
+
+    expectIntegrityFailure(() => integrity.verify(BINDING, fixture.manifest));
+    assert.equal(injected, true);
+    assert.equal(databaseSha256(fixture.databasePath), fixture.manifest.databaseSha256);
+  });
+
+  it("keeps descriptor-captured A bytes across an A-to-B-to-A generation pathname swap", async () => {
+    const fixture = await createFixture();
+    const originalPath = `${fixture.databasePath}.original`;
+    const alternatePath = `${fixture.databasePath}.alternate`;
+    copyFileSync(fixture.databasePath, alternatePath);
+    mutateFtsShadowDatabase({ ...fixture, databasePath: alternatePath }, `
+      UPDATE lexical_chunks_fts_docsize SET sz = X'0101' WHERE id = 1
+    `);
+    assert.notEqual(databaseSha256(alternatePath), fixture.manifest.databaseSha256);
+    let swapped = false;
+    let restored = false;
+    const integrity = new ProjectionIntegrityService({
+      driver,
+      eventStorePath: fixture.sourcePath,
+      projectionDirectory: fixture.projectionDirectory,
+      faultInjector: {
+        hit(boundary): void {
+          if (boundary === "after-generation-identity-before-open" && !swapped) {
+            renameSync(fixture.databasePath, originalPath);
+            renameSync(alternatePath, fixture.databasePath);
+            swapped = true;
+          } else if (boundary === "after-generation-open-before-inspection" && !restored) {
+            renameSync(fixture.databasePath, alternatePath);
+            renameSync(originalPath, fixture.databasePath);
+            restored = true;
+          }
+        },
+      },
+    });
+
+    assert.deepEqual(integrity.verify(BINDING, fixture.manifest), {
+      status: "passed",
+      terminalEventPosition: "3",
+    });
+    assert.equal(swapped, true);
+    assert.equal(restored, true);
+    assert.equal(databaseSha256(fixture.databasePath), fixture.manifest.databaseSha256);
+  });
+
+  it("does not create or clean any scratch inspection pathname", async () => {
+    const fixture = await createFixture();
+    const boundaries: string[] = [];
+    const integrity = new ProjectionIntegrityService({
+      driver,
+      eventStorePath: fixture.sourcePath,
+      projectionDirectory: fixture.projectionDirectory,
+      faultInjector: {
+        hit(boundary): void {
+          boundaries.push(String(boundary));
+        },
+      },
+    });
+
+    assert.deepEqual(integrity.verify(BINDING, fixture.manifest), {
+      status: "passed",
+      terminalEventPosition: "3",
+    });
+    assert.deepEqual(boundaries, [
+      "after-generation-identity-before-open",
+      "after-generation-open-before-inspection",
+    ]);
+  });
+
+  it("opens the pinned byte image only through in-memory deserialization", async () => {
+    const fixture = await createFixture();
+    const sourceBefore = readFileSync(fixture.sourcePath);
+    const projectionBefore = readFileSync(fixture.databasePath);
+    const sourceStat = lstatSync(fixture.sourcePath, { bigint: true });
+    const projectionStat = lstatSync(fixture.databasePath, { bigint: true });
+    const root = dirname(fixture.projectionDirectory);
+    const rootEntries = readdirSync(root).sort();
+    const projectionEntries = readdirSync(fixture.projectionDirectory).sort();
+    const bytes = Uint8Array.from(projectionBefore);
+    bytes[18] = 2;
+    bytes[19] = 2;
+    const rawBefore = Uint8Array.from(bytes);
+    const database = trackResource(openImmutableProjectionImage(bytes, 35), fixture.databasePath);
+    try {
+      assert.equal(database.prepare("PRAGMA database_list").all().find(row => row.name === "main")?.file, "");
+      assert.equal(database.prepare("SELECT count(*) AS n FROM lexical_chunks").get()?.n, 2);
+      assert.equal(database.prepare("PRAGMA query_only").get()?.query_only, 1);
+      assert.equal(database.prepare("PRAGMA trusted_schema").get()?.trusted_schema, 0);
+      assert.equal(database.prepare("PRAGMA foreign_keys").get()?.foreign_keys, 1);
+      assert.equal(database.prepare("PRAGMA busy_timeout").get()?.timeout, 35);
+      assert.throws(() => database.exec("DELETE FROM lexical_chunks"));
+      assert.deepEqual(bytes, rawBefore, "normalization must preserve the pinned raw-byte SHA domain");
+    } finally { closeOwned(database); }
+    assert.deepEqual(readFileSync(fixture.sourcePath), sourceBefore);
+    assert.deepEqual(readFileSync(fixture.databasePath), projectionBefore);
+    for (const [path, before] of [[fixture.sourcePath, sourceStat], [fixture.databasePath, projectionStat]] as const) {
+      const after = lstatSync(path, { bigint: true });
+      assert.deepEqual([after.dev, after.ino, after.size, after.ctimeNs], [before.dev, before.ino, before.size, before.ctimeNs]);
+    }
+    assert.deepEqual(readdirSync(root).sort(), rootEntries);
+    assert.deepEqual(readdirSync(fixture.projectionDirectory).sort(), projectionEntries);
+  });
+
+  it("detects a missing derived row after outer hashes are recomputed", async () => {
+    const fixture = await createFixture();
+    mutateDatabase(fixture, `DELETE FROM lexical_chunks WHERE item_id = '${ITEM_A}'`);
+    expectIntegrityFailure(() => fixture.integrity.verify(
+      BINDING,
+      resignedManifest(fixture, ["lexicalChunks"]),
+    ));
+  });
+
+  it("detects an extra derived row after outer hashes are recomputed", async () => {
+    const fixture = await createFixture();
+    mutateDatabase(fixture, `
+      INSERT INTO entity_nodes(
+        project_id, entity_id, normalized_name, entity_type, valid_from, valid_to,
+        source_event_id, source_event_position, anchor
+      ) VALUES (
+        '${PROJECT_ID}', '00000000-0000-4000-8000-000000000499',
+        'invented entity', 'invented', '${NOW}', NULL,
+        '00000000-0000-4000-8000-000000000498', 3, NULL
+      )
+    `);
+    expectIntegrityFailure(() => fixture.integrity.verify(
+      BINDING,
+      resignedManifest(fixture, ["entityGraph"]),
+    ));
+  });
+
+  it("detects provenance-tampered V2 rows after database and logical hashes are recomputed", async () => {
+    const fixture = await createFixture();
+    mutateDatabase(fixture, `
+      UPDATE canonical_items
+      SET source_event_id = '00000000-0000-4000-8000-000000000499',
+          anchor = 'memory/items#forged'
+      WHERE item_id = '${ITEM_A}'
+    `);
+    expectIntegrityFailure(() => fixture.integrity.verify(
+      BINDING,
+      resignedManifest(fixture, ["canonicalItems"]),
+    ));
+  });
+
+  it("detects canonical row reordering even though logical core rows are unchanged", async () => {
+    const fixture = await createFixture();
+    mutateDatabase(fixture, `
+      UPDATE lexical_chunks SET row_id = row_id + 100;
+      UPDATE lexical_chunks SET row_id = CASE row_id WHEN 101 THEN 2 WHEN 102 THEN 1 END;
+    `);
+    expectIntegrityFailure(() => fixture.integrity.verify(
+      BINDING,
+      resignedManifest(fixture),
+    ));
+  });
+
+  it("detects cross-project rows after outer hashes are recomputed", async () => {
+    const fixture = await createFixture();
+    mutateDatabase(fixture, `
+      UPDATE canonical_items SET project_id = '${OTHER_PROJECT_ID}' WHERE item_id = '${ITEM_A}'
+    `);
+    expectIntegrityFailure(() => fixture.integrity.verify(
+      BINDING,
+      resignedManifest(fixture, ["canonicalItems"]),
+    ));
+  });
+
+  it("detects noncanonical derived values after outer hashes are recomputed", async () => {
+    const fixture = await createFixture();
+    mutateDatabase(fixture, `
+      UPDATE canonical_items SET normalized_key = 'Decision:Authoritative-Replay'
+      WHERE item_id = '${ITEM_A}'
+    `);
+    expectIntegrityFailure(() => fixture.integrity.verify(
+      BINDING,
+      resignedManifest(fixture, ["canonicalItems"]),
+    ));
+  });
+
+  it("detects a checksum-mismatched manifest without touching either database", async () => {
+    const fixture = await createFixture();
+    const sourceBefore = databaseSha256(fixture.sourcePath);
+    const projectionBefore = databaseSha256(fixture.databasePath);
+    const manifest = parseProjectionManifestV2({
+      ...fixture.manifest,
+      coreChecksums: {
+        ...fixture.manifest.coreChecksums,
+        canonicalItems: "f".repeat(64),
+      },
+    }, BINDING);
+
+    expectIntegrityFailure(() => fixture.integrity.verify(BINDING, manifest));
+
+    assert.equal(databaseSha256(fixture.sourcePath), sourceBefore);
+    assert.equal(databaseSha256(fixture.databasePath), projectionBefore);
+  });
+
+  it("maps manifest scope identity mismatch to the safe integrity contract", async () => {
+    const fixture = await createFixture();
+    const mismatched = {
+      ...fixture.manifest,
+      projectId: OTHER_PROJECT_ID,
+    } as ProjectionManifestV2;
+    expectIntegrityFailure(() => fixture.integrity.verify(BINDING, mismatched));
+  });
+
+  it("rejects a valid V1 manifest before any V2 source or projection byte path is opened", async () => {
+    const fixture = await createFixture();
+    const { sessionCheckpoints: _sessionCheckpoints, ...v1Checksums } = fixture.manifest.coreChecksums;
+    const { highestObservedGeneration: _highestObservedGeneration, ...v1Manifest } = fixture.manifest;
+    const v1 = parseProjectionManifest({
+      ...v1Manifest,
+      schemaVersion: 1,
+      databaseFile: "projections-1-1.sqlite",
+      coreChecksums: v1Checksums,
+    }, BINDING);
+    let sourceOpens = 0;
+    let pathInspections = 0;
+    const failBeforeOpen = new ProjectionIntegrityService({
+      driver: {
+        open(): never {
+          sourceOpens += 1;
+          throw new Error("V1_SOURCE_OPENED");
+        },
+      },
+      eventStorePath: fixture.sourcePath,
+      projectionDirectory: fixture.projectionDirectory,
+      pathInspection: {
+        lstat(): never {
+          pathInspections += 1;
+          throw new Error("V1_PROJECTION_PATH_INSPECTED");
+        },
+        realpath(): never {
+          pathInspections += 1;
+          throw new Error("V1_PROJECTION_PATH_INSPECTED");
+        },
+      },
+    });
+
+    expectIntegrityFailure(() => failBeforeOpen.verify(BINDING, v1 as never));
+    assert.equal(sourceOpens, 0);
+    assert.equal(pathInspections, 0);
+  });
+
+  it("detects projection metadata and terminal identity tampering", async () => {
+    for (const sql of [
+      "UPDATE projection_metadata SET generation = 2 WHERE singleton = 1",
+      `UPDATE projection_metadata SET terminal_event_hash = '${"e".repeat(64)}' WHERE singleton = 1`,
+    ]) {
+      const fixture = await createFixture();
+      mutateDatabase(fixture, sql);
+      expectIntegrityFailure(() => fixture.integrity.verify(
+        BINDING,
+        resignedManifest(fixture),
+      ));
+    }
+  });
+
+  it("accepts a valid unpublished V2 image through the shared semantic validator", async () => {
+    const fixture = await createFixture();
+
+    assert.doesNotThrow(() => assertUnpublishedProjectionV2Image(
+      readFileSync(fixture.databasePath),
+      basename(fixture.databasePath),
+      BINDING,
+    ));
+  });
+
+  it("detects invalid derived references after outer hashes are recomputed", async () => {
+    const fixture = await createFixture();
+    mutateDatabase(fixture, `
+      UPDATE retrieval_feedback SET item_id = '00000000-0000-4000-8000-000000000499'
+      WHERE feedback_id = '${FEEDBACK_ID}'
+    `);
+    expectIntegrityFailure(() => fixture.integrity.verify(
+      BINDING,
+      resignedManifest(fixture, ["retrievalFeedback"]),
+    ));
+  });
+
+  it("rejects a re-signed unpublished V2 image with a corrupt cross-table reference", async () => {
+    const fixture = await createFixture();
+    mutateDatabase(fixture, `
+      UPDATE retrieval_feedback SET item_id = '00000000-0000-4000-8000-000000000499'
+      WHERE feedback_id = '${FEEDBACK_ID}'
+    `);
+
+    expectUnpublishedImageRejection(fixture, resignedUnpublishedImage(fixture));
+  });
+
+  it("detects FTS index tampering even when core rows and checksums are unchanged", async () => {
+    const fixture = await createFixture();
+    const database = fixtureDatabase(fixture.databasePath);
+    try {
+      const row = database.prepare(`
+        SELECT row_id, normalized_key, text FROM lexical_chunks WHERE item_id = ?
+      `).get(ITEM_A);
+      assert.notEqual(row, undefined);
+      database.prepare(`
+        INSERT INTO lexical_chunks_fts(lexical_chunks_fts, rowid, normalized_key, text)
+        VALUES ('delete', ?, ?, ?)
+      `).run(row!.row_id, row!.normalized_key, row!.text);
+      database.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+      assert.equal(database.prepare("PRAGMA journal_mode=DELETE").get()?.journal_mode, "delete");
+    } finally {
+      closeOwned(database);
+    }
+    assertMainFileOnly(fixture.databasePath);
+    expectIntegrityFailure(() => fixture.integrity.verify(
+      BINDING,
+      resignedManifest(fixture),
+    ));
+  });
+
+  it("rejects a re-signed unpublished V2 image with FTS semantic tampering", async () => {
+    const fixture = await createFixture();
+    const database = fixtureDatabase(fixture.databasePath);
+    try {
+      const row = database.prepare(`
+        SELECT row_id, normalized_key, text FROM lexical_chunks WHERE item_id = ?
+      `).get(ITEM_A);
+      assert.notEqual(row, undefined);
+      database.prepare(`
+        INSERT INTO lexical_chunks_fts(lexical_chunks_fts, rowid, normalized_key, text)
+        VALUES ('delete', ?, ?, ?)
+      `).run(row!.row_id, row!.normalized_key, row!.text);
+      database.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+      assert.equal(database.prepare("PRAGMA journal_mode=DELETE").get()?.journal_mode, "delete");
+    } finally {
+      closeOwned(database);
+    }
+
+    expectUnpublishedImageRejection(fixture, resignedUnpublishedImage(fixture));
+  });
+
+  it("detects a dropped required retrieval index after the database hash is re-signed", async () => {
+    const fixture = await createFixture();
+    mutateDatabase(fixture, "DROP INDEX retrieval_feedback_item_idx");
+
+    expectIntegrityFailure(() => fixture.integrity.verify(
+      BINDING,
+      resignedManifest(fixture),
+    ));
+  });
+
+  it("detects persistent FTS rank configuration tampering after the database hash is re-signed", async () => {
+    const fixture = await createFixture();
+    mutateDatabase(fixture, `
+      INSERT INTO lexical_chunks_fts(lexical_chunks_fts, rank)
+      VALUES ('rank', 'bm25(10.0, 1.0)')
+    `);
+
+    expectIntegrityFailure(() => fixture.integrity.verify(
+      BINDING,
+      resignedManifest(fixture),
+    ));
+  });
+
+  it("detects rank-sensitive FTS docsize tampering after the database hash is re-signed", async () => {
+    const fixture = await createFixture();
+    const before = ftsDecisionRanks(fixture.databasePath);
+    assert.equal(before.length, 2);
+    mutateFtsShadowDatabase(fixture, `
+      UPDATE lexical_chunks_fts_docsize SET sz = X'0101' WHERE id = 1
+    `);
+    const after = ftsDecisionRanks(fixture.databasePath);
+    assert.notDeepEqual(after, before);
+
+    expectIntegrityFailure(() => fixture.integrity.verify(
+      BINDING,
+      resignedManifest(fixture),
+    ));
+  });
+
+  it("rejects database bytes that no longer match the published manifest", async () => {
+    const fixture = await createFixture();
+    mutateDatabase(fixture, `UPDATE canonical_items SET summary = 'tampered' WHERE item_id = '${ITEM_A}'`);
+    expectIntegrityFailure(() => fixture.integrity.verify(BINDING, fixture.manifest));
+  });
+});

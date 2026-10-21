@@ -4,10 +4,17 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, it } from "node:test";
-import { DEFAULT_BUSY_TIMEOUT_MS } from "../src/orchestrator/runtime/runtime-capabilities.js";
+import {
+  DEFAULT_BUSY_TIMEOUT_MS,
+  PROJECT_MEMORY_APPLICATION_ID,
+} from "../src/orchestrator/runtime/runtime-capabilities.js";
 import { MigrationRunner, migrationChecksum } from "../src/orchestrator/storage/migration-runner.js";
 import { eventCoreMigration } from "../src/orchestrator/storage/migrations/0001-event-core.js";
+import { sessionLifecycleMigration } from "../src/orchestrator/storage/migrations/0002-session-lifecycle.js";
+import { PROJECT_STORE_MIGRATIONS } from "../src/orchestrator/storage/migrations/registry.js";
 import { NodeSqliteDriver } from "../src/orchestrator/storage/node-sqlite-driver.js";
+import { SqliteQualifiedCheckpointMigrationPreflight } from "../src/orchestrator/storage/qualified-checkpoint-migration-preflight.js";
+import type { ProjectContext } from "../src/orchestrator/identity/contracts.js";
 
 const roots: string[] = [];
 const driver = new NodeSqliteDriver({ DatabaseSync });
@@ -30,11 +37,42 @@ describe("MigrationRunner", () => {
     });
     try {
       const runner = new MigrationRunner();
-      const applied = runner.apply(connection, [eventCoreMigration], "2026-07-11T00:00:00.000Z");
+      const applied = runner.apply(
+        connection,
+        [eventCoreMigration],
+        "2026-07-11T00:00:00.000Z",
+        { kind: "bootstrap-empty", beforeMigration: () => undefined },
+      );
       assert.deepEqual(applied, [1]);
+      connection.exec(`
+        INSERT INTO project_meta(
+          singleton, project_id, vault_id, store_id, schema_version, created_at
+        ) VALUES (
+          1,
+          '11111111-1111-4111-8111-111111111111',
+          '22222222-2222-4222-8222-222222222222',
+          '33333333-3333-4333-8333-333333333333',
+          1,
+          '2026-07-11T00:00:00.000Z'
+        )
+      `);
       assert.deepEqual(
-        runner.apply(connection, [eventCoreMigration], "2026-07-11T00:00:01.000Z"),
+        runner.apply(
+          connection,
+          [eventCoreMigration],
+          "2026-07-11T00:00:01.000Z",
+          { kind: "explicit-upgrade", expectedAppliedVersion: 1, beforeMigration: () => undefined },
+        ),
         [],
+      );
+      assert.throws(
+        () => runner.apply(
+          connection,
+          [eventCoreMigration],
+          "2026-07-11T00:00:01.500Z",
+          { kind: "explicit-upgrade", expectedAppliedVersion: 0, beforeMigration: () => undefined },
+        ),
+        /MIGRATION_EXPECTED_VERSION_MISMATCH/,
       );
       assert.equal(
         connection.prepare("SELECT checksum FROM schema_migrations WHERE version = 1").get()?.checksum,
@@ -48,7 +86,11 @@ describe("MigrationRunner", () => {
         () => runner.apply(connection, [{
           ...eventCoreMigration,
           sql: `${eventCoreMigration.sql}\nSELECT 1;`,
-        }], "2026-07-11T00:00:02.000Z"),
+        }], "2026-07-11T00:00:02.000Z", {
+          kind: "explicit-upgrade",
+          beforeMigration: () => undefined,
+          expectedAppliedVersion: 1,
+        }),
         /MIGRATION_CHECKSUM_MISMATCH/,
       );
     } finally {
@@ -71,7 +113,12 @@ describe("MigrationRunner", () => {
         [{ ...eventCoreMigration, version: 2 }, eventCoreMigration],
       ]) {
         assert.throws(
-          () => runner.apply(connection, migrations, "2026-07-11T00:00:00.000Z"),
+          () => runner.apply(
+            connection,
+            migrations,
+            "2026-07-11T00:00:00.000Z",
+            { kind: "bootstrap-empty", beforeMigration: () => undefined },
+          ),
           /MIGRATION_SET_INVALID/,
         );
       }
@@ -100,7 +147,9 @@ describe("MigrationRunner", () => {
           version: 1,
           name: "broken",
           sql: "CREATE TABLE partial(value TEXT) STRICT; SELECT * FROM missing_table;",
-        }], "2026-07-11T00:00:00.000Z"),
+        }], "2026-07-11T00:00:00.000Z", {
+          kind: "bootstrap-empty", beforeMigration: () => undefined,
+        }),
       );
       assert.equal(
         connection.prepare("SELECT count(*) AS count FROM sqlite_schema WHERE name = $name").get({
@@ -126,8 +175,14 @@ describe("MigrationRunner", () => {
         $checksum: "f".repeat(64),
         $appliedAt: "2026-07-11T00:00:00.000Z",
       });
+      connection.exec(`PRAGMA application_id = ${PROJECT_MEMORY_APPLICATION_ID}`);
       assert.throws(
-        () => runner.apply(connection, [eventCoreMigration], "2026-07-11T00:00:01.000Z"),
+        () => runner.apply(
+          connection,
+          [eventCoreMigration],
+          "2026-07-11T00:00:01.000Z",
+          { kind: "explicit-upgrade", expectedAppliedVersion: 1, beforeMigration: () => undefined },
+        ),
         /SCHEMA_TOO_NEW/,
       );
     } finally {
@@ -145,6 +200,7 @@ describe("MigrationRunner", () => {
         connection,
         [eventCoreMigration],
         "2026-07-11T00:00:00.000Z",
+        { kind: "bootstrap-empty", beforeMigration: () => undefined },
       );
       const requiredTables = [
         "branch_scopes",
@@ -295,6 +351,142 @@ describe("MigrationRunner", () => {
       assert.throws(
         () => connection.exec("DELETE FROM command_dedup"),
         /COMMAND_DEDUP_IMMUTABLE/,
+      );
+    } finally {
+      connection.close();
+    }
+  });
+
+  it("rolls back every pending DDL, history, and project-version change atomically", () => {
+    const connection = driver.open(databasePath(), {
+      mode: "create",
+      busyTimeoutMs: DEFAULT_BUSY_TIMEOUT_MS,
+    });
+    try {
+      const runner = new MigrationRunner();
+      runner.apply(
+        connection,
+        [eventCoreMigration],
+        "2026-07-11T00:00:00.000Z",
+        { kind: "bootstrap-empty", beforeMigration: () => undefined },
+      );
+      connection.exec(`
+        INSERT INTO project_meta(
+          singleton, project_id, vault_id, store_id, schema_version, created_at
+        ) VALUES (
+          1,
+          '11111111-1111-4111-8111-111111111111',
+          '22222222-2222-4222-8222-222222222222',
+          '33333333-3333-4333-8333-333333333333',
+          1,
+          '2026-07-11T00:00:00.000Z'
+        );
+        INSERT INTO maintenance_state(
+          singleton, epoch, mode, owner_id, fencing_token, lease_expires_at, requested_at
+        ) VALUES (1, 0, 'idle', NULL, 0, NULL, NULL);
+      `);
+
+      const injectedFailure = {
+        ...sessionLifecycleMigration,
+        sql: `${sessionLifecycleMigration.sql}\n`
+          + "CREATE TABLE rollback_witness(value TEXT) STRICT;\n"
+          + "SELECT * FROM injected_missing_table;",
+      };
+      assert.throws(() => runner.apply(
+        connection,
+        [eventCoreMigration, injectedFailure],
+        "2026-07-11T00:00:01.000Z",
+        { kind: "explicit-upgrade", expectedAppliedVersion: 1, beforeMigration: () => undefined },
+      ));
+      assert.deepEqual(
+        connection.prepare("SELECT version FROM schema_migrations ORDER BY version")
+          .all().map((row) => row.version),
+        [1n],
+      );
+      assert.equal(
+        connection.prepare("SELECT schema_version FROM project_meta").get()?.schema_version,
+        1n,
+      );
+      assert.equal(
+        connection.prepare(`
+          SELECT count(*) AS count FROM sqlite_schema
+          WHERE name IN ('session_authority', 'rollback_witness')
+        `).get()?.count,
+        0n,
+      );
+      assert.equal(
+        connection.prepare(`
+          SELECT count(*) AS count FROM sqlite_schema
+          WHERE type = 'trigger' AND name = 'project_meta_no_update'
+        `).get()?.count,
+        1n,
+      );
+
+      assert.deepEqual(runner.apply(
+        connection,
+        PROJECT_STORE_MIGRATIONS,
+        "2026-07-11T00:00:02.000Z",
+        {
+          kind: "explicit-upgrade",
+          expectedAppliedVersion: 1,
+          beforeMigration: (migrationConnection, migration) => {
+            if (migration.version !== 3) return;
+            new SqliteQualifiedCheckpointMigrationPreflight().assertEligibleAndStage(
+              migrationConnection,
+              {
+                binding: {
+                  projectId: "11111111-1111-4111-8111-111111111111",
+                  vaultId: "22222222-2222-4222-8222-222222222222",
+                  storeId: "33333333-3333-4333-8333-333333333333",
+                },
+              } as ProjectContext,
+            );
+          },
+        },
+      ), [2, 3, 4, 5, 6, 7, 8, 9]);
+      assert.equal(
+        connection.prepare("SELECT schema_version FROM project_meta").get()?.schema_version,
+        9n,
+      );
+    } finally {
+      connection.close();
+    }
+  });
+
+  it("rejects an identity-less explicit upgrade without applying pending schema", () => {
+    const connection = driver.open(databasePath(), {
+      mode: "create",
+      busyTimeoutMs: DEFAULT_BUSY_TIMEOUT_MS,
+    });
+    try {
+      const runner = new MigrationRunner();
+      runner.apply(
+        connection,
+        [eventCoreMigration],
+        "2026-07-11T00:00:00.000Z",
+        { kind: "bootstrap-empty", beforeMigration: () => undefined },
+      );
+
+      assert.throws(
+        () => runner.apply(
+          connection,
+          PROJECT_STORE_MIGRATIONS,
+          "2026-07-11T00:00:01.000Z",
+          { kind: "explicit-upgrade", expectedAppliedVersion: 1, beforeMigration: () => undefined },
+        ),
+        /PROJECT_SCHEMA_VERSION_MISMATCH/,
+      );
+      assert.deepEqual(
+        connection.prepare("SELECT version FROM schema_migrations ORDER BY version")
+          .all().map((row) => row.version),
+        [1n],
+      );
+      assert.equal(
+        connection.prepare(`
+          SELECT count(*) AS count FROM sqlite_schema
+          WHERE name = 'session_authority'
+        `).get()?.count,
+        0n,
       );
     } finally {
       connection.close();

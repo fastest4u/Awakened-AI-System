@@ -10,6 +10,7 @@ import {
 import { dirname, join } from "node:path";
 import type {
   ProjectDescriptorV1,
+  ProjectContext,
   ProjectStoreRoute,
   StoreId,
 } from "../identity/contracts.js";
@@ -36,18 +37,30 @@ import {
 import {
   DEFAULT_BUSY_TIMEOUT_MS,
   PROJECT_MEMORY_APPLICATION_ID,
+  assertMinimumNodeVersion,
   probeRuntimeCapabilities,
   type RuntimeCapabilityResult,
 } from "../runtime/runtime-capabilities.js";
-import { MigrationRunner, migrationChecksum } from "./migration-runner.js";
-import { eventCoreMigration } from "./migrations/0001-event-core.js";
+import { MigrationRunner } from "./migration-runner.js";
+import {
+  CURRENT_PROJECT_STORE_SCHEMA_VERSION,
+  PROJECT_STORE_MIGRATIONS,
+} from "./migrations/registry.js";
 import { NodeSqliteDriver } from "./node-sqlite-driver.js";
 import {
-  expectedSchemaFingerprint,
-  schemaFingerprint,
-  type SchemaQueryConnection,
-} from "./schema-fingerprint.js";
+  inspectStoreSchema,
+  requireCurrentStoreSchema,
+  SchemaCompatibilityError,
+} from "./schema-compatibility.js";
 import type { SqliteConnection, SqliteDriver } from "./sqlite-driver.js";
+import {
+  SqliteQualifiedCheckpointMigrationPreflight,
+  type QualifiedCheckpointMigrationPreflight,
+} from "./qualified-checkpoint-migration-preflight.js";
+import {
+  SqliteSessionEndEffectiveStateMigrationPreflight,
+  type SessionEndEffectiveStateMigrationPreflight,
+} from "./session-end-effective-state-migration-preflight.js";
 
 type DatabaseSyncConstructor = typeof import("node:sqlite").DatabaseSync;
 type NodeSqliteModule = Pick<typeof import("node:sqlite"), "DatabaseSync">;
@@ -86,7 +99,10 @@ export interface ProjectStoreBootstrapService {
 
 export type ProjectStoreBootstrapErrorCode =
   | "PROJECT_REPLICA_DECISION_REQUIRED"
+  | "SCHEMA_UPGRADE_REQUIRED"
   | "SCHEMA_TOO_NEW"
+  | "MIGRATION_CHECKSUM_MISMATCH"
+  | "SCHEMA_FINGERPRINT_MISMATCH"
   | "SQLITE_CAPABILITY_MISSING"
   | "STORE_UNAVAILABLE";
 
@@ -113,6 +129,9 @@ export interface ProjectStoreBootstrapDependencies {
   randomId: () => string;
   faultInjector: ProjectStoreBootstrapFaultInjector;
   syncDirectory?: DirectorySync;
+  /** Internal initialization owner may durably reserve identity before publication. */
+  reserveStoreId?: (descriptor: ProjectDescriptorV1, route: ProjectStoreRoute) => StoreId;
+  beforeStorePublish?: (route: ProjectStoreRoute) => void | Promise<void>;
 }
 
 interface ResolvedProjectStoreBootstrapDependencies
@@ -249,33 +268,10 @@ function validateExistingStore(
       throw bootstrapFailure("STORE_UNAVAILABLE");
     }
 
-    const migrations = database.prepare(`
-      SELECT version, name, checksum
-      FROM schema_migrations
-      ORDER BY version
-    `).all();
-    const maximumVersion = migrations.reduce(
-      (maximum, row) => Math.max(maximum, numeric(row.version) ?? Number.MAX_SAFE_INTEGER),
-      0,
-    );
-    if (maximumVersion > eventCoreMigration.version) {
-      throw bootstrapFailure("SCHEMA_TOO_NEW");
-    }
-    if (
-      migrations.length !== 1
-      || numeric(migrations[0]?.version) !== eventCoreMigration.version
-      || migrations[0]?.name !== eventCoreMigration.name
-      || migrations[0]?.checksum !== migrationChecksum(eventCoreMigration)
-    ) {
-      throw bootstrapFailure("STORE_UNAVAILABLE");
-    }
-
-    if (
-      schemaFingerprint(database as unknown as SchemaQueryConnection)
-      !== expectedSchemaFingerprint([eventCoreMigration], DatabaseSync)
-    ) {
-      throw bootstrapFailure("STORE_UNAVAILABLE");
-    }
+    requireCurrentStoreSchema(inspectStoreSchema(
+      database as unknown as SqliteConnection,
+      PROJECT_STORE_MIGRATIONS,
+    ));
 
     const rows = database.prepare(`
       SELECT project_id, vault_id, store_id, schema_version, created_at
@@ -289,7 +285,7 @@ function validateExistingStore(
       || meta.vault_id !== descriptor.vaultId
       || typeof meta.store_id !== "string"
       || typeof meta.created_at !== "string"
-      || numeric(meta.schema_version) !== eventCoreMigration.version
+      || numeric(meta.schema_version) !== CURRENT_PROJECT_STORE_SCHEMA_VERSION
       || (expectedStoreId !== undefined && meta.store_id !== expectedStoreId)
     ) {
       throw bootstrapFailure("STORE_UNAVAILABLE");
@@ -348,6 +344,17 @@ function validateExistingStore(
     };
   } catch (error) {
     if (error instanceof ProjectStoreBootstrapError) throw error;
+    if (
+      error instanceof SchemaCompatibilityError
+      && (
+        error.code === "SCHEMA_TOO_NEW"
+        || error.code === "SCHEMA_UPGRADE_REQUIRED"
+        || error.code === "MIGRATION_CHECKSUM_MISMATCH"
+        || error.code === "SCHEMA_FINGERPRINT_MISMATCH"
+      )
+    ) {
+      throw bootstrapFailure(error.code, error);
+    }
     throw bootstrapFailure("STORE_UNAVAILABLE", error);
   } finally {
     database?.close();
@@ -360,28 +367,21 @@ function insertBootstrapIdentity(
   storeId: StoreId,
   createdAt: string,
 ): void {
-  connection.exec("BEGIN IMMEDIATE");
-  try {
-    connection.prepare(`
-      INSERT INTO project_meta(
-        singleton, project_id, vault_id, store_id, schema_version, created_at
-      ) VALUES (1, $projectId, $vaultId, $storeId, 1, $createdAt)
-    `).run({
-      $projectId: descriptor.projectId,
-      $vaultId: descriptor.vaultId,
-      $storeId: storeId,
-      $createdAt: createdAt,
-    });
-    connection.exec(`
-      INSERT INTO maintenance_state(
-        singleton, epoch, mode, owner_id, fencing_token, lease_expires_at, requested_at
-      ) VALUES (1, 0, 'idle', NULL, 0, NULL, NULL)
-    `);
-    connection.exec("COMMIT");
-  } catch (error) {
-    try { connection.exec("ROLLBACK"); } catch { /* preserve original */ }
-    throw error;
-  }
+  connection.prepare(`
+    INSERT INTO project_meta(
+      singleton, project_id, vault_id, store_id, schema_version, created_at
+    ) VALUES (1, $projectId, $vaultId, $storeId, 2, $createdAt)
+  `).run({
+    $projectId: descriptor.projectId,
+    $vaultId: descriptor.vaultId,
+    $storeId: storeId,
+    $createdAt: createdAt,
+  });
+  connection.exec(`
+    INSERT INTO maintenance_state(
+      singleton, epoch, mode, owner_id, fencing_token, lease_expires_at, requested_at
+    ) VALUES (1, 0, 'idle', NULL, 0, NULL, NULL)
+  `);
 }
 
 function manifestIdentity(
@@ -402,9 +402,13 @@ export class DefaultProjectStoreBootstrapService implements ProjectStoreBootstra
   >();
 
   readonly #dependencies: ResolvedProjectStoreBootstrapDependencies;
+  readonly #preflight: QualifiedCheckpointMigrationPreflight;
+  readonly #sessionEndPreflight: SessionEndEffectiveStateMigrationPreflight;
   #nodeSqlite: Promise<NodeSqliteModule> | undefined;
 
   constructor(dependencies: Partial<ProjectStoreBootstrapDependencies> = {}) {
+    this.#preflight = new SqliteQualifiedCheckpointMigrationPreflight();
+    this.#sessionEndPreflight = new SqliteSessionEndEffectiveStateMigrationPreflight();
     this.#dependencies = {
       descriptorRepository: dependencies.descriptorRepository
         ?? new ProjectDescriptorRepository(),
@@ -422,6 +426,8 @@ export class DefaultProjectStoreBootstrapService implements ProjectStoreBootstra
       faultInjector: dependencies.faultInjector
         ?? NO_PROJECT_STORE_BOOTSTRAP_FAULTS,
       syncDirectory: dependencies.syncDirectory ?? fsyncDirectory,
+      reserveStoreId: dependencies.reserveStoreId,
+      beforeStorePublish: dependencies.beforeStorePublish,
     };
   }
 
@@ -548,6 +554,7 @@ export class DefaultProjectStoreBootstrapService implements ProjectStoreBootstra
 
   private async databaseSync(): Promise<DatabaseSyncConstructor> {
     try {
+      assertMinimumNodeVersion();
       this.#nodeSqlite ??= this.#dependencies.loadNodeSqlite();
       const sqlite = await this.#nodeSqlite;
       if (typeof sqlite.DatabaseSync !== "function") {
@@ -592,7 +599,8 @@ export class DefaultProjectStoreBootstrapService implements ProjectStoreBootstra
       throw bootstrapFailure("SQLITE_CAPABILITY_MISSING");
     }
 
-    const storeId = this.#dependencies.randomId() as StoreId;
+    const storeId = this.#dependencies.reserveStoreId?.(descriptor, route)
+      ?? this.#dependencies.randomId() as StoreId;
     const temporaryReservation = reserveSqlitePath(
       route.storeRoot,
       (id) => `.events.sqlite.bootstrap-${id}.tmp`,
@@ -610,15 +618,40 @@ export class DefaultProjectStoreBootstrapService implements ProjectStoreBootstra
       });
       this.#dependencies.migrationRunner.apply(
         connection,
-        [eventCoreMigration],
+        PROJECT_STORE_MIGRATIONS,
         this.#dependencies.now(),
-      );
-      this.#dependencies.faultInjector.hit("after-temp-schema-before-identity");
-      insertBootstrapIdentity(
-        connection,
-        descriptor,
-        storeId,
-        this.#dependencies.now(),
+        {
+          kind: "bootstrap-empty",
+          beforeMigration: (migrationConnection, migration) => {
+            const migrationContext = {
+              binding: {
+                projectId: descriptor.projectId,
+                vaultId: descriptor.vaultId,
+                storeId,
+              },
+            } as ProjectContext;
+            if (migration.version === 3) {
+              this.#dependencies.faultInjector.hit("after-temp-schema-before-identity");
+              const createdAt = this.#dependencies.now();
+              insertBootstrapIdentity(
+                migrationConnection,
+                descriptor,
+                storeId,
+                createdAt,
+              );
+              this.#preflight.assertEligibleAndStage(
+                migrationConnection,
+                migrationContext,
+              );
+            }
+            if (migration.version === 4) {
+              this.#sessionEndPreflight.assertEligible(
+                migrationConnection,
+                migrationContext,
+              );
+            }
+          },
+        },
       );
       this.#dependencies.faultInjector.hit("after-temp-complete-before-publish");
       const checkpoint = connection.prepare("PRAGMA wal_checkpoint(TRUNCATE)").get();
@@ -644,6 +677,7 @@ export class DefaultProjectStoreBootstrapService implements ProjectStoreBootstra
         "pristine-unpublished",
       );
       fsyncFile(temporaryPath);
+      await this.#dependencies.beforeStorePublish?.(route);
       try {
         linkSync(temporaryPath, route.eventsPath);
         publishedByThisContender = true;

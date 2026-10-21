@@ -95,6 +95,16 @@ function positiveSafeInteger(value: unknown, code: string): number {
   return Number(value);
 }
 
+function addTrustedMilliseconds(base: bigint, milliseconds: number): string {
+  const instant = base + (BigInt(milliseconds) * 1_000_000n);
+  const epochMilliseconds = instant / 1_000_000n;
+  const numericMilliseconds = Number(epochMilliseconds);
+  if (!Number.isSafeInteger(numericMilliseconds)) fail("MAINTENANCE_LEASE_INVALID");
+  const date = new Date(numericMilliseconds);
+  if (!Number.isFinite(date.getTime())) fail("MAINTENANCE_LEASE_INVALID");
+  return date.toISOString();
+}
+
 function bigint(value: unknown, code: string, minimum = 0n): bigint {
   if (typeof value !== "bigint" || value < minimum || value > SQLITE_INT64_MAX) {
     fail(code);
@@ -516,6 +526,51 @@ export class MaintenanceFence {
     return { epoch, fencingToken, ownerId: owner, leaseExpiresAt };
   }
 
+  renewOwner(
+    connection: SqliteConnection,
+    lease: MaintenanceLease,
+    now: string,
+    trustedTtlMs: number,
+  ): MaintenanceLease {
+    const ttl = positiveSafeInteger(trustedTtlMs, "MAINTENANCE_LEASE_INVALID");
+    const state = assertCurrentLease(connection, lease, now);
+    const nowInstant = timestampInstant(now, "MAINTENANCE_TIMESTAMP_INVALID");
+    const currentExpiry = timestampInstant(
+      lease.leaseExpiresAt,
+      "MAINTENANCE_LEASE_INVALID",
+    );
+    const nextExpiry = addTrustedMilliseconds(
+      currentExpiry > nowInstant ? currentExpiry : nowInstant,
+      ttl,
+    );
+    if (timestampInstant(nextExpiry, "MAINTENANCE_LEASE_INVALID") <= currentExpiry) {
+      fail("MAINTENANCE_LEASE_INVALID");
+    }
+    const changed = connection.prepare(`
+      UPDATE maintenance_state
+      SET lease_expires_at = $nextLeaseExpiresAt
+      WHERE singleton = 1
+        AND mode = 'quiescing'
+        AND epoch = $epoch
+        AND fencing_token = $fencingToken
+        AND owner_id = $ownerId
+        AND lease_expires_at = $leaseExpiresAt
+    `).run({
+      $nextLeaseExpiresAt: nextExpiry,
+      $epoch: state.epoch,
+      $fencingToken: state.fencingToken,
+      $ownerId: state.ownerId,
+      $leaseExpiresAt: state.leaseExpiresAt,
+    }).changes;
+    if (changed !== 1n) fail("MAINTENANCE_LEASE_STALE");
+    return {
+      epoch: lease.epoch,
+      fencingToken: lease.fencingToken,
+      ownerId: lease.ownerId,
+      leaseExpiresAt: nextExpiry,
+    };
+  }
+
   acknowledge(
     connection: SqliteConnection,
     lease: MaintenanceLease,
@@ -597,6 +652,17 @@ export class MaintenanceFence {
     });
     if (typeof row?.missing !== "bigint") fail("MAINTENANCE_STATE_INVALID");
     return row.missing === 0n;
+  }
+
+  assertReady(
+    connection: SqliteConnection,
+    lease: MaintenanceLease,
+    now: string,
+  ): void {
+    assertCurrentLease(connection, lease, now);
+    if (!this.allRequiredExecutorsAcknowledged(connection, lease)) {
+      fail("MAINTENANCE_ACKNOWLEDGEMENT_REQUIRED");
+    }
   }
 
   release(

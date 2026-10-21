@@ -1,4 +1,17 @@
+import { decodeOwnedGovernedCreate, decodeOwnedGovernedRecovery } from "../governed-notes/worker-protocol.js";
+import type { GovernedNoteRuntimeV2, PreparedGovernedNoteCreateV1, PreparedGovernedNoteCreateV2, PreparedGovernedNoteRecoveryV1, PreparedGovernedNoteRecoveryV2 } from "../governed-notes/contracts.js";
+import { decodeGovernedFixtureActionV2, decodeGovernedFixtureResultV2, type GovernedFixtureActionV2, type GovernedFixtureResultV2, type GovernedFixtureActionPortV1, type TrustedGovernedFixtureFactoryV1 } from "../governed-notes/fixture-control.js";
+import { GovernedNoteError } from "../governed-notes/errors.js";
+import { hasUncertainGovernedRecoveryCleanup } from "../governed-notes/service.js";
+import { decodePreparedGovernedNoteCreateV1, decodePreparedGovernedNoteRecoveryV1 } from "../governed-notes/codec.js";
+import type { GovernedNoteRuntime, GovernedNoteRuntimeFactoryPort } from "../governed-notes/contracts.js";
+import { decodeGovernedNoteWorkerResponse, governedNoteRequestIds, isGovernedNoteRequest, sanitizeGovernedNoteError, type GovernedNoteWorkerRequest } from "../governed-notes/worker-protocol.js";
 import { randomUUID } from "node:crypto";
+import { RetainedEvidenceError } from "../privacy/evidence-contracts.js";
+import { decodePreparedRetainedEvidenceCommand, decodeRetainedEvidenceWorkerResponse } from "../privacy/retained-evidence-worker-protocol.js";
+import type { RetainedEvidenceRuntime, RetainedEvidenceRuntimeFactoryPort } from "../privacy/retained-evidence-runtime.factory.js";
+import { FreshStartAdmissionGuard, assertFreshStartConnectionAllowed, bindFreshStartAdmissionContext } from "../fresh-start/fresh-start-admission.js";
+import { FreshStartError } from "../fresh-start/contracts.js";
 import {
   mkdtempSync,
   realpathSync,
@@ -11,7 +24,13 @@ import { Worker } from "node:worker_threads";
 import type { JsonValue } from "../contracts/event.js";
 import type { ProjectContext } from "../identity/contracts.js";
 import { EventIntegrityService } from "../integrity/event-integrity.service.js";
-import type { IntegrityReport } from "../integrity/integrity.types.js";
+import { LifecycleIntegrityService } from "../integrity/lifecycle-integrity.service.js";
+import type {
+  HistoricalEvidenceIntegrityProviderPort,
+  IntegrityReport,
+} from "../integrity/integrity.types.js";
+import type { CapabilityKeyProvider } from "../lifecycle/authority/capability-key-provider.js";
+import { LifecycleError } from "../lifecycle/errors.js";
 import { BranchScopeRepository } from "../storage/branch-scope.repository.js";
 import {
   EventStore,
@@ -19,14 +38,13 @@ import {
   SqliteEventStoreStatements,
 } from "../storage/event-store.js";
 import { MaintenanceFence } from "../storage/maintenance-fence.js";
-import { eventCoreMigration } from "../storage/migrations/0001-event-core.js";
-import { migrationChecksum } from "../storage/migration-runner.js";
+import { PROJECT_STORE_MIGRATIONS } from "../storage/migrations/registry.js";
 import { NodeSqliteDriver } from "../storage/node-sqlite-driver.js";
 import {
-  expectedSchemaFingerprint,
-  schemaFingerprint,
-  type SchemaQueryConnection,
-} from "../storage/schema-fingerprint.js";
+  inspectStoreSchema,
+  requireCurrentStoreSchema,
+  SchemaCompatibilityError,
+} from "../storage/schema-compatibility.js";
 import type { SqliteConnection, SqliteRow } from "../storage/sqlite-driver.js";
 import {
   compareVersions,
@@ -39,8 +57,13 @@ import type {
   WorkerHeartbeatObservation,
   WorkerRuntimeBackend,
 } from "./project-store-worker-runtime.js";
+import type { LifecycleWorkerRuntimeFactoryPort } from "./lifecycle-worker-runtime.factory.js";
+import type { LifecycleWorkerRuntime } from "./lifecycle-worker-runtime.js";
 import {
   decodeAppendCommandWire,
+  decodeFreshStartContextWire,
+  encodeFreshStartContextWire,
+  decodeIntegrityProviderRequestWire,
   decodeIntegrityReport,
   decodeMaintenanceLeaseWire,
   decodeWorkerBinding,
@@ -49,16 +72,26 @@ import {
   encodeAppendResultWire,
   encodeMaintenanceLeaseWire,
   encodeWorkerBinding,
+  MAX_INTEGRITY_PROVIDER_INPUT_BYTES,
   type MaintenanceLeaseWire,
+  type IntegrityProviderResponseWire,
   type ProjectStoreRouteWire,
   type StoreIdentityExpectationWire,
   type StoreIdentityWire,
   type WorkerBindingAssertion,
   type WorkerRequest,
   type WorkerSuccessData,
+  type FreshStartContextWire,
+  type FreshStartOpenWire,
 } from "./worker-protocol.js";
 
 const POSITIVE_SAFE_INTEGER = (value: number): boolean => Number.isSafeInteger(value) && value > 0;
+
+const terminalGovernedReadErrors = new WeakSet<object>();
+/** Internal identity only: public error codes cannot certify owner health. */
+export function isTerminalGovernedReadOwnerError(error: unknown): boolean {
+  return typeof error === "object" && error !== null && terminalGovernedReadErrors.has(error);
+}
 
 export class ProjectStoreWorkerBackendError extends Error {
   constructor(
@@ -71,9 +104,16 @@ export class ProjectStoreWorkerBackendError extends Error {
 }
 
 export interface ProjectStoreWorkerBackendOptions {
+  /** Independently measures the executing deployment; absence keeps fresh stores closed. */
+  readonly trustedFreshStartBuildInspector?: () => string;
   selfUrl: URL;
   executorLeaseMs: number;
   appendRetryDeadlineMs: number;
+  readonly keyProvider?: CapabilityKeyProvider;
+  readonly lifecycleRuntimeFactory?: LifecycleWorkerRuntimeFactoryPort;
+  readonly trustedGovernedFixtureFactory?: TrustedGovernedFixtureFactoryV1;
+  readonly governedNoteRuntimeFactory?: GovernedNoteRuntimeFactoryPort;
+  readonly retainedEvidenceRuntimeFactory?: RetainedEvidenceRuntimeFactoryPort;
   afterReadOnlyIdentityVerified?: () => void;
   integrityWorkerFactory?: (
     url: URL,
@@ -103,6 +143,69 @@ function terminationFailure(): ProjectStoreWorkerBackendError {
   return new ProjectStoreWorkerBackendError("WORKER_UNAVAILABLE", {
     terminationFailed: true,
   });
+}
+
+const INTRINSIC_UINT8_ARRAY_FILL = Uint8Array.prototype.fill;
+const TYPED_ARRAY_PROTOTYPE = Object.getPrototypeOf(Uint8Array.prototype) as object;
+const INTRINSIC_TYPED_ARRAY_BUFFER = Object.getOwnPropertyDescriptor(
+  TYPED_ARRAY_PROTOTYPE,
+  "buffer",
+)!.get!;
+const INTRINSIC_TYPED_ARRAY_BYTE_LENGTH = Object.getOwnPropertyDescriptor(
+  TYPED_ARRAY_PROTOTYPE,
+  "byteLength",
+)!.get!;
+const INTRINSIC_TYPED_ARRAY_BYTE_OFFSET = Object.getOwnPropertyDescriptor(
+  TYPED_ARRAY_PROTOTYPE,
+  "byteOffset",
+)!.get!;
+const INTRINSIC_ARRAY_BUFFER_BYTE_LENGTH = Object.getOwnPropertyDescriptor(
+  ArrayBuffer.prototype,
+  "byteLength",
+)!.get!;
+
+function ownsWholeBytes(bytes: Uint8Array, expectedByteLength: number): boolean {
+  try {
+    const buffer = INTRINSIC_TYPED_ARRAY_BUFFER.call(bytes) as ArrayBuffer;
+    return buffer instanceof ArrayBuffer
+      && INTRINSIC_TYPED_ARRAY_BYTE_LENGTH.call(bytes) === expectedByteLength
+      && INTRINSIC_TYPED_ARRAY_BYTE_OFFSET.call(bytes) === 0
+      && INTRINSIC_ARRAY_BUFFER_BYTE_LENGTH.call(buffer) === expectedByteLength;
+  } catch {
+    return false;
+  }
+}
+
+function intrinsicByteLength(bytes: Uint8Array): number {
+  try {
+    return INTRINSIC_TYPED_ARRAY_BYTE_LENGTH.call(bytes) as number;
+  } catch {
+    return 0;
+  }
+}
+
+function scrubProviderBytes(bytes: Uint8Array, expectedByteLength: number): boolean {
+  const ownershipValid = ownsWholeBytes(bytes, expectedByteLength);
+  try {
+    INTRINSIC_UINT8_ARRAY_FILL.call(bytes, 0);
+  } catch {
+    return false;
+  }
+  return ownershipValid && ownsWholeBytes(bytes, expectedByteLength);
+}
+
+function zeroMalformedProviderFingerprint(value: unknown): void {
+  if (typeof value !== "object" || value === null) return;
+  const candidate = value as { operation?: unknown; bytes?: unknown };
+  const bytes = candidate.bytes;
+  if (
+    candidate.operation === "fingerprint"
+    && bytes instanceof Uint8Array
+    && Object.getPrototypeOf(bytes) === Uint8Array.prototype
+    && bytes.buffer instanceof ArrayBuffer
+    && intrinsicByteLength(bytes) >= 1
+    && intrinsicByteLength(bytes) <= MAX_INTEGRITY_PROVIDER_INPUT_BYTES
+  ) scrubProviderBytes(bytes, intrinsicByteLength(bytes));
 }
 
 function canonicalEventsPath(route: ProjectStoreRouteWire): string {
@@ -148,24 +251,11 @@ function identityFromConnection(
   const journal = connection.prepare("PRAGMA journal_mode").get()?.journal_mode;
   if (typeof journal !== "string" || journal.toLowerCase() !== "wal") failure("STORE_UNAVAILABLE");
 
-  const migrations = connection.prepare(`
-    SELECT version, name, checksum
-    FROM schema_migrations
-    ORDER BY version
-  `).all();
-  if (
-    migrations.length !== 1
-    || number(migrations[0]?.version) !== eventCoreMigration.version
-    || migrations[0]?.name !== eventCoreMigration.name
-    || migrations[0]?.checksum !== migrationChecksum(eventCoreMigration)
-  ) {
-    failure("MIGRATION_CHECKSUM_MISMATCH");
-  }
-  if (
-    schemaFingerprint(connection as unknown as SchemaQueryConnection)
-    !== expectedSchemaFingerprint([eventCoreMigration])
-  ) {
-    failure("SCHEMA_FINGERPRINT_MISMATCH");
+  try {
+    requireCurrentStoreSchema(inspectStoreSchema(connection, PROJECT_STORE_MIGRATIONS));
+  } catch (error) {
+    if (error instanceof SchemaCompatibilityError) failure(error.code);
+    throw error;
   }
 
   const rows = connection.prepare(`
@@ -275,6 +365,10 @@ interface ActiveStore {
   connection: SqliteConnection;
   maintenance: MaintenanceFence;
   eventStore: EventStore;
+  lifecycleRuntime: LifecycleWorkerRuntime | null;
+  retainedEvidenceRuntime: RetainedEvidenceRuntime | null;
+  governedNoteRuntime: GovernedNoteRuntime | null;
+  governedFixture: GovernedFixtureActionPortV1 | null;
   executorId: string;
 }
 
@@ -298,6 +392,7 @@ export class ProjectStoreWorkerBackend implements WorkerRuntimeBackend {
   }
 
   async dispatch(request: WorkerRequest): Promise<WorkerSuccessData> {
+    if (isGovernedNoteRequest(request)) return this.governedNote(request);
     if (this.#closed && request.type !== "ping") failure("WORKER_CLOSED");
     switch (request.type) {
       case "ping": return this.ping();
@@ -308,11 +403,17 @@ export class ProjectStoreWorkerBackend implements WorkerRuntimeBackend {
       case "inspectExisting":
         return inspectProjectStoreIdentity(request.route, request.expected);
       case "open":
-        return this.open(request.binding);
+        return this.open(request.binding, request.freshStart);
       case "append": {
         const active = this.requireActive(request.binding);
         return this.append(active, request.command);
       }
+      case "lifecycle":
+        const active = this.requireActive(request.binding);
+        if (active.lifecycleRuntime === null) failure("LIFECYCLE_V2_DISABLED");
+        return this.lifecycle(active, request);
+      case "retained-evidence":
+        return this.retainEvidence(this.requireActive(request.binding), request);
       case "quickIntegrity": {
         const active = this.requireActive(request.binding);
         return this.integrityInChild(active, request);
@@ -398,8 +499,11 @@ export class ProjectStoreWorkerBackend implements WorkerRuntimeBackend {
   async close(): Promise<void> {
     const active = this.#active;
     if (active === null) {
-      await this.terminateChildren();
-      this.#closed = true;
+      try {
+        await this.terminateChildren();
+      } finally {
+        this.#closed = true;
+      }
       return;
     }
     await this.closeHandles(active);
@@ -421,8 +525,9 @@ export class ProjectStoreWorkerBackend implements WorkerRuntimeBackend {
     };
   }
 
-  private async open(binding: unknown): Promise<WorkerSuccessData> {
+  private async open(binding: unknown, freshStartWire?: FreshStartContextWire): Promise<WorkerSuccessData> {
     if (this.#active !== null || this.#closed) failure("PROJECT_BINDING_REQUIRED");
+    const requestedFresh = freshStartWire === undefined ? undefined : decodeFreshStartContextWire(freshStartWire);
     const context = decodeWorkerBinding(binding);
     const path = canonicalEventsPath(context.binding.storeRoute);
 
@@ -445,15 +550,28 @@ export class ProjectStoreWorkerBackend implements WorkerRuntimeBackend {
       mode: "existing",
       busyTimeoutMs: DEFAULT_BUSY_TIMEOUT_MS,
     });
-    const maintenance = this.#options.maintenanceFactory?.() ?? new MaintenanceFence();
-    const executorId = randomUUID();
-    const now = new Date().toISOString();
+    let lifecycleRuntime: LifecycleWorkerRuntime | null = null;
+    let retainedEvidenceRuntime: RetainedEvidenceRuntime | null = null;
+    let governedNoteRuntime: GovernedNoteRuntime | null = null;
+    let governedFixture: GovernedFixtureActionPortV1 | null = null;
+    let registrationBegan = false;
     try {
+      const maintenance = this.#options.maintenanceFactory?.() ?? new MaintenanceFence();
+      const executorId = randomUUID();
+      const now = new Date().toISOString();
       identityFromConnection(
         connection,
         { projectId: context.binding.projectId, vaultId: context.binding.vaultId },
         context.binding.storeId,
       );
+      if (requestedFresh !== undefined) {
+        if (requestedFresh.identity.projectId !== context.binding.projectId || requestedFresh.identity.vaultId !== context.binding.vaultId
+          || requestedFresh.identity.storeId !== context.binding.storeId) throw new FreshStartError("FRESH_START_IDENTITY_MISMATCH");
+        const measuredBuildHash = this.#options.trustedFreshStartBuildInspector?.();
+        if (measuredBuildHash === undefined) throw new FreshStartError("FRESH_START_CONTEXT_REQUIRED");
+        if (measuredBuildHash !== requestedFresh.measuredBuildHash) throw new FreshStartError("FRESH_START_BUILD_MISMATCH");
+        bindFreshStartAdmissionContext(connection, { ...requestedFresh, measuredBuildHash });
+      }
       const eventStore = this.#options.eventStoreFactory?.(connection, maintenance)
         ?? new EventStore(
           connection,
@@ -461,7 +579,38 @@ export class ProjectStoreWorkerBackend implements WorkerRuntimeBackend {
           maintenance,
           new BranchScopeRepository(),
         );
+      if (
+        this.#options.lifecycleRuntimeFactory !== undefined
+        && this.#options.keyProvider !== undefined
+      ) {
+        lifecycleRuntime = this.#options.lifecycleRuntimeFactory.create({
+          connection,
+          maintenanceFence: maintenance,
+          keyProvider: this.#options.keyProvider,
+        });
+      }
+      if (this.#options.retainedEvidenceRuntimeFactory !== undefined && this.#options.keyProvider !== undefined) {
+        try {
+          retainedEvidenceRuntime = this.#options.retainedEvidenceRuntimeFactory.create({ connection, maintenanceFence: maintenance, keyProvider: this.#options.keyProvider });
+        } catch { throw new RetainedEvidenceError("RETAINED_EVIDENCE_UNAVAILABLE"); }
+      }
+      if (this.#options.governedNoteRuntimeFactory !== undefined && this.#options.keyProvider !== undefined) {
+        try { governedNoteRuntime = this.#options.governedNoteRuntimeFactory.create({ connection, maintenanceFence: maintenance, keyProvider: this.#options.keyProvider }); }
+        catch { throw new GovernedNoteError("GOVERNED_NOTE_UNAVAILABLE"); }
+      }
+      if(this.#options.trustedGovernedFixtureFactory!==undefined){
+        if(!lifecycleRuntime||!retainedEvidenceRuntime||!governedNoteRuntime||!this.#options.keyProvider)throw new GovernedNoteError("GOVERNED_NOTE_UNAVAILABLE");
+        governedFixture=this.#options.trustedGovernedFixtureFactory.create({connection,maintenanceFence:maintenance,keyProvider:this.#options.keyProvider,context,lifecycleRuntime,retainedEvidenceRuntime,governedNoteRuntime});
+      }
       connection.exec("BEGIN IMMEDIATE");
+      registrationBegan = true;
+      assertFreshStartConnectionAllowed(connection, "command-recovery");
+      let freshStart: FreshStartOpenWire | undefined;
+      if (requestedFresh !== undefined) {
+        const admission = new FreshStartAdmissionGuard(connection).assertRequestAllowed({ ...requestedFresh, operation: "command-recovery" });
+        if (admission.generation !== requestedFresh.generation) throw new FreshStartError("FRESH_START_ADMISSION_STALE");
+        freshStart = Object.freeze({ ...encodeFreshStartContextWire(requestedFresh), eventPosition: admission.eventPosition.toString(), eventHash: admission.eventHash });
+      }
       maintenance.registerExecutor(
         connection,
         context.binding.projectId,
@@ -472,26 +621,44 @@ export class ProjectStoreWorkerBackend implements WorkerRuntimeBackend {
         now,
       );
       connection.exec("COMMIT");
+      registrationBegan = false;
       this.#active = {
         context,
         connection,
         maintenance,
         eventStore,
+        lifecycleRuntime,
+        retainedEvidenceRuntime,
+        governedNoteRuntime,
+        governedFixture,
         executorId,
       };
+      return {
+        projectId: context.binding.projectId,
+        vaultId: context.binding.vaultId,
+        storeId: context.binding.storeId,
+        bindingGeneration: context.binding.generation,
+        contextFingerprint: context.binding.contextFingerprint,
+        executorId,
+        ...(freshStart === undefined ? {} : { freshStart }),
+      };
     } catch (error) {
-      try { connection.exec("ROLLBACK"); } catch { /* transaction may not have begun */ }
-      connection.close();
+      if (registrationBegan) {
+        try { connection.exec("ROLLBACK"); } catch { /* preserve the first open failure */ }
+      }
+      try { governedFixture?.dispose(); } catch { /* Preserve open uncertainty and attempt remaining cleanup. */ }
+      if (lifecycleRuntime !== null) {
+        try { lifecycleRuntime.dispose(); } catch { /* preserve the first open failure */ }
+      }
+      try { connection.close(); } catch { /* preserve the first open failure */ }
       throw error;
     }
-    return {
-      projectId: context.binding.projectId,
-      vaultId: context.binding.vaultId,
-      storeId: context.binding.storeId,
-      bindingGeneration: context.binding.generation,
-      contextFingerprint: context.binding.contextFingerprint,
-      executorId,
-    };
+  }
+
+  async executeTrustedGovernedFixtureAction(binding:WorkerBindingAssertion,action:GovernedFixtureActionV2):Promise<GovernedFixtureResultV2>{
+    const owned=decodeGovernedFixtureActionV2(action),active=this.requireActive(binding);
+    if(!active.governedFixture)throw new GovernedNoteError("GOVERNED_NOTE_UNAVAILABLE");
+    return decodeGovernedFixtureResultV2(await (active.governedFixture as import("../governed-notes/fixture-control.js").GovernedFixtureActionPortV2).execute(owned),owned);
   }
 
   private active(): ActiveStore {
@@ -518,13 +685,112 @@ export class ProjectStoreWorkerBackend implements WorkerRuntimeBackend {
     } catch (error) {
       if (error instanceof EventStoreError && error.code === "COMMAND_OUTCOME_UNKNOWN") {
         try {
-          active.connection.close();
+          await this.closeHandles(active);
         } catch {
           // The parent poisons and terminates this worker from the exact unknown-outcome response.
-        } finally {
-          this.#active = null;
-          this.#closed = true;
         }
+      }
+      throw error;
+    }
+  }
+
+  private async governedNote(request: GovernedNoteWorkerRequest): Promise<WorkerSuccessData> {
+    const ids = governedNoteRequestIds(request);
+    let active: ActiveStore | undefined, returned = false;
+    try {
+      active = this.requireActive(request.binding);
+      const runtime = active.governedNoteRuntime;
+      if (runtime === null) throw new GovernedNoteError("GOVERNED_NOTE_UNAVAILABLE");
+      const context = active.context;
+      const create=request.type==="governed-note-create"?decodeOwnedGovernedCreate(request.prepared):null;
+      const recover=request.type==="governed-note-recover"?decodeOwnedGovernedRecovery(request.prepared):null;
+      const v2=runtime as Partial<GovernedNoteRuntimeV2>;
+      if(create?.command.version===2&&typeof v2.createV2!=="function"||recover?.request.version===2&&typeof v2.recoverV2!=="function")throw new GovernedNoteError("GOVERNED_NOTE_UNAVAILABLE");
+      const data = request.type === "governed-note-create"
+        ? encodeAppendResultWire(await retryPrimarySqliteBusy(() => {
+          const result = create!.command.version===2?v2.createV2!(create as PreparedGovernedNoteCreateV2,context):runtime.create(create as PreparedGovernedNoteCreateV1,context);
+          returned = true;
+          return result;
+        }, { deadlineMs: this.#options.appendRetryDeadlineMs }))
+        : (recover!.request.version===2?v2.recoverV2!(recover as PreparedGovernedNoteRecoveryV2,context):runtime.recover(recover as PreparedGovernedNoteRecoveryV1,context));
+      returned = true;
+      const response = decodeGovernedNoteWorkerResponse({ id: request.id, ok: true, data }, request);
+      if (!response.ok) throw new GovernedNoteError("WORKER_PROTOCOL_ERROR");
+      return response.data;
+    } catch (error) {
+      if (request.type === "governed-note-recover" && active && hasUncertainGovernedRecoveryCleanup(active.connection)) {
+        // Invalidate before yielding. The runtime closes this owner's transport
+        // without an ordinary ACK; actual worker exit poisons its parent owner.
+        this.#closed = true;
+        const terminal = new GovernedNoteError("GOVERNED_NOTE_UNAVAILABLE");
+        terminalGovernedReadErrors.add(terminal);
+        throw terminal;
+      }
+      let safe = sanitizeGovernedNoteError(error, ids);
+      if (request.type === "governed-note-recover" && (safe.code === "COMMAND_OUTCOME_UNKNOWN" || safe.code === "GOVERNED_NOTE_OWNERSHIP_UNCERTAIN")) safe = new GovernedNoteError("WORKER_UNAVAILABLE");
+      if (request.type === "governed-note-create" && (returned || safe.code === "COMMAND_OUTCOME_UNKNOWN")) safe = new GovernedNoteError("COMMAND_OUTCOME_UNKNOWN", ids);
+      if (safe.code === "COMMAND_OUTCOME_UNKNOWN" && active) {
+        try { await this.closeHandles(active); } catch { /* Parent preserves original identity and poisons this owner. */ }
+      }
+      throw safe;
+    }
+  }
+
+  private async retainEvidence(active: ActiveStore, request: Extract<WorkerRequest, { type: "retained-evidence" }>): Promise<WorkerSuccessData> {
+    if (active.retainedEvidenceRuntime === null) throw new RetainedEvidenceError("RETAINED_EVIDENCE_UNAVAILABLE");
+    const prepared = decodePreparedRetainedEvidenceCommand(request.prepared);
+    const original = { commandId: prepared.command.commandId, idempotencyKey: prepared.command.idempotencyKey };
+    let returned = false;
+    try {
+      const result = await retryPrimarySqliteBusy(() => {
+        try { return active.retainedEvidenceRuntime!.execute(prepared, active.context); }
+        catch (error) {
+          // The retained service emits this code only after establishing rollback/pre-BEGIN absence.
+          // Raw native busy or unknown-outcome errors never enter this retry branch.
+          if (error instanceof RetainedEvidenceError && error.code === "SQLITE_BUSY") throw new EventStoreError("SQLITE_BUSY", { retryable: true });
+          throw error;
+        }
+      }, { deadlineMs: this.#options.appendRetryDeadlineMs });
+      returned = true;
+      const response = decodeRetainedEvidenceWorkerResponse({ id: request.id, ok: true, data: encodeAppendResultWire(result) }, request.id, prepared);
+      if (!response.ok) throw new RetainedEvidenceError("INTEGRITY_FAILURE");
+      return response.data;
+    } catch (error) {
+      const safe = returned || (error instanceof RetainedEvidenceError && error.code === "COMMAND_OUTCOME_UNKNOWN")
+        ? new RetainedEvidenceError("COMMAND_OUTCOME_UNKNOWN", original)
+        : error instanceof RetainedEvidenceError ? new RetainedEvidenceError(error.code, error.details)
+          : error instanceof EventStoreError && error.code === "SQLITE_BUSY" ? new RetainedEvidenceError("SQLITE_BUSY")
+            : new RetainedEvidenceError("RETAINED_EVIDENCE_UNAVAILABLE");
+      if (safe.code === "COMMAND_OUTCOME_UNKNOWN") {
+        try { await this.closeHandles(active); } catch { /* Parent poisons and terminates on the original recovery IDs. */ }
+      }
+      throw safe;
+    }
+  }
+
+  private async lifecycle(
+    active: ActiveStore,
+    request: Extract<WorkerRequest, { type: "lifecycle" }>,
+  ): Promise<WorkerSuccessData> {
+    try {
+      if (request.operation.kind === "query") assertFreshStartConnectionAllowed(active.connection, "content-read");
+      const result = await active.lifecycleRuntime!.execute(request.operation, active.context);
+      const semanticUnknown = request.operation.kind === "semantic"
+        && typeof result.result === "object"
+        && result.result !== null
+        && !Array.isArray(result.result)
+        && result.result.kind === "unknown"
+        && result.result.errorCode === "COMMAND_OUTCOME_UNKNOWN";
+      if (semanticUnknown) {
+        try { await this.closeHandles(active); } catch { /* preserve the exact unknown result */ }
+      }
+      return result;
+    } catch (error) {
+      if (
+        error instanceof LifecycleError
+        && (error.code === "COMMAND_OUTCOME_UNKNOWN" || error.code === "OPERATION_OUTCOME_UNKNOWN")
+      ) {
+        try { await this.closeHandles(active); } catch { /* preserve the exact unknown error */ }
       }
       throw error;
     }
@@ -544,6 +810,8 @@ export class ProjectStoreWorkerBackend implements WorkerRuntimeBackend {
       let response: IntegrityReport | undefined;
       let settled = false;
       let terminating = false;
+      let providerOperationActive = false;
+      const providerRequestIds = new Set<string>();
       let terminationCause: ProjectStoreWorkerBackendError | undefined;
       const rejectOnce = (error: ProjectStoreWorkerBackendError): void => {
         if (settled) return;
@@ -566,9 +834,168 @@ export class ProjectStoreWorkerBackend implements WorkerRuntimeBackend {
             },
           );
       };
+      const handleProviderRequest = (
+        providerRequest: ReturnType<typeof decodeIntegrityProviderRequestWire>,
+      ): void => {
+        if (
+          response !== undefined
+          || providerOperationActive
+          || providerRequestIds.has(providerRequest.providerRequestId)
+          || providerRequest.integrityRequestId !== request.id
+          || (providerRequest.operation === "fingerprint" && request.type !== "fullIntegrity")
+        ) {
+          if (providerRequest.operation === "fingerprint") {
+            scrubProviderBytes(
+              providerRequest.bytes,
+              intrinsicByteLength(providerRequest.bytes),
+            );
+          }
+          failChild(new ProjectStoreWorkerBackendError("WORKER_PROTOCOL_ERROR"));
+          return;
+        }
+        providerRequestIds.add(providerRequest.providerRequestId);
+        providerOperationActive = true;
+        const expectedByteLength = providerRequest.operation === "fingerprint"
+          ? intrinsicByteLength(providerRequest.bytes)
+          : 0;
+        const operationPromise = (async () => {
+          let providerResponse: IntegrityProviderResponseWire;
+          try {
+            const scope = {
+              projectId: active.context.binding.projectId,
+              storeId: active.context.binding.storeId,
+            };
+            const provider = this.#options.keyProvider;
+            if (provider === undefined) {
+              providerResponse = {
+                type: "integrity-provider-response",
+                integrityRequestId: providerRequest.integrityRequestId,
+                providerRequestId: providerRequest.providerRequestId,
+                operation: providerRequest.operation,
+                ok: false,
+                code: "EVIDENCE_HISTORICAL_KEY_UNAVAILABLE",
+              };
+            } else if (providerRequest.operation === "status") {
+              let status: unknown;
+              try {
+                status = await provider.status(
+                  scope,
+                  "evidence-fingerprint",
+                  providerRequest.keyId,
+                );
+              } catch {
+                status = undefined;
+              }
+              if (status === "available") {
+                providerResponse = {
+                  type: "integrity-provider-response",
+                  integrityRequestId: providerRequest.integrityRequestId,
+                  providerRequestId: providerRequest.providerRequestId,
+                  operation: "status",
+                  ok: true,
+                  status,
+                };
+              } else if (status === "revoked" || status === "unavailable") {
+                providerResponse = {
+                  type: "integrity-provider-response",
+                  integrityRequestId: providerRequest.integrityRequestId,
+                  providerRequestId: providerRequest.providerRequestId,
+                  operation: "status",
+                  ok: false,
+                  code: "EVIDENCE_HISTORICAL_KEY_UNAVAILABLE",
+                };
+              } else {
+                providerResponse = {
+                  type: "integrity-provider-response",
+                  integrityRequestId: providerRequest.integrityRequestId,
+                  providerRequestId: providerRequest.providerRequestId,
+                  operation: "status",
+                  ok: false,
+                  code: "INTEGRITY_FAILURE",
+                };
+              }
+            } else {
+              let fingerprint: unknown;
+              let ownershipValid = false;
+              try {
+                fingerprint = await provider.fingerprint({
+                  ...scope,
+                  purpose: "evidence-fingerprint",
+                  keyId: providerRequest.keyId,
+                  domain: "pm-evidence-coverage-v1",
+                  bytes: providerRequest.bytes,
+                });
+              } catch {
+                fingerprint = undefined;
+              } finally {
+                ownershipValid = scrubProviderBytes(
+                  providerRequest.bytes,
+                  expectedByteLength,
+                );
+              }
+              providerResponse = typeof fingerprint === "string"
+                && /^[0-9a-f]{64}$/.test(fingerprint)
+                && ownershipValid
+                ? {
+                    type: "integrity-provider-response",
+                    integrityRequestId: providerRequest.integrityRequestId,
+                    providerRequestId: providerRequest.providerRequestId,
+                    operation: "fingerprint",
+                    ok: true,
+                    fingerprint,
+                  }
+                : {
+                    type: "integrity-provider-response",
+                    integrityRequestId: providerRequest.integrityRequestId,
+                    providerRequestId: providerRequest.providerRequestId,
+                    operation: "fingerprint",
+                    ok: false,
+                    code: "INTEGRITY_FAILURE",
+                  };
+            }
+            if (!settled && !terminating) child.postMessage(providerResponse);
+          } catch {
+            if (!settled && !terminating) {
+              failChild(new ProjectStoreWorkerBackendError("WORKER_UNAVAILABLE"));
+            }
+          } finally {
+            if (providerRequest.operation === "fingerprint") {
+              scrubProviderBytes(providerRequest.bytes, expectedByteLength);
+            }
+            providerOperationActive = false;
+          }
+        })();
+        void operationPromise.catch(() => {
+          if (providerRequest.operation === "fingerprint") {
+            scrubProviderBytes(providerRequest.bytes, expectedByteLength);
+          }
+          providerOperationActive = false;
+          if (!settled && !terminating) {
+            failChild(new ProjectStoreWorkerBackendError("WORKER_PROTOCOL_ERROR"));
+          }
+        });
+      };
       child.on("message", (value) => {
         if (settled || terminating) return;
         try {
+          if (
+            typeof value === "object"
+            && value !== null
+            && "type" in value
+            && value.type === "integrity-provider-request"
+          ) {
+            try {
+              handleProviderRequest(decodeIntegrityProviderRequestWire(value));
+            } catch {
+              zeroMalformedProviderFingerprint(value);
+              throw new ProjectStoreWorkerBackendError("WORKER_PROTOCOL_ERROR");
+            }
+            return;
+          }
+          if (providerOperationActive) {
+            failChild(new ProjectStoreWorkerBackendError("WORKER_PROTOCOL_ERROR"));
+            return;
+          }
           const message = decodeWorkerMessage(value);
           if (!("id" in message) || response !== undefined) {
             return failChild(new ProjectStoreWorkerBackendError("WORKER_PROTOCOL_ERROR"));
@@ -622,9 +1049,25 @@ export class ProjectStoreWorkerBackend implements WorkerRuntimeBackend {
   }
 
   private async closeHandles(active: ActiveStore): Promise<void> {
-    await this.terminateChildren();
     let primaryError: unknown;
     let failed = false;
+    try {
+      await this.terminateChildren();
+    } catch (error) {
+      primaryError = error;
+      failed = true;
+    }
+    try {
+      active.governedFixture?.dispose();
+    } catch (error) { if(!failed){primaryError=error;failed=true;} }
+    try {
+      active.lifecycleRuntime?.dispose();
+    } catch (error) {
+      if (!failed) {
+        primaryError = error;
+        failed = true;
+      }
+    }
     try {
       active.connection.close();
     } catch (error) {
@@ -643,6 +1086,7 @@ export class ProjectStoreWorkerBackend implements WorkerRuntimeBackend {
 export async function runIntegrityChild(
   context: ProjectContext,
   request: Extract<WorkerRequest, { type: "quickIntegrity" | "fullIntegrity" }>,
+  provider?: HistoricalEvidenceIntegrityProviderPort,
 ): Promise<IntegrityReport> {
   const path = canonicalEventsPath(context.binding.storeRoute);
   // The child is intentionally read-only and never registers an executor lease.
@@ -657,10 +1101,14 @@ export async function runIntegrityChild(
       { projectId: context.binding.projectId, vaultId: context.binding.vaultId },
       context.binding.storeId,
     );
-    const integrity = new EventIntegrityService(connection);
+    const integrity = new EventIntegrityService(
+      connection,
+      PROJECT_STORE_MIGRATIONS,
+      [new LifecycleIntegrityService(connection, provider)],
+    );
     return request.type === "quickIntegrity"
-      ? integrity.quickCheck(context, request.tailLimit)
-      : integrity.fullCheck(context);
+      ? await integrity.quickCheckAsync(context, request.tailLimit)
+      : await integrity.fullCheckAsync(context);
   } finally {
     connection.close();
   }

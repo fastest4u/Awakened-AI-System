@@ -1,4 +1,9 @@
-import type { RuntimeCapabilityResult } from "../runtime/runtime-capabilities.js";
+import {
+  MINIMUM_NODE_VERSION,
+  MINIMUM_SQLITE_VERSION,
+  compareVersions,
+  type RuntimeCapabilityResult,
+} from "../runtime/runtime-capabilities.js";
 import type {
   ProjectBindingFailure,
   ProjectBindingProvider,
@@ -43,6 +48,8 @@ export interface SafeRuntimeCapabilitySummary {
   nodeSqlite?: true;
   wal?: true;
   fts5?: true;
+  sqliteDeserialize?: true;
+  queryOnly?: true;
   foreignKeys?: true;
   synchronousFull?: true;
   busyTimeoutMs?: 5000;
@@ -88,6 +95,8 @@ const RUNTIME_CHECK_NAMES = [
   "sqliteVersionAtLeastMinimum",
   "wal",
   "fts5",
+  "sqliteDeserialize",
+  "queryOnly",
   "foreignKeys",
   "synchronousFull",
   "busyTimeout",
@@ -107,6 +116,8 @@ const RUNTIME_FIELD_NAMES = [
   "nodeSqlite",
   "wal",
   "fts5",
+  "sqliteDeserialize",
+  "queryOnly",
   "foreignKeys",
   "synchronousFull",
   "busyTimeoutMs",
@@ -151,6 +162,8 @@ function successfulRuntimeShape(
   nodeSqlite: true;
   wal: true;
   fts5: true;
+  sqliteDeserialize: true;
+  queryOnly: true;
   foreignKeys: true;
   synchronousFull: true;
   busyTimeoutMs: 5000;
@@ -160,13 +173,17 @@ function successfulRuntimeShape(
 } {
   return typeof runtime.nodeVersion === "string"
     && STABLE_VERSION.test(runtime.nodeVersion)
+    && compareVersions(runtime.nodeVersion, MINIMUM_NODE_VERSION) >= 0
     && typeof runtime.sqliteVersion === "string"
     && STABLE_VERSION.test(runtime.sqliteVersion)
+    && compareVersions(runtime.sqliteVersion, MINIMUM_SQLITE_VERSION) >= 0
     && runtime.nodeVersionAtLeastMinimum === true
     && runtime.sqliteVersionAtLeastMinimum === true
     && runtime.nodeSqlite === true
     && runtime.wal === true
     && runtime.fts5 === true
+    && runtime.sqliteDeserialize === true
+    && runtime.queryOnly === true
     && runtime.foreignKeys === true
     && runtime.synchronousFull === true
     && runtime.busyTimeoutMs === 5000
@@ -215,6 +232,8 @@ function unsafeRuntimeSummary(
         nodeSqlite: record.nodeSqlite,
         wal: record.wal,
         fts5: record.fts5,
+        sqliteDeserialize: record.sqliteDeserialize,
+        queryOnly: record.queryOnly,
         foreignKeys: record.foreignKeys,
         synchronousFull: record.synchronousFull,
         busyTimeoutMs: record.busyTimeoutMs,

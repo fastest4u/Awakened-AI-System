@@ -31,6 +31,18 @@ describe("parseFrontmatter — happy paths", () => {
     assert.equal(result.hasFrontmatter, true);
     assert.equal(result.data.title, "CRLF");
   });
+
+  it("retains YAML 1.1 date coercion for existing normalization", () => {
+    const result = parseFrontmatter(`---\ncreated: 2026-01-02\n---\n`);
+    assert.ok(result.data.created instanceof Date);
+  });
+
+  it("rejects a non-mapping YAML frontmatter document", () => {
+    const result = parseFrontmatter(`---\n- not-a-mapping\n---\nbody\n`);
+    assert.deepEqual(result.data, {});
+    assert.ok(codes(result.raw).includes("FRONTMATTER_INVALID_YAML"));
+    assert.ok(result.diagnostics.some((diagnostic) => diagnostic.severity === "critical"));
+  });
 });
 
 describe("parseFrontmatter — never throws on malformed input", () => {

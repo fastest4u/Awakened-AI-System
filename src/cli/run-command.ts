@@ -59,10 +59,20 @@ import {
   DEFAULT_HEARTBEAT_INTERVAL_MS,
   DEFAULT_MAX_PENDING,
   ProjectStoreExecutor,
+  ProjectStoreExecutorRegistry,
   ProjectStoreWorkerError,
+  type MaintenanceClosureConfirmation,
 } from "../orchestrator/runtime/project-store-executor.js";
 import { WorkerProjectStoreIdentityProbe } from "../orchestrator/runtime/project-store-identity-probe.js";
-import { decodeIntegrityReport } from "../orchestrator/runtime/worker-protocol.js";
+import {
+  decodeIntegrityReport,
+  decodeProjectStoreUpgradePlan,
+  decodeProjectStoreUpgradeResult,
+} from "../orchestrator/runtime/worker-protocol.js";
+import type {
+  ProjectStoreUpgradePlan,
+  ProjectStoreUpgradeResult,
+} from "../orchestrator/storage/project-store-upgrade.service.js";
 import {
   compareVersions,
   MINIMUM_NODE_VERSION,
@@ -159,7 +169,9 @@ export type OrchestratorAdminResult =
       eventsPath: string;
       runtime: RuntimeCapabilityReport;
     }
-  | { action: "integrity"; report: IntegrityReport };
+  | { action: "integrity"; report: IntegrityReport }
+  | { action: "upgrade-inspection"; plan: ProjectStoreUpgradePlan }
+  | { action: "upgraded"; result: ProjectStoreUpgradeResult };
 
 export interface OrchestratorBindingService {
   establish(request: TrustedProjectBindingRequest): Promise<ProjectBindingResolution>;
@@ -170,6 +182,15 @@ export interface OrchestratorAdminExecutor {
   open(): Promise<unknown>;
   quickIntegrity(): Promise<IntegrityReport>;
   fullIntegrity(): Promise<IntegrityReport>;
+  close(): Promise<void>;
+}
+
+export interface OrchestratorUpgradeProbe {
+  inspect(context: ProjectContext): Promise<ProjectStoreUpgradePlan>;
+}
+
+export interface OrchestratorUpgradeExecutor {
+  apply(): Promise<ProjectStoreUpgradeResult>;
   close(): Promise<void>;
 }
 
@@ -199,6 +220,9 @@ export interface OrchestratorAdminDependencies {
   ): Promise<OrchestratorWorkspaceAuthority>;
   bootstrap: ProjectStoreBootstrapService;
   bindingService: OrchestratorBindingService;
+  upgradeBindingService?: OrchestratorBindingService;
+  upgradeProbe?: OrchestratorUpgradeProbe;
+  upgradeExecutorFactory?(context: ProjectContext): OrchestratorUpgradeExecutor;
   executorFactory(context: ProjectContext): OrchestratorAdminExecutor;
   integrityRecorder: OrchestratorIntegrityRecorder;
   clientInstanceId(): string;
@@ -387,6 +411,8 @@ function runtimeSnapshot(result: unknown): RuntimeCapabilityReport {
     nodeSqlite: snapshotTrue(Reflect.get(result, "nodeSqlite")),
     wal: snapshotTrue(Reflect.get(result, "wal")),
     fts5: snapshotTrue(Reflect.get(result, "fts5")),
+    sqliteDeserialize: snapshotTrue(Reflect.get(result, "sqliteDeserialize")),
+    queryOnly: snapshotTrue(Reflect.get(result, "queryOnly")),
     foreignKeys: snapshotTrue(Reflect.get(result, "foreignKeys")),
     synchronousFull: snapshotTrue(Reflect.get(result, "synchronousFull")),
     busyTimeoutMs: 5000,
@@ -1093,6 +1119,9 @@ function classifyError(error: unknown): ClassifiedError {
     }
     if (typeof error === "object" && error !== null) {
       const name = Reflect.get(error, "name");
+      if (name === "ProjectStoreUpgradeExecutorError") {
+        return { kind: "worker", code: Reflect.get(error, "code") };
+      }
       if (name === "ProjectStoreBootstrapError") {
         return { kind: "bootstrap", code: Reflect.get(error, "code") };
       }
@@ -1164,6 +1193,16 @@ function typedFailure(error: unknown): ClassifiedFailure {
         message: "The project store schema is newer than this CLI supports",
         remediation: ["upgrade the project-memory CLI before retrying"],
       },
+      SCHEMA_UPGRADE_REQUIRED: {
+        message: "The project store schema requires an explicit upgrade",
+        remediation: ["run orchestrator-upgrade --apply for the intended project"],
+      },
+      MIGRATION_CHECKSUM_MISMATCH: {
+        message: "Recorded migration history does not match the approved registry",
+      },
+      SCHEMA_FINGERPRINT_MISMATCH: {
+        message: "The project store schema fingerprint does not match the approved schema",
+      },
       SQLITE_CAPABILITY_MISSING: {
         message: "Required SQLite runtime capabilities are unavailable",
       },
@@ -1194,6 +1233,15 @@ function typedFailure(error: unknown): ClassifiedFailure {
         "WORKER_TIMEOUT",
         "WORKER_PROTOCOL_ERROR",
         "SQLITE_INTEGRITY_FAILED",
+        "SCHEMA_UPGRADE_REQUIRED",
+        "SCHEMA_TOO_NEW",
+        "MIGRATION_CHECKSUM_MISMATCH",
+        "SCHEMA_FINGERPRINT_MISMATCH",
+        "MAINTENANCE_ALREADY_ACTIVE",
+        "MAINTENANCE_LEASE_STALE",
+        "MAINTENANCE_ACKNOWLEDGEMENT_REQUIRED",
+        "POST_UPGRADE_INTEGRITY_FAILED",
+        "PREFIX_INTEGRITY_FAILED",
       ]);
       const code = classified.code;
       return {
@@ -1304,6 +1352,7 @@ const V2_COMMANDS = new Set([
   "orchestrator-init",
   "orchestrator-status",
   "orchestrator-integrity",
+  "orchestrator-upgrade",
 ]);
 
 export async function runCliCommand(
@@ -1358,7 +1407,10 @@ export async function runCliCommand(
       return 0;
     }
 
-    const resolution = await dependencies.bindingService.establish(request);
+    const bindingService = options.command === "orchestrator-upgrade"
+      ? dependencies.upgradeBindingService ?? dependencies.bindingService
+      : dependencies.bindingService;
+    const resolution = await bindingService.establish(request);
     if (!resolution.ok) throw bindingFailure(resolution);
     const established = validatedBindingSnapshot(resolution.binding, request);
     await verifyObservedWorkspaceAuthority(established, request, dependencies);
@@ -1369,10 +1421,65 @@ export async function runCliCommand(
     }
 
     const context = validatedContextSnapshot(
-      await dependencies.bindingService.revalidate(established),
+      await bindingService.revalidate(established),
       established,
       request,
     );
+    if (options.command === "orchestrator-upgrade") {
+      if (options.dryRun) {
+        if (dependencies.upgradeProbe === undefined) {
+          throw new SafeAdminError({
+            ok: false,
+            code: "STORE_UNAVAILABLE",
+            message: "The explicit upgrade probe is unavailable",
+          });
+        }
+        const plan = decodeProjectStoreUpgradePlan(
+          await dependencies.upgradeProbe.inspect(context),
+        );
+        if (plan.projectId !== context.binding.projectId) {
+          throw new ProjectBindingError("PROJECT_ID_MISMATCH");
+        }
+        if (plan.storeId !== context.binding.storeId) {
+          throw new ProjectBindingError("STORE_ID_MISMATCH");
+        }
+        writeJson(io.stdout, { action: "upgrade-inspection", plan });
+        return 0;
+      }
+      if (dependencies.upgradeExecutorFactory === undefined) {
+        throw new SafeAdminError({
+          ok: false,
+          code: "STORE_UNAVAILABLE",
+          message: "The explicit upgrade executor is unavailable",
+        });
+      }
+      const upgradeExecutor = dependencies.upgradeExecutorFactory(context);
+      let untrustedResult: unknown;
+      try {
+        untrustedResult = await upgradeExecutor.apply();
+      } finally {
+        await upgradeExecutor.close();
+      }
+      const result = decodeProjectStoreUpgradeResult(untrustedResult);
+      if (result.plan.projectId !== context.binding.projectId) {
+        throw new ProjectBindingError("PROJECT_ID_MISMATCH");
+      }
+      if (
+        result.plan.storeId !== context.binding.storeId
+        || result.integrity.storeId !== context.binding.storeId
+      ) {
+        throw new ProjectBindingError("STORE_ID_MISMATCH");
+      }
+      if (result.integrity.projectId !== context.binding.projectId || !result.integrity.ok) {
+        throw new SafeAdminError({
+          ok: false,
+          code: "INTEGRITY_REPORT_INVALID",
+          message: "Upgrade integrity report is invalid for this request",
+        });
+      }
+      writeJson(io.stdout, { action: "upgraded", result });
+      return 0;
+    }
     const executor = dependencies.executorFactory(context);
     let untrustedReport: unknown;
     try {
@@ -1826,6 +1933,19 @@ function createWorkspaceAuthorityInspector(dependencies: {
 export function createOrchestratorAdminDependencies(
   workerUrl: URL,
 ): OrchestratorAdminDependencies {
+  type ConfirmationCapableUpgradeExecutor = OrchestratorUpgradeExecutor & {
+    confirmMaintenanceClosure(confirmation: MaintenanceClosureConfirmation): Promise<void>;
+  };
+  let activeUpgradeExecutor: ConfirmationCapableUpgradeExecutor | null = null;
+  const executorRegistry = new ProjectStoreExecutorRegistry({
+    async confirmMaintenanceClosure(confirmation) {
+      const active = activeUpgradeExecutor;
+      if (active === null) {
+        throw new ProjectStoreWorkerError("MAINTENANCE_CONFIRMATION_REQUIRED");
+      }
+      await active.confirmMaintenanceClosure(confirmation);
+    },
+  });
   const identityProbe = new WorkerProjectStoreIdentityProbe({
     workerUrl,
     requestTimeoutMs: 10_000,
@@ -1836,6 +1956,31 @@ export function createOrchestratorAdminDependencies(
   const manifestRepository = new StoreManifestRepository();
   const bindingService = new ProjectBindingService({
     identityProbe,
+    descriptorRepository,
+    workspaceResolver,
+    router,
+    manifestRepository,
+  });
+  let upgradeProbePromise: Promise<ProjectStoreIdentityProbe & OrchestratorUpgradeProbe> | undefined;
+  const getUpgradeProbe = (): Promise<ProjectStoreIdentityProbe & OrchestratorUpgradeProbe> => {
+    upgradeProbePromise ??= import(
+      "../orchestrator/runtime/project-store-upgrade-probe.js"
+    ).then(({ ProjectStoreUpgradeProbe }) => new ProjectStoreUpgradeProbe());
+    return upgradeProbePromise;
+  };
+  const upgradeProbe: ProjectStoreIdentityProbe & OrchestratorUpgradeProbe = {
+    async inspect(context) {
+      return (await getUpgradeProbe()).inspect(context);
+    },
+    async inspectExisting(route, expected) {
+      return (await getUpgradeProbe()).inspectExisting(route, expected);
+    },
+    async verify(route, expected) {
+      return (await getUpgradeProbe()).verify(route, expected);
+    },
+  };
+  const upgradeBindingService = new ProjectBindingService({
+    identityProbe: upgradeProbe,
     descriptorRepository,
     workspaceResolver,
     router,
@@ -1873,8 +2018,40 @@ export function createOrchestratorAdminDependencies(
       },
     },
     bindingService,
+    upgradeBindingService,
+    upgradeProbe,
+    upgradeExecutorFactory(context) {
+      let executorPromise: Promise<ConfirmationCapableUpgradeExecutor> | undefined;
+      const getExecutor = (): Promise<ConfirmationCapableUpgradeExecutor> => {
+        executorPromise ??= import(
+          "../orchestrator/runtime/project-store-upgrade-executor.js"
+        ).then(({ ProjectStoreUpgradeExecutor }) => new ProjectStoreUpgradeExecutor({
+          workerUrl,
+          context,
+          requestTimeoutMs: 60_000,
+        }, { executorRegistry }));
+        return executorPromise;
+      };
+      return {
+        async apply() {
+          const executor = await getExecutor();
+          if (activeUpgradeExecutor !== null) {
+            throw new ProjectStoreWorkerError("MAINTENANCE_ALREADY_ACTIVE");
+          }
+          activeUpgradeExecutor = executor;
+          try {
+            return await executor.apply();
+          } finally {
+            if (activeUpgradeExecutor === executor) activeUpgradeExecutor = null;
+          }
+        },
+        async close() {
+          if (executorPromise !== undefined) await (await executorPromise).close();
+        },
+      };
+    },
     executorFactory(context) {
-      return new ProjectStoreExecutor({
+      const options = {
         workerUrl,
         context,
         maxPending: DEFAULT_MAX_PENDING,
@@ -1882,7 +2059,27 @@ export function createOrchestratorAdminDependencies(
         closeTimeoutMs: 10_000,
         executorLeaseMs: 15_000,
         heartbeatIntervalMs: DEFAULT_HEARTBEAT_INTERVAL_MS,
-      });
+      };
+      let executorPromise: Promise<ProjectStoreExecutor> | undefined;
+      const getExecutor = (): Promise<ProjectStoreExecutor> => {
+        executorPromise ??= executorRegistry.acquire(options);
+        return executorPromise;
+      };
+      return {
+        async open() { return (await getExecutor()).open(); },
+        async quickIntegrity() { return (await getExecutor()).quickIntegrity(); },
+        async fullIntegrity() { return (await getExecutor()).fullIntegrity(); },
+        async close() {
+          if (executorPromise === undefined) return;
+          let executor: ProjectStoreExecutor;
+          try {
+            executor = await executorPromise;
+          } catch {
+            return;
+          }
+          await executor.close();
+        },
+      };
     },
     integrityRecorder: {
       async record(context, report) {

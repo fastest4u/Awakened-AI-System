@@ -9,34 +9,63 @@
     "memory-vault": "dist/cli.js"
   },
   "engines": {
-    "node": ">=22.22.3"
+    "node": ">=24.16.0"
   },
   "scripts": {
+    "test:v2-full-body-notes": "node scripts/run-v2-full-body-notes.js",
+    "test:v2-governed-summary-commands": "node scripts/run-v2-governed-summary-commands.js",
     "dev": "npm run build && node dist/index.js",
     "start": "node dist/index.js",
+    "start:v2": "npm run check:runtime && node dist/v2.js",
+    "v2-admin": "npm run check:runtime && node dist/v2-admin.js",
     "check:runtime": "node scripts/check-runtime.js",
     "prestart": "npm run check:runtime",
     "prebuild": "npm run check:runtime",
     "pretest": "npm run check:runtime",
+    "pretest:all": "npm run check:runtime",
     "build": "node scripts/build.js",
     "memory-vault": "node dist/cli.js",
     "typecheck": "tsc --noEmit",
     "lint": "tsc --noEmit",
     "test:build": "tsc -p tsconfig.test.json",
     "test:stress": "node scripts/run-stress.js",
-    "test:build-artifacts": "npm run build && node scripts/smoke-worker.js",
-    "test": "npm run test:build && node --test --test-concurrency=1 --test-reporter=spec \"dist-test/tests/**/*.test.js\""
+    "test:lifecycle-stress": "node scripts/run-lifecycle-stress.js",
+    "test:retrieval-evaluation": "npm run test:build && node scripts/run-retrieval-evaluation.js dist-test/tests/retrieval-evaluation.test.js",
+    "test:rollout-control-plane": "npm run test:build && node --test --test-concurrency=1 --test-reporter=spec dist-test/tests/rollout-control-plane.test.js dist-test/tests/migration-registry.test.js dist-test/tests/project-store-bootstrap.test.js dist-test/tests/project-store-upgrade.test.js dist-test/tests/project-store-upgrade-phase-runner.test.js dist-test/tests/ci-lifecycle-gates.test.js",
+    "test:v2-shadow-migration": "npm run test:build && node --test --test-concurrency=1 --test-reporter=spec dist-test/tests/sqlite-driver.test.js dist-test/tests/v2-shadow-migration-contracts.test.js dist-test/tests/v2-shadow-migration-runtime.test.js dist-test/tests/v1-source-copy.test.js dist-test/tests/v2-migration-package.test.js dist-test/tests/v2-shadow-migration-repository.test.js dist-test/tests/v2-shadow-importer.test.js dist-test/tests/v2-imported-event-reader.test.js dist-test/tests/v2-shadow-projection.test.js dist-test/tests/v2-parity-lifecycle-fixture.test.js dist-test/tests/recording-git-command-runner.test.js dist-test/tests/v2-snapshot-parity.test.js dist-test/tests/retrieval-evaluation.test.js dist-test/tests/retrieval-service.test.js dist-test/tests/stable-compatibility-directory.test.js dist-test/tests/v2-shadow-compatibility.test.js dist-test/tests/v2-shadow-migration-runner.test.js dist-test/tests/v2-shadow-migration-rehearsal.test.js dist-test/tests/ci-lifecycle-gates.test.js",
+    "rehearse:v2-shadow-migration": "npm run build && node scripts/run-v2-shadow-migration-rehearsal.js",
+    "test:v2-fresh-start-foundation": "node scripts/run-v2-fresh-start-foundation.js",
+    "verify:v2-fresh-start-release": "node scripts/run-v2-fresh-start-release.js",
+    "test:v2-internal-verified-read": "node scripts/run-v2-internal-verified-read.js",
+    "test:v2-native-content": "node scripts/run-v2-native-content.js",
+    "test:v2-native-read-workflows": "node scripts/run-v2-native-read-workflows.js",
+    "test:build-artifacts": "npm run build && node scripts/smoke-worker.js && node scripts/smoke-v2-shadow-compatibility.js && node scripts/smoke-v2-fresh-start.js",
+    "test:subproject-2": "npm run test:build && node --test --test-concurrency=1 --test-reporter=spec dist-test/tests/migration-runner.test.js dist-test/tests/session-lifecycle-migration.test.js dist-test/tests/qualified-checkpoint-migration.test.js dist-test/tests/project-store-upgrade.test.js dist-test/tests/project-store-executor.test.js dist-test/tests/lifecycle-contracts.test.js dist-test/tests/checkpoint.service.test.js dist-test/tests/evidence-coverage.test.js dist-test/tests/event-integrity.test.js dist-test/tests/lifecycle-worker-protocol.test.js dist-test/tests/lifecycle-executor.test.js dist-test/tests/session-end-policy.test.js dist-test/tests/session-end.coordinator.test.js dist-test/tests/validation-profile-runner.test.js dist-test/tests/lifecycle-recovery.test.js dist-test/tests/compatibility-log-renderer.test.js dist-test/tests/compatibility-log-materializer.test.js dist-test/tests/lifecycle-compatibility.test.js dist-test/tests/lifecycle.concurrent.test.js dist-test/tests/lifecycle.crash.test.js dist-test/tests/lifecycle.security.test.js dist-test/tests/session-end-effective-state-migration.test.js dist-test/tests/session-end-effective-state.test.js dist-test/tests/session-end-workflow.test.js dist-test/tests/session-end-child-saga.test.js dist-test/tests/session-end.crash.test.js dist-test/tests/lifecycle-validation-result.repository.test.js dist-test/tests/lifecycle-materialization-queue.test.js dist-test/tests/lifecycle-render-closure.reader.test.js dist-test/tests/lifecycle-faults.test.js dist-test/tests/lifecycle-fixture-protocol.test.js dist-test/tests/lifecycle-worker-runtime.test.js dist-test/tests/lifecycle.stress.test.js",
+    "test:subproject-3": "npm run test:build && node --test --test-concurrency=1 --test-reporter=spec dist-test/tests/lifecycle-command-store.test.js dist-test/tests/lifecycle-contracts.test.js dist-test/tests/cli.orchestrator-admin.test.js dist-test/tests/project-binding.service.test.js dist-test/tests/project-store-bootstrap.test.js dist-test/tests/runtime-capabilities.test.js dist-test/tests/stored-event-authenticator.test.js dist-test/tests/lifecycle-projection-folds.test.js dist-test/tests/projection-source-event-codec.test.js dist-test/tests/projection-folds.test.js dist-test/tests/projection-schema.test.js dist-test/tests/projection-manifest.test.js dist-test/tests/projection-builder.test.js dist-test/tests/projection-coordinator.test.js dist-test/tests/projection-integrity.test.js dist-test/tests/retrieval-eligibility.test.js dist-test/tests/retrieval-candidates.test.js dist-test/tests/retrieval-ranking.test.js dist-test/tests/retrieval-explain.test.js dist-test/tests/retrieval-service.test.js dist-test/tests/retrieval-vector-cache.test.js dist-test/tests/projection-runtime.test.js dist-test/tests/v2-reader-lease.test.js dist-test/tests/v2-retrieval-candidates.test.js && node scripts/run-retrieval-evaluation.js dist-test/tests/retrieval-evaluation.test.js && node --test --test-concurrency=1 --test-reporter=spec dist-test/tests/rollout-control-plane.test.js dist-test/tests/ci-lifecycle-gates.test.js",
+    "test:migration": "npm run test:v2-shadow-migration",
+    "test:all": "npm run test:build && node --test --test-concurrency=1 --test-reporter=spec \"dist-test/tests/**/*.test.js\"",
+    "test": "npm run test:build && node scripts/run-test-profile.js"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.0.0",
+    "@modelcontextprotocol/sdk": "^1.30.0",
     "fast-glob": "^3.3.3",
-    "gray-matter": "^4.0.3",
+    "yaml": "^2.9.0",
     "zod": "^3.25.76"
   },
   "devDependencies": {
-    "@types/node": "^22.0.0",
-    "esbuild": "^0.28.0",
-    "javascript-obfuscator": "^5.4.2",
+    "@types/node": "^24.0.0",
+    "esbuild": "^0.28.2",
+    "javascript-obfuscator": "^5.5.1",
     "typescript": "^5.8.3"
+  },
+  "overrides": {
+    "@hono/node-server": "^1.19.15",
+    "hono": "^4.12.34",
+    "fast-uri": "^3.1.5",
+    "body-parser": "^2.3.0",
+    "ip-address": "^10.5.0",
+    "qs": "^6.15.3",
+    "brace-expansion": "^1.1.18",
+    "undici": "^6.28.0"
   }
 }

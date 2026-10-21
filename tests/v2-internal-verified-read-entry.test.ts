@@ -1,0 +1,445 @@
+import assert from "node:assert/strict";
+import { fork, type ForkOptions } from "node:child_process";
+import { cpSync, existsSync, lstatSync, mkdirSync, readFileSync, unlinkSync, writeFileSync, linkSync, renameSync } from "node:fs";
+import { join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
+import { test } from "node:test";
+import { createHash } from "node:crypto";
+import { pathToFileURL } from "node:url";
+import { canonicalJson } from "../src/orchestrator/serialization/canonical-json.js";
+import { createVerifiedReadAdapter } from "../src/orchestrator/verified-read/supervisor.js";
+import { FreshStartError } from "../src/orchestrator/fresh-start/contracts.js";
+import { FreshStartAdmissionGuard } from "../src/orchestrator/fresh-start/fresh-start-admission.js";
+import { makeActiveReadFixture } from "./support/v2-verified-read-fixture.js";
+import type { VerifiedReadBinding } from "../src/orchestrator/verified-read/contracts.js";
+
+const artifacts = ["v2.js", "v2-admin.js", "workers/project-store.worker.js",
+  "internal/v2-internal-verified-read.js", "internal/v2-internal-verified-read-cleanup.js"];
+const deployment = join(process.cwd(), "dist");
+const measured = () => JSON.parse(readFileSync(join(deployment, "v2-build.json"), "utf8"));
+const manifestDigest = (manifest: any) => {
+  const { buildIdentityHash: _ignored, ...body } = manifest;
+  return createHash("sha256").update(canonicalJson(body)).digest("hex");
+};
+async function comparisonMutation(entry: string, fault: "wrong-deployment" | "wrong-runtime", expectedHash: string) {
+  const sourceUrl = new URL("../src/v2/build-identity.js", import.meta.url);
+  let source = readFileSync(sourceUrl, "utf8");
+  const guard = fault === "wrong-deployment" ? "manifest.deploymentId !== __V2_DEPLOYMENT_ID__"
+    : "runtime.nodeVersion !== process.versions.node";
+  assert.equal(source.split(guard).length, 2, "mutation must remove exactly the intended compiled production comparison");
+  source = source.replace(guard, "false").replace(/from (["'])(\.[^"']+)\1/g,
+    (_match, _quote, relative) => `from ${JSON.stringify(new URL(relative, sourceUrl).href)}`);
+  source = `const __V2_DEPLOYMENT_ID__=${JSON.stringify(measured().deploymentId)};\n${source}`;
+  const inspector = await import(`data:text/javascript;base64,${Buffer.from(source).toString("base64")}`);
+  // This is a narrowly mutated inspector over genuine artifact bytes, never a
+  // fabricated positive deployment/child claim. All other checks remain real.
+  assert.equal(inspector.inspectV2Build(pathToFileURL(entry).href), expectedHash,
+    "another mismatch masked the targeted identity comparison");
+}
+async function fixture(buildHash = measured().buildIdentityHash) {
+  const f = await makeActiveReadFixture(buildHash);
+  try {
+    for (const name of [...artifacts, "v2-build.json"]) {
+      const target = join(f.binding.deploymentDirectory.canonicalPath, name);
+      mkdirSync(dirname(target), { recursive: true }); cpSync(join(deployment, name), target);
+    }
+    const canonicalPath = join(f.binding.deploymentDirectory.canonicalPath, "internal");
+    const stat = lstatSync(canonicalPath, { bigint: true });
+    const binding: VerifiedReadBinding = { ...f.binding, deploymentDirectory: { canonicalPath, device: String(stat.dev), inode: String(stat.ino) } };
+    return { ...f, binding, copied: f.binding.deploymentDirectory.canonicalPath };
+  } catch (error) { f.cleanup(); throw error; }
+}
+async function ipc(entry: string, cwd: string, input: object) {
+  const child = fork(entry, [], { cwd, execArgv: [], windowsHide: true, env: process.platform === "win32"
+    ? { SystemRoot: process.env.SystemRoot, WINDIR: process.env.WINDIR } : {}, stdio: ["ignore", "pipe", "pipe", "ipc"] } as ForkOptions);
+  const messages: any[] = []; let stdout = "", stderr = "";
+  child.on("message", value => messages.push(value)); child.stdout!.on("data", value => stdout += value); child.stderr!.on("data", value => stderr += value);
+  const closed = new Promise<number | null>((resolve, reject) => { child.once("error", reject); child.once("close", resolve); });
+  const timer = setTimeout(() => child.kill("SIGKILL"), 10000);
+  try { child.send(input); const code = await closed; return { messages, code, stdout, stderr }; }
+  finally { clearTimeout(timer); if (child.exitCode === null && child.signalCode === null) { child.kill("SIGKILL"); await closed; } }
+}
+const ids = { requestId: "entry-test", attemptId: "attempt-test", laneEpoch: "fixture-epoch" };
+function input(f: Awaited<ReturnType<typeof fixture>>, kind: "read" | "cleanup", hash = f.measuredBuildHash) {
+  return kind === "read" ? { version: 3, ids, binding: { ...f.binding, expectedRelease: { ...f.release, buildIdentityHash: hash } },
+    request: f.request, lockToken: "a".repeat(32), remainingMs: 5000 }
+    : { version: 1, ids, directory: f.binding.projectionDirectory, lockToken: "a".repeat(32), expectedBuildHash: hash, remainingMs: 2000 };
+}
+
+// Omitting either bundle from the build/identity breaks the actual deployment here.
+test("all five measured artifacts exist in exact order and both isolated closures exclude subprocess/thread APIs", () => {
+  const manifest = measured(); assert.deepEqual(manifest.artifacts.map((value: any) => value.path), artifacts);
+  for (const name of artifacts) assert.ok(existsSync(join(deployment, name)), `missing measured artifact ${name}`);
+  for (const name of artifacts.slice(3)) {
+    const closure = JSON.parse(readFileSync(join(deployment, `${name}.closure.json`), "utf8"));
+    assert.ok(closure.inputs.some((value: any) => value.path.startsWith("src/orchestrator/verified-read/")));
+    assert.equal(closure.artifact.sha256, manifest.artifacts.find((value: any) => value.path === name).sha256);
+    assert.ok(!closure.runtimeImports.some((value: string) => /^(node:)?(child_process|worker_threads)$/.test(value)));
+    assert.equal(closure.sourceChecked, true); assert.equal(closure.emittedChecked, true);
+  }
+});
+
+test("real measured supervisor verifies genesis, later publication and reopen with closed ownership and public denial", { timeout: 25000 }, async () => {
+  const f = await fixture(); let adapter = createVerifiedReadAdapter(f.binding);
+  try {
+    const genesis = await adapter.verify(f.request); assert.equal(genesis.projectionEventPosition, "0");
+    assert.equal(genesis.projectionEventHash, "0".repeat(64)); assert.equal(genesis.scope.storeId, f.identity.storeId);
+    assert.equal(Object.hasOwn(genesis, "content"), false);
+    assert.equal(existsSync(join(f.binding.executorStateDirectory.canonicalPath, "verified-read-owner.json")), false);
+    assert.equal(existsSync(join(f.binding.projectionDirectory.canonicalPath, ".projection-manifest.publish.lock")), false);
+    const event = f.append(); const manifest = await f.publish();
+    const later = await adapter.verify(f.request); assert.equal(later.projectionEventPosition, event.position);
+    assert.equal(later.projectionEventHash, event.hash); assert.equal(later.projectionGeneration, manifest.generation);
+    assert.equal((await adapter.close()).cleanup, "complete");
+    adapter = createVerifiedReadAdapter({ ...f.binding, compositionEpoch: "reopened" });
+    assert.equal((await adapter.verify(f.request)).projectionEventPosition, "1");
+    assert.throws(() => new FreshStartAdmissionGuard(f.writer).assertRequestAllowed({ identity: f.identity,
+      releaseId: f.release.releaseId, generation: 1n, measuredBuildHash: f.measuredBuildHash, operation: "content-read" }), { code: "FRESH_START_CONTENT_UNVERIFIED" });
+    assert.equal(f.writer.prepare("PRAGMA wal_checkpoint(TRUNCATE)").get()!.busy, 0n);
+  } finally { await adapter.close(); f.cleanup(); }
+});
+
+for (const target of ["disabled", "prepared", "read-only-recovery"] as const) test(`measured children enforce ${target} fencing`, async () => {
+  const f = await fixture(); const adapter = createVerifiedReadAdapter(f.binding);
+  try {
+    f.control.stop({ identity: f.identity, expectedGeneration: 1n, target: target === "prepared" ? "disabled" : target, reasonCode: "integrity-failure" });
+    if (target === "prepared") await f.control.transition({ identity: f.identity, expectedGeneration: 2n, expectedMode: "disabled",
+      expectedReleaseId: f.release.releaseId, nextMode: "prepared", nextRelease: f.release, approvalEnvelope: new Uint8Array([1]) });
+    await assert.rejects(adapter.verify(f.request), { code: target === "read-only-recovery" ? "FRESH_START_CONTENT_UNVERIFIED" : "FRESH_START_ADMISSION_DENIED" });
+    assert.equal((await adapter.close()).cleanup, "complete");
+  } finally { await adapter.close(); f.cleanup(); }
+});
+
+for (const child of ["read", "cleanup"] as const) {
+  test(`${child} entry independently measures the deployment and refuses a parent-only hash echo and unbundled entry`, async () => {
+    const f = await fixture();
+    try {
+      const file = `v2-internal-verified-read${child === "cleanup" ? "-cleanup" : ""}.js`;
+      const good = await ipc(join(f.binding.deploymentDirectory.canonicalPath, file), f.binding.projectionDirectory.canonicalPath, input(f, child));
+      assert.equal(good.code, 0, good.stderr); assert.equal(good.messages.at(-1).kind, child === "read" ? "success" : "cleanup");
+      if (child === "cleanup") assert.equal(good.messages.at(-1).cleanup, "complete", JSON.stringify(good.messages.at(-1)));
+      const unbundled = fileURLToPath(new URL(`../src/v2/internal-verified-read${child === "cleanup" ? "-cleanup" : ""}.entry.js`, import.meta.url));
+      const value = await ipc(unbundled, f.binding.projectionDirectory.canonicalPath, input(f, child));
+      assert.equal(value.messages.at(-1).kind, child === "read" ? "failure" : "cleanup");
+      if (child === "read") assert.equal(value.messages.at(-1).failure.code, "FRESH_START_BUILD_MISMATCH");
+      else assert.equal(value.messages.at(-1).cleanup, "incomplete");
+    } finally { f.cleanup(); }
+    // The wrong parent hash also matches real stored authority. Only independent
+    // inspection of the unchanged measured bundles can reject this composition.
+    const echo = await fixture("f".repeat(64));
+    try {
+      const file = `v2-internal-verified-read${child === "cleanup" ? "-cleanup" : ""}.js`;
+      const value = await ipc(join(echo.binding.deploymentDirectory.canonicalPath, file), echo.binding.projectionDirectory.canonicalPath, input(echo, child));
+      assert.equal(value.messages.at(-1).kind, child === "read" ? "failure" : "cleanup");
+      if (child === "read") { assert.equal(value.messages.at(-1).failure.code, "FRESH_START_BUILD_MISMATCH"); assert.equal(value.messages.filter(value => value.kind === "stage").length, 0); }
+      else assert.equal(value.messages.at(-1).cleanup, "incomplete");
+    } finally { echo.cleanup(); }
+  });
+  for (const fault of ["missing", "tampered", "wrong-deployment", "wrong-runtime", "wrong-build"] as const) test(`${child} independently refuses ${fault} copied deployment`, async () => {
+    const negative = measured();
+    if (fault === "wrong-deployment") negative.deploymentId = "11111111-1111-4111-8111-111111111111";
+    if (fault === "wrong-runtime") negative.runtime.nodeVersion = "0.0.0";
+    if (fault === "wrong-deployment" || fault === "wrong-runtime") negative.buildIdentityHash = manifestDigest(negative);
+    // Real synthetic stored/request authority agrees with the forged negative
+    // digest, so neither stale digest nor admission mismatch can mask refusal.
+    const f = await fixture(fault === "wrong-deployment" || fault === "wrong-runtime" ? negative.buildIdentityHash : measured().buildIdentityHash);
+    try {
+      const file = `internal/v2-internal-verified-read${child === "cleanup" ? "-cleanup" : ""}.js`;
+      // Run the other entry for a missing/tampered child: both entries must measure all five artifacts.
+      const entry = join(f.copied, fault === "missing" || fault === "tampered"
+        ? `internal/v2-internal-verified-read${child === "read" ? "-cleanup" : ""}.js` : file);
+      const running = fault === "missing" || fault === "tampered" ? child === "read" ? "cleanup" : "read" : child;
+      if (fault === "missing") unlinkSync(join(f.copied, file));
+      else if (fault === "tampered") writeFileSync(join(f.copied, file), readFileSync(join(f.copied, file), "utf8") + "\n// owned tamper\n");
+      else {
+        const manifest = negative;
+        if (fault === "wrong-build") manifest.buildIdentityHash = "f".repeat(64);
+        writeFileSync(join(f.copied, "v2-build.json"), JSON.stringify(manifest));
+      }
+      const value = await ipc(entry, f.binding.projectionDirectory.canonicalPath, input(f, running));
+      if (running === "read") assert.equal(value.messages.at(-1).failure.code, "FRESH_START_BUILD_MISMATCH");
+      else assert.equal(value.messages.at(-1).cleanup, "incomplete");
+      if (fault === "wrong-deployment" || fault === "wrong-runtime") {
+        assert.equal(value.messages.filter(message => message.kind === "stage").length, 0);
+        assert.equal(existsSync(join(f.binding.executorStateDirectory.canonicalPath, "verified-read-owner.json")), false);
+        assert.equal(existsSync(join(f.binding.projectionDirectory.canonicalPath, ".projection-manifest.publish.lock")), false);
+        for (const name of artifacts) assert.deepEqual(readFileSync(join(f.copied, name)), readFileSync(join(deployment, name)));
+        await comparisonMutation(entry, fault, f.measuredBuildHash);
+      }
+    } finally { f.cleanup(); }
+  });
+}
+
+
+import fsPromises from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
+import { performance } from "node:perf_hooks";
+import { VerifiedReadOwnershipRepository } from "../src/orchestrator/verified-read/ownership.js";
+async function identityInspector() {
+  const sourceUrl = new URL("../src/v2/build-identity.js", import.meta.url);
+  let source = readFileSync(sourceUrl, "utf8").replace(/from (["'])(\.[^"']+)\1/g,
+    (_match, _quote, relative) => `from ${JSON.stringify(new URL(relative, sourceUrl).href)}`);
+  source = `const __V2_DEPLOYMENT_ID__=${JSON.stringify(measured().deploymentId)};\n${source}`;
+  return import(`data:text/javascript;base64,${Buffer.from(source).toString("base64")}`);
+}
+const identityEntry = (f: Awaited<ReturnType<typeof fixture>>) => pathToFileURL(join(f.binding.deploymentDirectory.canonicalPath, "v2-internal-verified-read-cleanup.js")).href;
+const mismatch = { code: "FRESH_START_BUILD_MISMATCH" };
+test("async_identity_export_parity_bounded_handles", { timeout: 20000 }, async t => {
+  const inspector = await identityInspector(); assert.equal(typeof inspector.inspectV2BuildAsync, "function");
+  const f = await fixture(); const synchronous = inspector.inspectV2Build(identityEntry(f)); const handles: Awaited<ReturnType<typeof fsPromises.open>>[] = []; let active = 0, maximum = 0;
+  const original = fsPromises.open; let release!: () => void; const gate = new Promise<void>(resolve => { release = resolve; });
+  const timer = setTimeout(release, 2000);
+  const mock = t.mock.method(fsPromises, "open", async (...args: Parameters<typeof original>) => {
+    const handle = await original(...args); handles.push(handle); maximum = Math.max(maximum, ++active);
+    const read = handle.read; (handle as unknown as { read: (options: { buffer: Buffer; length: number }) => Promise<unknown> }).read = async options => {
+      assert.equal(options.buffer.byteLength, 65536); assert.equal(options.length, 65536); return Reflect.apply(read, handle, [options]);
+    };
+    const close = handle.close; handle.close = async function() { try { return await close.call(this); } finally { active--; } };
+    if (!String(args[0]).endsWith("v2-build.json")) { if (active === 3) release(); await gate; }
+    return handle;
+  }); syncBuiltinESMExports();
+  try {
+    assert.equal(await inspector.inspectV2BuildAsync(identityEntry(f)), synchronous); assert.equal(synchronous, f.measuredBuildHash);
+    assert.equal(maximum, 3); assert.equal(handles.length, 7); assert.ok(handles.every(handle => handle.fd === -1)); assert.equal(active, 0);
+  } finally { release(); clearTimeout(timer); mock.mock.restore(); syncBuiltinESMExports(); if (handles.every(handle => handle.fd === -1)) f.cleanup(); else { f.reader.close(); f.writer.close(); console.error("Retained uncertain identity handles"); } }
+});
+for (const fault of ["missing", "tampered", "wrong-deployment", "wrong-runtime", "wrong-build", "topology"] as const) test(`async_identity_sync_refusal_parity ${fault}`, { timeout: 20000 }, async () => {
+  const inspector = await identityInspector(); assert.equal(typeof inspector.inspectV2BuildAsync, "function"); const f = await fixture();
+  try {
+    const artifact = join(f.copied, "v2-admin.js");
+    if (fault === "missing") unlinkSync(artifact);
+    else if (fault === "tampered") writeFileSync(artifact, readFileSync(artifact, "utf8") + "\n// owned identity fault\n");
+    else if (fault === "topology") linkSync(artifact, join(f.copied, "owned-hardlink.js"));
+    else {
+      const manifest = measured();
+      if (fault === "wrong-deployment") manifest.deploymentId = "11111111-1111-4111-8111-111111111111";
+      if (fault === "wrong-runtime") manifest.runtime.nodeVersion = "0.0.0";
+      manifest.buildIdentityHash = fault === "wrong-build" ? "f".repeat(64) : manifestDigest(manifest);
+      writeFileSync(join(f.copied, "v2-build.json"), JSON.stringify(manifest));
+    }
+    assert.throws(() => inspector.inspectV2Build(identityEntry(f)), mismatch);
+    await assert.rejects(inspector.inspectV2BuildAsync(identityEntry(f)), mismatch);
+  } finally { f.cleanup(); }
+});
+test("async_identity_abort_drains_handles_preserves_owned_authority", { timeout: 20000 }, async t => {
+  const inspector = await identityInspector(); assert.equal(typeof inspector.inspectV2BuildAsync, "function"); const f = await fixture();
+  const ownership = new VerifiedReadOwnershipRepository(f.binding.executorStateDirectory);
+  const token = "a".repeat(32), lock = join(f.binding.projectionDirectory.canonicalPath, ".projection-manifest.publish.lock");
+  const intent = { schemaVersion: 1 as const, bindingFingerprint: "a".repeat(64), buildHash: f.measuredBuildHash, supervisorId: "async-identity-test", ids, lockToken: token };
+  await ownership.begin(intent); writeFileSync(lock, token); const before = readFileSync(join(f.binding.executorStateDirectory.canonicalPath, "verified-read-owner.json"));
+  const abort = new AbortController(), reason = Object.assign(new Error("owned identity abort"), { code: "WORKER_CLOSED" });
+  const handles: Awaited<ReturnType<typeof fsPromises.open>>[] = []; const original = fsPromises.open;
+  const mock = t.mock.method(fsPromises, "open", async (...args: Parameters<typeof original>) => {
+    const handle = await original(...args); handles.push(handle); if (!String(args[0]).endsWith("v2-build.json")) abort.abort(reason); return handle;
+  }); syncBuiltinESMExports();
+  try {
+    const started = performance.now(); await assert.rejects(inspector.inspectV2BuildAsync(identityEntry(f), abort.signal), error => error === reason);
+    assert.ok(performance.now() - started <= 3000); assert.ok(handles.length >= 2 && handles.length <= 4); assert.ok(handles.every(handle => handle.fd === -1));
+    assert.equal(readFileSync(lock, "utf8"), token); assert.deepEqual(readFileSync(join(f.binding.executorStateDirectory.canonicalPath, "verified-read-owner.json")), before);
+    assert.equal((await ownership.inspect())?.lockToken, token);
+  } finally { mock.mock.restore(); syncBuiltinESMExports(); if (handles.every(handle => handle.fd === -1)) f.cleanup(); else { f.reader.close(); f.writer.close(); console.error("Retained uncertain identity handles"); } }
+});
+test("async_identity_replacement_during_await_refuses_and_drains", { timeout: 20000 }, async t => {
+  const inspector = await identityInspector(); assert.equal(typeof inspector.inspectV2BuildAsync, "function"); const f = await fixture();
+  const artifact = join(f.copied, "v2-admin.js"), original = fsPromises.open; const handles: Awaited<ReturnType<typeof original>>[] = []; let replaced = false;
+  const mock = t.mock.method(fsPromises, "open", async (...args: Parameters<typeof original>) => {
+    const handle = await original(...args); handles.push(handle);
+    if (String(args[0]) === artifact && !replaced) { replaced = true; renameSync(artifact, artifact + ".retained"); cpSync(artifact + ".retained", artifact); }
+    return handle;
+  }); syncBuiltinESMExports();
+  try { await assert.rejects(inspector.inspectV2BuildAsync(identityEntry(f)), mismatch); assert.equal(replaced, true); assert.ok(handles.every(handle => handle.fd === -1)); }
+  finally { mock.mock.restore(); syncBuiltinESMExports(); if (handles.every(handle => handle.fd === -1)) f.cleanup(); else { f.reader.close(); f.writer.close(); console.error("Retained uncertain identity handles"); } }
+});
+
+
+test("async_identity_primary_abort_survives_secondary_close_failure", { timeout: 20000 }, async t => {
+  const inspector = await identityInspector(); assert.equal(typeof inspector.inspectV2BuildAsync, "function"); const f = await fixture();
+  const abort = new AbortController(), reason = Object.assign(new Error("owned identity abort"), { code: "WORKER_CLOSED" });
+  const handles: Awaited<ReturnType<typeof fsPromises.open>>[] = []; const original = fsPromises.open;
+  const mock = t.mock.method(fsPromises, "open", async (...args: Parameters<typeof original>) => {
+    const handle = await original(...args); handles.push(handle); const close = handle.close;
+    handle.close = async function() { await close.call(this); abort.abort(reason); throw new Error("secondary owned close receipt failure"); };
+    return handle;
+  }); syncBuiltinESMExports();
+  try {
+    await assert.rejects(inspector.inspectV2BuildAsync(identityEntry(f), abort.signal), error => error === reason);
+    assert.equal(handles.length, 1); assert.ok(handles.every(handle => handle.fd === -1));
+  } finally { mock.mock.restore(); syncBuiltinESMExports(); if (handles.every(handle => handle.fd === -1)) f.cleanup(); else { f.reader.close(); f.writer.close(); console.error("Retained uncertain identity handles"); } }
+});
+
+
+for (const remainingMs of [0, 1]) test(`actual_cleanup_receipt_deadline_preserves_owned_authority ${remainingMs}`, { timeout: 20000 }, async t => {
+  const f = await fixture(); const ownership = new VerifiedReadOwnershipRepository(f.binding.executorStateDirectory);
+  const token = "a".repeat(32), lock = join(f.binding.projectionDirectory.canonicalPath, ".projection-manifest.publish.lock");
+  const record = join(f.binding.executorStateDirectory.canonicalPath, "verified-read-owner.json");
+  try {
+    await ownership.begin({ schemaVersion: 1, bindingFingerprint: "a".repeat(64), buildHash: f.measuredBuildHash,
+      supervisorId: "cleanup-deadline-test", ids, lockToken: token }); writeFileSync(lock, token);
+    const originalRecord = readFileSync(record), originalLock = readFileSync(lock);
+    const value = await ipc(join(f.binding.deploymentDirectory.canonicalPath, "v2-internal-verified-read-cleanup.js"),
+      f.binding.projectionDirectory.canonicalPath, { ...input(f, "cleanup"), remainingMs });
+    assert.equal(value.code, 0, value.stderr); assert.equal(value.messages.length, 1);
+    assert.equal(value.messages[0].kind, "cleanup"); assert.equal(value.messages[0].outcome, "failed"); assert.equal(value.messages[0].cleanup, "incomplete");
+    assert.deepEqual(readFileSync(record), originalRecord); assert.deepEqual(readFileSync(lock), originalLock);
+    assert.equal((await ownership.inspect())?.lockToken, token);
+  } finally { f.reader.close(); f.writer.close(); t.diagnostic(`Retained expired cleanup fixture with original ownership and lock: ${f.root}`); }
+});
+
+test("async_identity_first_failure_stops_scheduling_before_close_drain", { timeout: 20000 }, async t => {
+  const inspector = await identityInspector(), f = await fixture();
+  const original = fsPromises.open, handles: Awaited<ReturnType<typeof original>>[] = [];
+  const reason = new FreshStartError("FRESH_START_BUILD_MISMATCH");
+  let releaseClose!: () => void, releaseSiblings!: () => void, releaseStarted!: () => void;
+  const closeGate = new Promise<void>(resolve => { releaseClose = resolve; });
+  const siblingGate = new Promise<void>(resolve => { releaseSiblings = resolve; });
+  const startedGate = new Promise<void>(resolve => { releaseStarted = resolve; });
+  let openedJobs = 0, failingCloseHeld = false, siblingsClosed = 0, active = 0, maximum = 0;
+  const timer = setTimeout(() => { releaseStarted(); releaseSiblings(); releaseClose(); }, 4000);
+  const mock = t.mock.method(fsPromises, "open", async (...args: Parameters<typeof original>) => {
+    const handle = await original(...args); handles.push(handle); maximum = Math.max(maximum, ++active);
+    const manifest = String(args[0]).endsWith("v2-build.json"), job = manifest ? 0 : ++openedJobs;
+    if (openedJobs === 3) releaseStarted();
+    const read = handle.read, close = handle.close;
+    if (!manifest) (handle as unknown as { read: (options: unknown) => Promise<unknown> }).read = async options => {
+      await startedGate;
+      if (job === 1) throw reason;
+      await siblingGate;
+      return Reflect.apply(read, handle, [options]);
+    };
+    handle.close = async function() {
+      if (job === 1) { failingCloseHeld = true; await closeGate; }
+      try { await close.call(this); } finally { active--; if (job === 2 || job === 3) siblingsClosed++; }
+      if (job === 1) throw new Error("secondary owned close failure");
+    };
+    return handle;
+  }); syncBuiltinESMExports();
+  const measurement = inspector.inspectV2BuildAsync(identityEntry(f)).then(() => null, (error: unknown) => error);
+  const until = async (predicate: () => boolean) => { const deadline = performance.now() + 3000;
+    while (!predicate()) { assert.ok(performance.now() < deadline, "identity interleaving barrier not reached"); await new Promise(resolve => setTimeout(resolve, 5)); } };
+  try {
+    await until(() => failingCloseHeld); releaseSiblings(); await until(() => siblingsClosed === 2);
+    await new Promise(resolve => setTimeout(resolve, 25));
+    const jobsWhileHeld = openedJobs;
+    releaseClose(); assert.equal(await measurement, reason);
+    assert.equal(active, 0); assert.ok(handles.every(handle => handle.fd === -1));
+    assert.equal(jobsWhileHeld, 3, "no further file job opens after failure while close is held");
+    assert.equal(openedJobs, 3); assert.equal(handles.length, 4); assert.equal(maximum, 3);
+  } finally {
+    releaseStarted(); releaseSiblings(); releaseClose(); clearTimeout(timer); await measurement;
+    mock.mock.restore(); syncBuiltinESMExports();
+    if (handles.every(handle => handle.fd === -1)) f.cleanup(); else { f.reader.close(); f.writer.close(); console.error("Retained uncertain first-failure identity handles"); }
+  }
+});
+
+for (const interleaving of ["sibling-completion", "sibling-error", "later-abort"] as const) test(`async_identity_first_close_failure_latches_before_${interleaving}`, { timeout: 20000 }, async t => {
+  const inspector = await identityInspector(), f = await fixture(), abort = new AbortController();
+  const reason = new FreshStartError("FRESH_START_BUILD_MISMATCH"), later = new FreshStartError("FRESH_START_BUILD_MISMATCH");
+  const externalReason = new Error("later owned first-close abort"), ordering: string[] = [];
+  const original = fsPromises.open, originalLstat = fsPromises.lstat, handles: Awaited<ReturnType<typeof original>>[] = [];
+  let rejectClose!: (error: unknown) => void, releaseSiblingClose!: () => void, rejectSiblingRead!: (error: unknown) => void;
+  let releaseStarted!: () => void, releaseReady!: () => void;
+  const started = new Promise<void>(resolve => { releaseStarted = resolve; });
+  const ready = new Promise<void>(resolve => { releaseReady = resolve; });
+  const firstClose = new Promise<void>((_resolve, reject) => { rejectClose = reject; });
+  const siblingClose = new Promise<void>(resolve => { releaseSiblingClose = resolve; });
+  const siblingRead = new Promise<never>((_resolve, reject) => { rejectSiblingRead = reject; });
+  let openedJobs = 0, active = 0, maximum = 0, readyCloses = 0, laterJobStats = 0, closeAttempts = 0;
+  const timer = setTimeout(() => { releaseStarted(); releaseReady(); releaseSiblingClose(); rejectClose(reason); rejectSiblingRead(later); }, 4000);
+  const statMock = t.mock.method(fsPromises, "lstat", (...args: Parameters<typeof originalLstat>) => {
+    if (String(args[0]) === join(f.copied, "workers/project-store.worker.js")) laterJobStats++;
+    return Reflect.apply(originalLstat, fsPromises, args);
+  });
+  const mock = t.mock.method(fsPromises, "open", async (...args: Parameters<typeof original>) => {
+    const handle = await original(...args); handles.push(handle); maximum = Math.max(maximum, ++active);
+    const job = String(args[0]).endsWith("v2-build.json") ? 0 : ++openedJobs;
+    if (openedJobs === 3) releaseStarted();
+    const read = handle.read, close = handle.close;
+    if (job !== 0) (handle as unknown as { read: (options: unknown) => Promise<unknown> }).read = options => {
+      if (job === 1) return siblingRead;
+      return started.then(() => Reflect.apply(read, handle, [options]));
+    };
+    handle.close = function() {
+      closeAttempts++;
+      if (job === 2 || job === 3) {
+        // Return the exact controlled promise awaited by fileIdentity; an adopting wrapper
+        // would let the sibling race happen before the close rejection is locally observed.
+        void close.call(this).then(() => { active--; ordering.push(`real-close-${job}`); if (++readyCloses === 2) releaseReady(); }, rejectClose);
+        return job === 2 ? firstClose : siblingClose;
+      }
+      return close.call(this).then(() => { active--; });
+    };
+    return handle;
+  }); syncBuiltinESMExports();
+  const measurement = inspector.inspectV2BuildAsync(identityEntry(f), abort.signal).then(() => null, (error: unknown) => error);
+  try {
+    await ready;
+    assert.equal(openedJobs, 3); assert.equal(maximum, 3);
+    assert.ok(handles.filter(handle => handle.fd === -1).length >= 3, "manifest and both controlled close handles really closed before injecting rejection");
+    if (interleaving === "sibling-completion") { ordering.push("release-sibling-completion"); releaseSiblingClose(); }
+    ordering.push("reject-first-close"); rejectClose(reason);
+    queueMicrotask(() => {
+      // firstClose is the exact awaited promise: its rejection continuation is
+      // queued before this callback and before the exact sibling read rejects.
+      ordering.push("later-callback");
+      if (interleaving === "later-abort") abort.abort(externalReason);
+      rejectSiblingRead(later); releaseSiblingClose();
+    });
+    const outcome = await measurement;
+    assert.equal(active, 0); assert.ok(handles.every(handle => handle.fd === -1)); assert.equal(closeAttempts, handles.length);
+    assert.ok(ordering.indexOf("real-close-2") < ordering.indexOf("reject-first-close"));
+    assert.ok(ordering.indexOf("reject-first-close") < ordering.indexOf("later-callback"));
+    if (interleaving === "later-abort") { assert.equal(abort.signal.aborted, true); assert.equal(abort.signal.reason, externalReason); }
+    assert.equal(outcome, reason, "first close failure must survive later sibling failure or external abort");
+    assert.equal(laterJobStats, 0, "no later file measurement starts after locally observed close failure");
+    assert.equal(openedJobs, 3, "no fourth job opens"); assert.equal(handles.length, 4); assert.equal(maximum, 3);
+  } finally {
+    releaseStarted(); releaseReady(); releaseSiblingClose(); rejectClose(reason); rejectSiblingRead(later); clearTimeout(timer); await measurement;
+    mock.mock.restore(); statMock.mock.restore(); syncBuiltinESMExports();
+    if (handles.every(handle => handle.fd === -1)) f.cleanup(); else { f.reader.close(); f.writer.close(); console.error("Retained uncertain first-close identity handles"); }
+  }
+});
+
+for (const fault of ["stat-error", "topology"] as const) test(`async_identity_preopen_failure_latches_before_later_abort ${fault}`, { timeout: 20000 }, async t => {
+  const inspector = await identityInspector(), f = await fixture(), abort = new AbortController();
+  const reason = new FreshStartError("FRESH_START_BUILD_MISMATCH"), later = new Error("later owned pre-open abort");
+  const original = fsPromises.open, originalLstat = fsPromises.lstat, handles: Awaited<ReturnType<typeof original>>[] = [];
+  const artifact = join(f.copied, "v2.js"); if (fault === "topology") linkSync(artifact, artifact + ".owned-hardlink");
+  let releaseStarted!: () => void, releaseStat!: () => void, rejectStat!: (error: unknown) => void, releaseReads!: () => void;
+  const started = new Promise<void>(resolve => { releaseStarted = resolve; });
+  const statGate = new Promise<void>((resolve, reject) => { releaseStat = resolve; rejectStat = reject; });
+  const reads = new Promise<void>(resolve => { releaseReads = resolve; });
+  let siblingHandles = 0, initialStatObserved = false, openedJobs = 0, active = 0, maximum = 0, closeAttempts = 0;
+  const markStarted = () => { if (initialStatObserved && siblingHandles === 2) releaseStarted(); };
+  const timer = setTimeout(() => { releaseStarted(); releaseStat(); releaseReads(); }, 4000);
+  const statMock = t.mock.method(fsPromises, "lstat", async (...args: Parameters<typeof originalLstat>) => {
+    const value = await Reflect.apply(originalLstat, fsPromises, args);
+    if (String(args[0]) === artifact) { initialStatObserved = true; markStarted(); await statGate; }
+    return value;
+  });
+  const mock = t.mock.method(fsPromises, "open", async (...args: Parameters<typeof original>) => {
+    const handle = await original(...args); handles.push(handle); maximum = Math.max(maximum, ++active);
+    const manifest = String(args[0]).endsWith("v2-build.json"), read = handle.read, close = handle.close;
+    if (!manifest) {
+      openedJobs++; siblingHandles++; markStarted();
+      (handle as unknown as { read: (options: unknown) => Promise<unknown> }).read = async options => { await reads; return Reflect.apply(read, handle, [options]); };
+    }
+    handle.close = async function() { closeAttempts++; await close.call(this); active--; };
+    return handle;
+  }); syncBuiltinESMExports();
+  const measurement = inspector.inspectV2BuildAsync(identityEntry(f), abort.signal).then(() => null, (error: unknown) => error);
+  try {
+    await started; assert.equal(initialStatObserved, true); assert.equal(siblingHandles, 2);
+    if (fault === "stat-error") rejectStat(reason); else releaseStat();
+    // The stat wrapper settles first, then fileIdentity observes it, then the later abort runs.
+    queueMicrotask(() => queueMicrotask(() => { abort.abort(later); releaseReads(); }));
+    const outcome = await measurement;
+    assert.equal(active, 0); assert.ok(handles.every(handle => handle.fd === -1)); assert.equal(closeAttempts, handles.length);
+    if (fault === "stat-error") assert.equal(outcome, reason);
+    else { assert.notEqual(outcome, later); assert.equal((outcome as FreshStartError).code, "FRESH_START_BUILD_MISMATCH"); }
+    assert.equal(openedJobs, 2); assert.equal(handles.length, 3); assert.equal(maximum, 2);
+  } finally {
+    releaseStarted(); releaseStat(); releaseReads(); clearTimeout(timer); await measurement;
+    mock.mock.restore(); statMock.mock.restore(); syncBuiltinESMExports();
+    if (handles.every(handle => handle.fd === -1)) f.cleanup(); else { f.reader.close(); f.writer.close(); console.error("Retained uncertain pre-open identity handles"); }
+  }
+});

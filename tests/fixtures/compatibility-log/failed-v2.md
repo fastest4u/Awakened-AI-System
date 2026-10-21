@@ -1,0 +1,26 @@
+# Compatibility Session Log v2
+
+## Identity
+{"branchRef":"refs/heads/main","branchScopeId":null,"documentVersion":2,"projectId":"11111111-1111-4111-8111-111111111111","sessionId":"44444444-4444-4444-8444-444444444444","startedAt":"2026-08-09T00:00:00.000Z","storeId":"33333333-3333-4333-8333-333333333333","vaultId":"22222222-2222-4222-8222-222222222222","workspaceId":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
+
+## Source
+{"startEventPosition":"1","streamId":"session/44444444-4444-4444-8444-444444444444","streamType":"session","throughEventPosition":"21"}
+
+## Lifecycle
+{"childEndPolicy":"require-completed","evidenceWindowState":"sealed","rootState":"ending","workflowGeneration":1,"workflowId":"b6c2d359-82a6-567e-86c7-bf9e780cf20b"}
+> SESSION ENDING
+
+## Accepted Children
+[{"category":"findings","childSessionId":"66666666-6666-4666-8666-666666666666","confidence":"high","evidenceReferences":["artifact://accepted"],"itemId":"10101010-1010-4010-8010-101010101010","itemIndex":0,"reportId":"99999999-9999-4999-8999-999999999999","summary":"Accepted child finding"}]
+
+## Unresolved Follow-ups
+[{"category":"blockers","confidence":"medium","evidenceReferences":["artifact://rejected"],"itemId":"20202020-2020-4020-8020-202020202020","itemIndex":1,"kind":"rejected-child-item","reportId":"99999999-9999-4999-8999-999999999999","sourceChildSessionId":"66666666-6666-4666-8666-666666666666","summary":"Rejected blocker"}]
+
+## Final Checkpoint
+{"checkpoint":{"artifactReferences":[],"assumptions":[],"baseEventPosition":"16","blockers":[],"checkpointEventPosition":"17","checkpointId":"55555555-5555-4555-8555-555555555555","checkpointVersion":1,"childSummaries":[],"commandResults":[],"completedItems":[{"confidence":"high","summary":"Children resolved"}],"createdAt":"2026-08-09T00:17:00.000Z","creatorAgentId":"agent-primary","creatorClientInstanceId":"client-primary","decisions":[],"evidenceCoverage":{"captureMode":"coverage-only","contentRetained":false,"highestContiguousOrdinal":"4","missingIntervals":[]},"filesTouched":[],"inProgressItems":[],"materialClaims":[],"nextActions":[],"parentSessionId":null,"sessionId":"44444444-4444-4444-8444-444444444444","sourceReferences":[],"sourceState":{"branchRef":"refs/heads/main","dirtyWorktreeFingerprint":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","headCommit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","sourceStateScopeVersion":1,"workspaceId":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"taskSummary":"Final checkpoint v1","testResults":[],"unresolvedConflicts":[],"verificationPerformed":[]},"checkpointFingerprint":"f0299b2cd2a07329988301c16fd34e7c395e5976f91e5b9a93bdd519189b4571"}
+
+## Validation
+{"qualityScore":null,"results":[{"artifactReferences":["artifact://validation/fail"],"completedAt":"2026-08-09T00:19:00.000Z","exitClassification":"failed","finalCheckpointFingerprint":"f0299b2cd2a07329988301c16fd34e7c395e5976f91e5b9a93bdd519189b4571","finalCheckpointId":"55555555-5555-4555-8555-555555555555","fresh":true,"outputFingerprint":{"fingerprint":"abababababababababababababababababababababababababababababababab","fingerprintDomain":"pm-validation-output-v1","fingerprintKeyId":"validation-key","fingerprintSchemaVersion":1},"profileConfigurationHash":"cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd","profileId":"safety","profileVersion":1,"projectId":"11111111-1111-4111-8111-111111111111","resultId":"30303030-3030-4030-8030-303030303030","runId":"40404040-4040-4040-8040-404040404040","runnerId":"validator-a","sessionId":"44444444-4444-4444-8444-444444444444","sourceStateAtCompletion":{"branchRef":"refs/heads/main","dirtyWorktreeFingerprint":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","headCommit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","sourceStateScopeVersion":1,"workspaceId":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"sourceStateAtStart":{"branchRef":"refs/heads/main","dirtyWorktreeFingerprint":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","headCommit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","sourceStateScopeVersion":1,"workspaceId":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"startedAt":"2026-08-09T00:18:00.000Z","status":"failed","storeId":"33333333-3333-4333-8333-333333333333","summary":"Validation failed safely","validationResultVersion":1,"vaultId":"22222222-2222-4222-8222-222222222222","workflowGeneration":1,"workflowId":"b6c2d359-82a6-567e-86c7-bf9e780cf20b","workspaceId":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}],"safeFailureCode":"SESSION_SOURCE_STATE_CONFLICT","validationResultIds":["30303030-3030-4030-8030-303030303030"],"verificationStatus":"failed"}
+
+## Materialization
+{"artifactKind":"compatibility-session-log","artifactPath":"05_Agent_Session_Logs/2026-08-09-session-44444444-4444-4444-8444-444444444444.md","materializationRevision":"21","targetKey":"lifecycle-log/44444444-4444-4444-8444-444444444444/21","triggeringEventPosition":"21","triggeringEventSchemaVersion":1,"triggeringEventType":"SessionEndVerificationFailed","triggeringPayloadHash":"f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1"}

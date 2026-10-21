@@ -48,6 +48,10 @@ export type ProjectBindingFailureCode =
   | "PROJECT_ID_MISMATCH"
   | "VAULT_ID_MISMATCH"
   | "STORE_ID_MISMATCH"
+  | "SCHEMA_UPGRADE_REQUIRED"
+  | "SCHEMA_TOO_NEW"
+  | "MIGRATION_CHECKSUM_MISMATCH"
+  | "SCHEMA_FINGERPRINT_MISMATCH"
   | "WORKSPACE_AMBIGUOUS"
   | "GIT_PROBE_FAILED"
   | "STORE_ROUTE_INVALID"
@@ -154,6 +158,10 @@ const IDENTITY_FAILURE_CODES = new Set<ProjectBindingFailureCode>([
   "PROJECT_ID_MISMATCH",
   "VAULT_ID_MISMATCH",
   "STORE_ID_MISMATCH",
+  "SCHEMA_UPGRADE_REQUIRED",
+  "SCHEMA_TOO_NEW",
+  "MIGRATION_CHECKSUM_MISMATCH",
+  "SCHEMA_FINGERPRINT_MISMATCH",
 ]);
 
 const FAILURE_MESSAGES: Record<ProjectBindingFailureCode, string> = {
@@ -168,6 +176,10 @@ const FAILURE_MESSAGES: Record<ProjectBindingFailureCode, string> = {
   PROJECT_ID_MISMATCH: "Project identity does not match the bound store",
   VAULT_ID_MISMATCH: "Vault identity does not match the bound store",
   STORE_ID_MISMATCH: "Store identity does not match the manifest",
+  SCHEMA_UPGRADE_REQUIRED: "The project store schema requires an explicit upgrade",
+  SCHEMA_TOO_NEW: "The project store schema is newer than this runtime supports",
+  MIGRATION_CHECKSUM_MISMATCH: "Recorded migration history does not match the approved registry",
+  SCHEMA_FINGERPRINT_MISMATCH: "The project store schema fingerprint does not match the approved schema",
   WORKSPACE_AMBIGUOUS: "The bound workspace identity is unavailable or changed",
   GIT_PROBE_FAILED: "Git workspace identity could not be verified",
   STORE_ROUTE_INVALID: "The project store route is invalid",
@@ -192,6 +204,10 @@ const REMEDIATION: Record<ProjectBindingFailureCode, string[]> = {
   PROJECT_ID_MISMATCH: ["select the intended project or perform an explicit identity migration"],
   VAULT_ID_MISMATCH: ["select the intended vault or perform an explicit vault migration"],
   STORE_ID_MISMATCH: ["attach the intended store or recover its manifest explicitly"],
+  SCHEMA_UPGRADE_REQUIRED: ["run orchestrator-upgrade --apply for the intended project"],
+  SCHEMA_TOO_NEW: ["upgrade the project-memory runtime before opening this store"],
+  MIGRATION_CHECKSUM_MISMATCH: ["restore the approved migration history before retrying"],
+  SCHEMA_FINGERPRINT_MISMATCH: ["run integrity recovery against the authoritative store"],
   WORKSPACE_AMBIGUOUS: ["establish a new binding for the intended workspace"],
   GIT_PROBE_FAILED: ["resolve the Git diagnostic and retry explicit binding"],
   STORE_ROUTE_INVALID: ["repair the canonical project store route before binding"],

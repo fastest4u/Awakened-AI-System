@@ -1,3 +1,8 @@
+import { decodeGovernedFixtureActionV2, decodeGovernedFixtureResultV2, type GovernedFixtureActionV2, type GovernedFixtureResultV2 } from "../governed-notes/fixture-control.js";
+import { decodeWorkerBindingAssertion } from "./worker-protocol.js";
+import { decodeGovernedNoteWorkerResponse, governedNoteRequestIds, isGovernedNoteRequest, sanitizeGovernedNoteError } from "../governed-notes/worker-protocol.js";
+import { GovernedNoteError } from "../governed-notes/errors.js";
+import { isTerminalGovernedReadOwnerError } from "./project-store-worker-backend.js";
 import type { JsonValue } from "../contracts/event.js";
 import {
   decodeWorkerRequest,
@@ -38,6 +43,7 @@ export interface WorkerRuntimeBackend {
 }
 
 export interface ProjectStoreWorkerRuntimeOptions {
+  trustedGovernedFixtureActions?: Readonly<{execute:(binding:WorkerBindingAssertion,action:GovernedFixtureActionV2)=>Promise<GovernedFixtureResultV2>}>;
   backend: WorkerRuntimeBackend;
   port: WorkerRuntimePort;
   scheduler: WorkerRuntimeScheduler;
@@ -118,6 +124,7 @@ function bindingAssertionFailure(
 }
 
 export class ProjectStoreWorkerRuntime {
+  readonly #trustedGovernedFixtureActions: ProjectStoreWorkerRuntimeOptions["trustedGovernedFixtureActions"];
   readonly #backend: WorkerRuntimeBackend;
   readonly #port: WorkerRuntimePort;
   readonly #scheduler: WorkerRuntimeScheduler;
@@ -130,6 +137,7 @@ export class ProjectStoreWorkerRuntime {
   #binding: WorkerBindingAssertion | null = null;
   #observedQuiesce: { lease: MaintenanceLeaseWire; requestIds: string[] } | null = null;
   #heartbeatInFlight = false;
+  #terminalGovernedRead = false;
 
   constructor(options: ProjectStoreWorkerRuntimeOptions) {
     if (
@@ -138,13 +146,23 @@ export class ProjectStoreWorkerRuntime {
     ) {
       throw new Error("WORKER_CONFIG_INVALID");
     }
+    this.#trustedGovernedFixtureActions=options.trustedGovernedFixtureActions;
     this.#backend = options.backend;
     this.#port = options.port;
     this.#scheduler = options.scheduler;
     this.#heartbeatIntervalMs = options.heartbeatIntervalMs;
   }
 
+  enqueueTrustedGovernedFixtureAction(binding:WorkerBindingAssertion,action:GovernedFixtureActionV2):Promise<GovernedFixtureResultV2>{
+    const owned=decodeGovernedFixtureActionV2(action),assertion=decodeWorkerBindingAssertion(binding);
+    const check=()=>{if(this.#closing||this.#quiescing||!this.#open||!this.#binding||!this.#trustedGovernedFixtureActions||bindingAssertionFailure(this.#binding,assertion))throw new GovernedNoteError("GOVERNED_NOTE_UNAVAILABLE");};
+    check();
+    const operation=this.#fifo.then(async()=>{check();return decodeGovernedFixtureResultV2(await this.#trustedGovernedFixtureActions!.execute(assertion,owned),owned);});
+    this.#fifo=operation.then(()=>undefined,()=>undefined);return operation;
+  }
+
   receive(value: unknown): void {
+    if (this.#terminalGovernedRead) return;
     let request: WorkerRequest;
     try {
       request = decodeWorkerRequest(value);
@@ -154,7 +172,7 @@ export class ProjectStoreWorkerRuntime {
       return;
     }
     if (this.#closing) {
-      this.postFailure(request.id, { code: "MAINTENANCE_QUIESCING", details: {} });
+      this.postRequestFailure(request, { code: "MAINTENANCE_QUIESCING", details: {} });
       return;
     }
     if (this.#quiescing) {
@@ -167,11 +185,11 @@ export class ProjectStoreWorkerRuntime {
         } else if (sameMaintenanceLeaseWire(request.lease, this.#observedQuiesce.lease)) {
           this.#observedQuiesce.requestIds.push(request.id);
         } else {
-          this.postFailure(request.id, { code: "MAINTENANCE_QUIESCING", details: {} });
+          this.postRequestFailure(request, { code: "MAINTENANCE_QUIESCING", details: {} });
         }
         return;
       }
-      this.postFailure(request.id, { code: "MAINTENANCE_QUIESCING", details: {} });
+      this.postRequestFailure(request, { code: "MAINTENANCE_QUIESCING", details: {} });
       return;
     }
     if (request.type === "quiesce") this.#quiescing = true;
@@ -181,13 +199,16 @@ export class ProjectStoreWorkerRuntime {
   }
 
   private async process(request: WorkerRequest): Promise<void> {
+    // Requests already accepted into FIFO cannot reach dispatch after this
+    // private terminal observation, including an already-enqueued close.
+    if (this.#terminalGovernedRead) return;
     if (request.type === "close") {
       this.clearHeartbeat();
       try {
         await this.#backend.close();
         this.#port.postMessage({ id: request.id, ok: true, data: { closed: true } });
       } catch (error) {
-        this.postFailure(request.id, safeError(error));
+        this.postRequestFailure(request, error);
       } finally {
         this.#port.close();
       }
@@ -216,7 +237,7 @@ export class ProjectStoreWorkerRuntime {
           connectionClosed: true,
         });
       } catch (error) {
-        this.postFailure(request.id, safeError(error));
+        this.postRequestFailure(request, error);
       } finally {
         this.#closing = true;
         this.#port.close();
@@ -225,7 +246,11 @@ export class ProjectStoreWorkerRuntime {
     }
     try {
       const data = await this.#backend.dispatch(request);
-      this.#port.postMessage({ id: request.id, ok: true, data });
+      const response = { id: request.id, ok: true, data };
+      if (isGovernedNoteRequest(request)) {
+        try { this.#port.postMessage(decodeGovernedNoteWorkerResponse(response, request)); }
+        catch { throw new GovernedNoteError(request.type === "governed-note-create" ? "COMMAND_OUTCOME_UNKNOWN" : "WORKER_PROTOCOL_ERROR", governedNoteRequestIds(request)); }
+      } else this.#port.postMessage(response);
       if (request.type === "open") {
         this.#binding = {
           projectId: request.binding.projectId,
@@ -242,7 +267,16 @@ export class ProjectStoreWorkerRuntime {
         this.#port.close();
       }
     } catch (error) {
-      this.postFailure(request.id, safeError(error));
+      if (isTerminalGovernedReadOwnerError(error)) {
+        this.#terminalGovernedRead = true;
+        this.#closing = true;
+        this.clearHeartbeat();
+        // Never publish a normal safe-error ACK for an uncertain read owner.
+        // Existing executor onExit owns poisoning and pending-request failure.
+        void this.#backend.close().catch(() => undefined).finally(() => this.#port.close());
+        return;
+      }
+      this.postRequestFailure(request, error);
       if (request.type === "open" || request.type === "verifyIdentity" || request.type === "inspectExisting") {
         this.#closing = true;
         this.#port.close();
@@ -308,6 +342,15 @@ export class ProjectStoreWorkerRuntime {
         this.#port.close();
       }
     }).catch(() => this.stop());
+  }
+
+  private postRequestFailure(request: WorkerRequest, error: unknown): void {
+    if (!isGovernedNoteRequest(request)) { this.postFailure(request.id, safeError(error)); return; }
+    try {
+      const safe = sanitizeGovernedNoteError(error, governedNoteRequestIds(request));
+      const response = decodeGovernedNoteWorkerResponse({ id: request.id, ok: false, error: { code: safe.code, message: safe.message, details: safe.details } }, request);
+      this.#port.postMessage(response);
+    } catch { this.stop(); }
   }
 
   private postFailure(id: string, error: SafeRuntimeError): void {

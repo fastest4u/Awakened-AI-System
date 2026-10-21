@@ -1,9 +1,11 @@
 import { parentPort, workerData } from "node:worker_threads";
+import { inspectV2Build } from "../v2/build-identity.js";
 import {
   ProjectStoreWorkerBackend,
   ProjectStoreWorkerBackendError,
   runIntegrityChild,
 } from "../orchestrator/runtime/project-store-worker-backend.js";
+import { ProjectStoreUpgradeService } from "../orchestrator/storage/project-store-upgrade.service.js";
 import {
   ProjectStoreWorkerRuntime,
   type WorkerRuntimePort,
@@ -11,9 +13,15 @@ import {
 } from "../orchestrator/runtime/project-store-worker-runtime.js";
 import {
   decodeWorkerBinding,
+  decodeIntegrityProviderResponseWire,
   decodeWorkerRequest,
+  decodeUpgradeWorkerCommand,
+  decodeMaintenanceLeaseWire,
+  encodeMaintenanceLeaseWire,
   type WorkerRequest,
 } from "../orchestrator/runtime/worker-protocol.js";
+import { WorkerIntegrityProviderClient } from "../orchestrator/runtime/worker-integrity-provider-client.js";
+import type { MaintenanceLease } from "../orchestrator/storage/maintenance-fence.js";
 
 const DEFAULT_EXECUTOR_LEASE_MS = 15_000;
 const DEFAULT_APPEND_RETRY_DEADLINE_MS = 10_000;
@@ -27,7 +35,8 @@ type WorkerRoleConfig =
       appendRetryDeadlineMs: number;
     }
   | { role: "identity" }
-  | { role: "integrity"; binding: unknown };
+  | { role: "integrity"; binding: unknown }
+  | { role: "upgrade"; binding: unknown; trustedTtlMs?: number };
 
 function protocolFailure(): never {
   throw new ProjectStoreWorkerBackendError("WORKER_CONFIG_INVALID");
@@ -62,6 +71,22 @@ function config(value: unknown): WorkerRoleConfig {
   if (observed.role === "integrity") {
     const parsed = exact(value, ["role", "binding"]);
     return { role: "integrity", binding: parsed.binding };
+  }
+  if (observed.role === "upgrade") {
+    const keys = Object.keys(observed).sort();
+    const expected = observed.trustedTtlMs === undefined
+      ? ["binding", "role"]
+      : ["binding", "role", "trustedTtlMs"];
+    if (keys.length !== expected.length || keys.some((key, index) => key !== expected[index])) {
+      protocolFailure();
+    }
+    return {
+      role: "upgrade",
+      binding: observed.binding,
+      ...(observed.trustedTtlMs === undefined
+        ? {}
+        : { trustedTtlMs: positiveInteger(observed.trustedTtlMs) }),
+    };
   }
   if (observed.role === "store") {
     const parsed = exact(value, [
@@ -101,18 +126,141 @@ const parent = parentPort;
 
 const role = config(workerData);
 const selfUrl = new URL(import.meta.url);
+const upgradePhaseWorkerUrl = new URL("./project-store-upgrade-phase.worker.js", import.meta.url);
 
-if (role.role === "integrity") {
+if (role.role === "upgrade") {
+  const context = decodeWorkerBinding(role.binding);
+  let activeOperationId: string | null = null;
+  let releaseQuiesce: (() => void) | null = null;
+  let rejectQuiesce: ((error: Error) => void) | null = null;
+  let activeService: ProjectStoreUpgradeService | null = null;
+  const registry = {
+    quiesceStore(
+      _context: typeof context,
+      lease: MaintenanceLease,
+    ): Promise<void> {
+      if (activeOperationId === null || releaseQuiesce !== null) {
+        throw new ProjectStoreWorkerBackendError("WORKER_PROTOCOL_ERROR");
+      }
+      parent.postMessage({
+        type: "upgrade-quiesce-required",
+        operationId: activeOperationId,
+        lease: encodeMaintenanceLeaseWire(lease),
+      });
+      return new Promise<void>((resolveQuiesce, reject) => {
+        releaseQuiesce = resolveQuiesce;
+        rejectQuiesce = reject;
+      });
+    },
+  };
+  const postFailure = (id: string, error: unknown): void => {
+    const failure = safeFailure(error);
+    parent.postMessage({
+      id,
+      ok: false,
+      error: { code: failure.code, message: failure.code, details: failure.details },
+    });
+  };
+  parent.on("message", (value: unknown) => {
+    let command: ReturnType<typeof decodeUpgradeWorkerCommand>;
+    try {
+      command = decodeUpgradeWorkerCommand(value);
+    } catch (error) {
+      postFailure("unknown", error);
+      return;
+    }
+    if (command.type === "upgrade-quiesce-complete") {
+      if (command.operationId !== activeOperationId || releaseQuiesce === null) {
+        postFailure("unknown", new ProjectStoreWorkerBackendError("WORKER_PROTOCOL_ERROR"));
+        return;
+      }
+      const release = releaseQuiesce;
+      releaseQuiesce = null;
+      rejectQuiesce = null;
+      release();
+      return;
+    }
+    if (command.type === "upgrade-confirm-closure") {
+      if (command.operationId !== activeOperationId || activeService === null) {
+        postFailure(command.id, new ProjectStoreWorkerBackendError("MAINTENANCE_CONFIRMATION_FAILED"));
+        return;
+      }
+      const lease = decodeMaintenanceLeaseWire(command.confirmation.lease);
+      void activeService.confirmMaintenanceClosure({
+        projectId: command.confirmation.projectId as typeof context.binding.projectId,
+        executorId: command.confirmation.executorId,
+        lease,
+        connectionClosed: true,
+      }).then(() => {
+        parent.postMessage({ id: command.id, ok: true, data: { confirmed: true } });
+      }).catch((error: unknown) => postFailure(command.id, error));
+      return;
+    }
+    if (command.type === "upgrade-inspect") {
+      if (activeOperationId !== null) {
+        postFailure(command.id, new ProjectStoreWorkerBackendError("MAINTENANCE_ALREADY_ACTIVE"));
+        return;
+      }
+      const service = new ProjectStoreUpgradeService();
+      void service.inspect(context).then((plan) => {
+        parent.postMessage({ id: command.id, ok: true, data: plan });
+      }).catch((error: unknown) => postFailure(command.id, error));
+      return;
+    }
+    if (activeOperationId !== null) {
+      postFailure(command.id, new ProjectStoreWorkerBackendError("MAINTENANCE_ALREADY_ACTIVE"));
+      return;
+    }
+    activeOperationId = command.id;
+    activeService = new ProjectStoreUpgradeService({
+      executorRegistry: registry,
+      upgradePhaseWorkerUrl,
+      ...(role.trustedTtlMs === undefined ? {} : { trustedTtlMs: role.trustedTtlMs }),
+    });
+    void activeService.apply(context).then((result) => {
+      parent.postMessage({ id: command.id, ok: true, data: result });
+    }).catch((error: unknown) => postFailure(command.id, error)).finally(() => {
+      if (releaseQuiesce !== null) {
+        const reject = rejectQuiesce;
+        releaseQuiesce = null;
+        rejectQuiesce = null;
+        reject?.(new ProjectStoreWorkerBackendError("WORKER_CLOSED"));
+      }
+      activeOperationId = null;
+      activeService = null;
+    });
+  });
+} else if (role.role === "integrity") {
   const context = decodeWorkerBinding(role.binding);
   let accepted = false;
+  let activeRequestId = "unknown";
+  let providerClient: WorkerIntegrityProviderClient | null = null;
+  let terminalPosted = false;
+  const postFailureOnce = (id: string, error: unknown): void => {
+    if (terminalPosted) return;
+    terminalPosted = true;
+    const failure = safeFailure(error);
+    parent.postMessage({
+      id,
+      ok: false,
+      error: { code: failure.code, message: failure.code, details: failure.details },
+    });
+  };
+  parent.on("close", () => {
+    providerClient?.dispose(new ProjectStoreWorkerBackendError("WORKER_CLOSED"));
+  });
   parent.on("message", (value: unknown) => {
     if (accepted) {
-      parent.postMessage({
-        id: "unknown",
-        ok: false,
-        error: { code: "WORKER_PROTOCOL_ERROR", message: "WORKER_PROTOCOL_ERROR", details: {} },
-      });
-      parent.close();
+      try {
+        decodeIntegrityProviderResponseWire(value);
+        if (providerClient === null) throw new ProjectStoreWorkerBackendError("WORKER_PROTOCOL_ERROR");
+        providerClient.accept(value);
+      } catch {
+        const error = new ProjectStoreWorkerBackendError("WORKER_PROTOCOL_ERROR");
+        providerClient?.dispose(error);
+        postFailureOnce(activeRequestId, error);
+        parent.close();
+      }
       return;
     }
     accepted = true;
@@ -122,6 +270,7 @@ if (role.role === "integrity") {
       if (request.type !== "quickIntegrity" && request.type !== "fullIntegrity") {
         throw new ProjectStoreWorkerBackendError("WORKER_PROTOCOL_ERROR");
       }
+      activeRequestId = request.id;
       const binding = request.binding;
       const current = context.binding;
       if (binding.projectId !== current.projectId) {
@@ -143,27 +292,27 @@ if (role.role === "integrity") {
         });
       }
     } catch (error) {
-      const failure = safeFailure(error);
       const id = typeof value === "object" && value !== null && "id" in value
         && typeof value.id === "string" ? value.id : "unknown";
-      parent.postMessage({
-        id,
-        ok: false,
-        error: { code: failure.code, message: failure.code, details: failure.details },
-      });
+      postFailureOnce(id, error);
       parent.close();
       return;
     }
-    void runIntegrityChild(context, request).then((report) => {
+    providerClient = new WorkerIntegrityProviderClient(
+      parent,
+      request.id,
+      request.type === "quickIntegrity" ? "quick" : "full",
+    );
+    void runIntegrityChild(context, request, providerClient).then((report) => {
+      if (terminalPosted) return;
+      terminalPosted = true;
       parent.postMessage({ id: request.id, ok: true, data: report });
     }).catch((error: unknown) => {
-      const failure = safeFailure(error);
-      parent.postMessage({
-        id: request.id,
-        ok: false,
-        error: { code: failure.code, message: failure.code, details: failure.details },
-      });
-    }).finally(() => parent.close());
+      postFailureOnce(request.id, error);
+    }).finally(() => {
+      providerClient?.dispose(new ProjectStoreWorkerBackendError("WORKER_CLOSED"));
+      parent.close();
+    });
   });
 } else {
   const executorLeaseMs = role.role === "store"
@@ -177,6 +326,7 @@ if (role.role === "integrity") {
     : DEFAULT_APPEND_RETRY_DEADLINE_MS;
   const backend = new ProjectStoreWorkerBackend({
     selfUrl,
+    trustedFreshStartBuildInspector: () => inspectV2Build(selfUrl.href),
     executorLeaseMs,
     appendRetryDeadlineMs,
   });

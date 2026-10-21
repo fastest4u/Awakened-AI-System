@@ -1,109 +1,90 @@
-import { createHash } from "node:crypto";
 import { PROJECT_MEMORY_APPLICATION_ID } from "../runtime/runtime-capabilities.js";
-import type { SqliteConnection, SqliteRow } from "./sqlite-driver.js";
 import type { Migration } from "./migration.js";
+import {
+  inspectStoreSchema,
+  migrationChecksum,
+  SchemaCompatibilityError,
+  type SchemaCompatibilityErrorCode,
+  validateMigrationRegistry,
+} from "./schema-compatibility.js";
+import type { SqliteConnection } from "./sqlite-driver.js";
+import {
+  assertQualifiedCheckpointMigrationStage,
+  qualifiedCheckpointMigrationFailure,
+} from "./qualified-checkpoint-migration-preflight.js";
+import { sessionEndEffectiveStateMigrationFailure } from "./session-end-effective-state-migration-preflight.js";
 
-export type MigrationErrorCode =
-  | "MIGRATION_SET_INVALID"
-  | "MIGRATION_CHECKSUM_MISMATCH"
-  | "MIGRATION_NAME_MISMATCH"
-  | "SCHEMA_TOO_NEW"
-  | "STORE_APPLICATION_ID_MISMATCH";
+export { migrationChecksum } from "./schema-compatibility.js";
+export { SchemaCompatibilityError as MigrationError } from "./schema-compatibility.js";
+export type MigrationErrorCode = SchemaCompatibilityErrorCode;
 
-export class MigrationError extends Error {
-  constructor(readonly code: MigrationErrorCode, message = code) {
-    super(message);
-    this.name = "MigrationError";
-  }
+export type MigrationBeforeHook = (
+  connection: SqliteConnection,
+  migration: Migration,
+) => void;
+
+export type MigrationApplyMode =
+  | { readonly kind: "bootstrap-empty"; readonly beforeMigration: MigrationBeforeHook }
+  | {
+      readonly kind: "explicit-upgrade";
+      readonly expectedAppliedVersion: number;
+      readonly beforeMigration: MigrationBeforeHook;
+      readonly faultInjector?: {
+        hit(
+          boundary:
+            | "after-ddl-before-migration-row"
+            | "after-migration-row-before-project-version"
+            | "after-project-version-before-commit",
+          migration: Migration,
+        ): void;
+      };
+      readonly renewMutableBoundary?: () => void;
+    };
+
+function fail(code: SchemaCompatibilityErrorCode): never {
+  throw new SchemaCompatibilityError(code);
 }
 
-export function migrationChecksum(migration: Migration): string {
-  return createHash("sha256").update(migration.sql, "utf8").digest("hex");
-}
-
-function fail(code: MigrationErrorCode): never {
-  throw new MigrationError(code);
-}
-
-function validateMigrations(migrations: readonly Migration[]): void {
-  let previousVersion = 0;
-  const names = new Set<string>();
-  for (const migration of migrations) {
-    if (
-      !Number.isSafeInteger(migration.version)
-      || migration.version <= previousVersion
-      || migration.version <= 0
-      || migration.name.trim().length === 0
-      || migration.name !== migration.name.trim()
-      || names.has(migration.name)
-      || migration.sql.trim().length === 0
-    ) {
-      fail("MIGRATION_SET_INVALID");
-    }
-    previousVersion = migration.version;
-    names.add(migration.name);
-  }
+function numeric(value: unknown): number | undefined {
+  if (typeof value !== "number" && typeof value !== "bigint") return undefined;
+  const result = Number(value);
+  return Number.isSafeInteger(result) ? result : undefined;
 }
 
 function applicationId(connection: SqliteConnection): number {
-  const value = connection.prepare("PRAGMA application_id").get()?.application_id;
-  if (typeof value !== "bigint" && typeof value !== "number") {
-    fail("STORE_APPLICATION_ID_MISMATCH");
-  }
-  return Number(value);
+  const value = numeric(connection.prepare("PRAGMA application_id").get()?.application_id);
+  if (value === undefined) fail("STORE_APPLICATION_ID_MISMATCH");
+  return value;
 }
 
-function tableExists(connection: SqliteConnection, name: string): boolean {
-  return connection.prepare(`
+function userSchemaObjectCount(connection: SqliteConnection): number {
+  const count = numeric(connection.prepare(`
     SELECT count(*) AS count
     FROM sqlite_schema
-    WHERE type = 'table' AND name = $name
-  `).get({ $name: name })?.count === 1n;
+    WHERE name NOT GLOB 'sqlite_*'
+  `).get()?.count);
+  if (count === undefined || count < 0) fail("STORE_NOT_EMPTY");
+  return count;
 }
 
-interface RecordedMigration {
-  version: number;
-  name: string;
-  checksum: string;
-}
-
-function recordedMigrations(connection: SqliteConnection): RecordedMigration[] {
-  if (!tableExists(connection, "schema_migrations")) return [];
-  return connection.prepare(`
-    SELECT version, name, checksum
-    FROM schema_migrations
-    ORDER BY version
-  `).all().map((row: SqliteRow): RecordedMigration => {
-    if (
-      (typeof row.version !== "bigint" && typeof row.version !== "number")
-      || typeof row.name !== "string"
-      || typeof row.checksum !== "string"
-    ) {
-      fail("MIGRATION_CHECKSUM_MISMATCH");
-    }
-    const version = Number(row.version);
-    if (!Number.isSafeInteger(version) || version <= 0) {
-      fail("MIGRATION_CHECKSUM_MISMATCH");
-    }
-    return { version, name: row.name, checksum: row.checksum };
-  });
-}
-
-function verifyRecorded(
-  recorded: readonly RecordedMigration[],
-  migrations: readonly Migration[],
-): void {
-  const byVersion = new Map(migrations.map((migration) => [migration.version, migration]));
-  const maximumVersion = migrations.at(-1)?.version ?? 0;
-  for (const applied of recorded) {
-    if (applied.version > maximumVersion) fail("SCHEMA_TOO_NEW");
-    const expected = byVersion.get(applied.version);
-    if (expected === undefined) fail("MIGRATION_CHECKSUM_MISMATCH");
-    if (applied.name !== expected.name) fail("MIGRATION_NAME_MISMATCH");
-    if (applied.checksum !== migrationChecksum(expected)) {
-      fail("MIGRATION_CHECKSUM_MISMATCH");
-    }
+function identityRowCount(connection: SqliteConnection): number {
+  const count = numeric(connection.prepare(`
+    SELECT count(*) AS count FROM project_meta WHERE singleton = 1
+  `).get()?.count);
+  if (count === undefined || count < 0 || count > 1) {
+    fail("PROJECT_SCHEMA_VERSION_MISMATCH");
   }
+  return count;
+}
+
+function validateMode(mode: MigrationApplyMode): void {
+  if (typeof mode.beforeMigration !== "function") fail("MIGRATION_MODE_INVALID");
+  if (mode.kind === "bootstrap-empty") return;
+  if (
+    mode.kind !== "explicit-upgrade"
+    || !Number.isSafeInteger(mode.expectedAppliedVersion)
+    || mode.expectedAppliedVersion < 0
+  ) fail("MIGRATION_MODE_INVALID");
 }
 
 function rollbackPreservingOriginal(connection: SqliteConnection): void {
@@ -117,35 +98,63 @@ function rollbackPreservingOriginal(connection: SqliteConnection): void {
 export class MigrationRunner {
   apply(
     connection: SqliteConnection,
-    migrations: readonly Migration[],
+    registry: readonly Migration[],
     appliedAt: string,
+    mode: MigrationApplyMode,
   ): number[] {
-    validateMigrations(migrations);
+    validateMigrationRegistry(registry);
+    validateMode(mode);
+    if (appliedAt.trim().length === 0) fail("MIGRATION_MODE_INVALID");
 
-    const observedApplicationId = applicationId(connection);
-    if (observedApplicationId === 0) {
-      connection.exec(`PRAGMA application_id = ${PROJECT_MEMORY_APPLICATION_ID}`);
-    } else if (observedApplicationId !== PROJECT_MEMORY_APPLICATION_ID) {
-      fail("STORE_APPLICATION_ID_MISMATCH");
+    if (mode.kind === "bootstrap-empty") {
+      const observedApplicationId = applicationId(connection);
+      if (observedApplicationId !== 0) {
+        fail(observedApplicationId === PROJECT_MEMORY_APPLICATION_ID
+          ? "STORE_NOT_EMPTY"
+          : "STORE_APPLICATION_ID_MISMATCH");
+      }
+      if (userSchemaObjectCount(connection) !== 0) fail("STORE_NOT_EMPTY");
     }
 
-    verifyRecorded(recordedMigrations(connection), migrations);
-    const applied: number[] = [];
-    for (const migration of migrations) {
-      try {
-        connection.exec("BEGIN IMMEDIATE");
+    try {
+      connection.exec("BEGIN IMMEDIATE");
+      let appliedVersion: number;
+      if (mode.kind === "bootstrap-empty") {
         const lockedApplicationId = applicationId(connection);
-        if (lockedApplicationId !== PROJECT_MEMORY_APPLICATION_ID) {
+        if (lockedApplicationId !== 0) {
+          fail(lockedApplicationId === PROJECT_MEMORY_APPLICATION_ID
+            ? "STORE_NOT_EMPTY"
+            : "STORE_APPLICATION_ID_MISMATCH");
+        }
+        if (userSchemaObjectCount(connection) !== 0) fail("STORE_NOT_EMPTY");
+        connection.exec(`PRAGMA application_id = ${PROJECT_MEMORY_APPLICATION_ID}`);
+        if (applicationId(connection) !== PROJECT_MEMORY_APPLICATION_ID) {
           fail("STORE_APPLICATION_ID_MISMATCH");
         }
-        const recorded = recordedMigrations(connection);
-        verifyRecorded(recorded, migrations);
-        if (recorded.some((item) => item.version === migration.version)) {
-          connection.exec("COMMIT");
-          continue;
+        appliedVersion = 0;
+      } else {
+        const inspection = inspectStoreSchema(connection, registry);
+        appliedVersion = inspection.appliedVersion;
+        if (appliedVersion !== mode.expectedAppliedVersion) {
+          fail("MIGRATION_EXPECTED_VERSION_MISMATCH");
         }
+        if (appliedVersion === inspection.targetVersion) {
+          connection.exec("COMMIT");
+          return [];
+        }
+      }
 
+      const applied: number[] = [];
+      for (const migration of registry.slice(appliedVersion)) {
+        if (mode.kind === "explicit-upgrade") mode.renewMutableBoundary?.();
+        mode.beforeMigration(connection, migration);
+        if (migration.version === 3) assertQualifiedCheckpointMigrationStage(connection);
+        if (mode.kind === "explicit-upgrade") mode.renewMutableBoundary?.();
         connection.exec(migration.sql);
+        if (mode.kind === "explicit-upgrade") {
+          mode.faultInjector?.hit("after-ddl-before-migration-row", migration);
+          mode.renewMutableBoundary?.();
+        }
         connection.prepare(`
           INSERT INTO schema_migrations(version, name, checksum, applied_at)
           VALUES ($version, $name, $checksum, $appliedAt)
@@ -155,13 +164,36 @@ export class MigrationRunner {
           $checksum: migrationChecksum(migration),
           $appliedAt: appliedAt,
         });
-        connection.exec("COMMIT");
+
+        if (mode.kind === "explicit-upgrade") {
+          mode.faultInjector?.hit("after-migration-row-before-project-version", migration);
+          mode.renewMutableBoundary?.();
+        }
+
+        if (identityRowCount(connection) === 1) {
+          const result = connection.prepare(`
+            UPDATE project_meta
+            SET schema_version = $version
+            WHERE singleton = 1 AND schema_version = $previousVersion
+          `).run({
+            $version: migration.version,
+            $previousVersion: migration.version - 1,
+          });
+          if (result.changes !== 1n) fail("PROJECT_SCHEMA_VERSION_MISMATCH");
+        }
+        if (mode.kind === "explicit-upgrade") {
+          mode.faultInjector?.hit("after-project-version-before-commit", migration);
+        }
         applied.push(migration.version);
-      } catch (error) {
-        rollbackPreservingOriginal(connection);
-        throw error;
       }
+      if (mode.kind === "explicit-upgrade") mode.renewMutableBoundary?.();
+      connection.exec("COMMIT");
+      return applied;
+    } catch (error) {
+      rollbackPreservingOriginal(connection);
+      throw sessionEndEffectiveStateMigrationFailure(error)
+        ?? qualifiedCheckpointMigrationFailure(error)
+        ?? error;
     }
-    return applied;
   }
 }

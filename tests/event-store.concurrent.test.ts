@@ -13,6 +13,7 @@ import {
 } from "../src/orchestrator/identity/project-binding.service.js";
 import { WorkerProjectStoreIdentityProbe } from "../src/orchestrator/runtime/project-store-identity-probe.js";
 import { DEFAULT_MAX_PENDING, ProjectStoreExecutor } from "../src/orchestrator/runtime/project-store-executor.js";
+import { PROJECT_STORE_MIGRATIONS } from "../src/orchestrator/storage/migrations/registry.js";
 import {
   decodeWorkerBinding,
   encodeWorkerBinding,
@@ -462,7 +463,11 @@ function inspectStore(route: ProjectStoreRouteWire, expectedEvents: number, expe
     }
     assert.equal(database.prepare("PRAGMA integrity_check").get()?.integrity_check, "ok");
     assert.deepEqual(database.prepare("PRAGMA foreign_key_check").all(), []);
-    assert.equal(database.prepare("SELECT count(*) AS count FROM schema_migrations").get()?.count, 1);
+    assert.deepEqual(
+      database.prepare("SELECT version, name FROM schema_migrations ORDER BY version").all()
+        .map((row) => ({ version: Number(row.version), name: row.name })),
+      PROJECT_STORE_MIGRATIONS.map(({ version, name }) => ({ version, name })),
+    );
     return identity;
   } finally {
     database.close();

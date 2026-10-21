@@ -1,0 +1,434 @@
+import { filterCandidates, rankingChannels, resultItems } from "./selection-core.js";
+import { ProjectionLagError } from "../projections/coordinator.js";
+import { parseProjectionManifest, type ProjectionManifestV1 } from "../projections/manifest.js";
+import { ShadowMigrationError } from "../migration/v2-shadow-migration.contracts.js";
+import type { ShadowMigrationInvocationDeadline } from "../migration/v2-shadow-migration-runtime.js";
+import {
+  InternalRetrievalError,
+  validateInternalRetrievalRequest,
+  type InternalRetrievalRequest,
+  type InternalRetrievalResult,
+  type InternalRetrievalResultItem,
+  type ProjectionLeaseProvider,
+  type RetrievalCandidateCollection,
+  type RetrievalCandidateRepository,
+  type RetrievalItem,
+  type ValidatedInternalRetrievalRequest,
+  type VectorCacheManifestV1,
+  type VectorCandidateChannel,
+  type VectorChannelFailureCode,
+  type VectorChannelResult,
+} from "./contracts.js";
+import {
+  buildRetrievalExplanation,
+  type RedactedDropCounts,
+  type RedactedDropReason,
+  type RetrievalChannelContribution,
+  type RetrievalExplanation,
+} from "./explain.js";
+import {
+  branchVisible,
+  freshnessVisible,
+  sessionVisible,
+  statusVisible,
+  temporalVisible,
+  workspaceVisible,
+} from "./eligibility.js";
+import {
+  DEFAULT_RANKING_POLICY,
+  RERANK_FEATURE_NAMES,
+  addRationalScores,
+  formatRationalScore,
+  fuseCandidates,
+  rerankCandidates,
+  selectRankedCandidates,
+  validateCustomRanking,
+  type FusedCandidate,
+  type RankedConflictGroup,
+  type RankedSelection,
+  type RationalScore,
+  type RetrievalRanker,
+} from "./ranking.js";
+import {
+  disabledVectorChannel,
+  parseVectorCacheManifest,
+  unavailableVectorChannel,
+  withVectorDeadline,
+} from "./vector-cache.js";
+
+export interface InternalRetrievalServiceOptions {
+  readonly projections: ProjectionLeaseProvider;
+  readonly candidates: RetrievalCandidateRepository;
+  readonly ranker?: RetrievalRanker;
+  readonly vectorChannel?: VectorCandidateChannel;
+}
+
+export interface VectorChannelDiagnostic {
+  readonly used: boolean;
+  readonly failureCode: VectorChannelFailureCode | null;
+  readonly candidateCount: number;
+  readonly manifest: VectorCacheManifestV1 | null;
+}
+
+export interface InternalRetrievalChannelDiagnostics {
+  readonly vector: VectorChannelDiagnostic;
+}
+
+export interface RankedInternalRetrievalResultItem extends InternalRetrievalResultItem {
+  readonly conflictGroupId: string | null;
+}
+
+export interface RankedInternalRetrievalResult extends InternalRetrievalResult {
+  readonly items: readonly RankedInternalRetrievalResultItem[];
+  readonly eligibleCount: number;
+  readonly rankingPolicyVersion: string;
+  readonly rerankFeatureNames: typeof RERANK_FEATURE_NAMES;
+  readonly redactedDropCounts: RedactedDropCounts;
+  readonly channelContributions: readonly RetrievalChannelContribution[];
+  readonly requiredEventPosition: bigint;
+  readonly publishedEventPosition: bigint;
+  readonly conflicts: readonly RankedConflictGroup[];
+  readonly conflictTruncated: boolean;
+  readonly conflictCursor: string | null;
+  readonly channels: InternalRetrievalChannelDiagnostics;
+  readonly explanation?: RetrievalExplanation;
+  readonly explanationTruncated: boolean;
+}
+
+type MutableDropCounts = Record<RedactedDropReason, number>;
+
+function emptyDropCounts(): MutableDropCounts {
+  return {
+    scopeDenied: 0,
+    temporalDenied: 0,
+    statusDenied: 0,
+    freshnessDenied: 0,
+    eligibilityDenied: 0,
+    candidateBound: 0,
+    diversity: 0,
+    resultLimit: 0,
+    tokenBudget: 0,
+    conflictSuppressed: 0,
+  };
+}
+
+function denialReason(
+  item: RetrievalItem,
+  request: ValidatedInternalRetrievalRequest,
+): RedactedDropReason | null {
+  if (
+    item.projectId !== request.binding.projectId
+    || !workspaceVisible(item, request.binding, request)
+    || !branchVisible(item, request.binding, request)
+    || !sessionVisible(item, request)
+  ) return "scopeDenied";
+  if (!statusVisible(item)) return "statusDenied";
+  if (!temporalVisible(item, request)) return "temporalDenied";
+  if (!freshnessVisible(item)) return "freshnessDenied";
+  return null;
+}
+
+function channelContributions(
+  eligible: RetrievalCandidateCollection,
+  fused: readonly FusedCandidate[],
+  selectedIds: ReadonlySet<string>,
+): readonly RetrievalChannelContribution[] {
+  const zeroScore: RationalScore = Object.freeze({ numerator: 0n, denominator: 1n });
+  return Object.freeze(eligible.channels.map((channel) => {
+    const ranks = channel.candidates.map((candidate) => candidate.rank);
+    const relevant = fused.filter((candidate) => (
+      candidate.contributions.some((contribution) => contribution.channel === channel.channel)
+    ));
+    return Object.freeze({
+      channel: channel.channel,
+      eligibleCount: channel.candidates.length,
+      selectedCount: relevant.filter((candidate) => selectedIds.has(candidate.id)).length,
+      bestRank: ranks.length === 0 ? null : Math.min(...ranks),
+      worstRank: ranks.length === 0 ? null : Math.max(...ranks),
+      fusionContribution: formatRationalScore(relevant.reduce((total, candidate) => (
+        candidate.contributions
+          .filter((contribution) => contribution.channel === channel.channel)
+          .reduce(
+            (subtotal, contribution) => addRationalScores(subtotal, contribution.score),
+            total,
+          )
+      ), zeroScore)),
+    });
+  }));
+}
+
+function redactedDropCounts(
+  eligible: RetrievalCandidateCollection,
+  defensiveDrops: Readonly<MutableDropCounts>,
+  selection: RankedSelection,
+): RedactedDropCounts {
+  const counts = emptyDropCounts();
+  for (const [reason, count] of Object.entries(defensiveDrops) as Array<[
+    RedactedDropReason,
+    number,
+  ]>) counts[reason] += count;
+  counts.eligibilityDenied += eligible.droppedItemCount;
+  const materialized = new Set(eligible.channels.flatMap((channel) => (
+    channel.candidates.map((candidate) => `${candidate.item.kind}:${candidate.item.id}`)
+  ))).size;
+  counts.candidateBound += Math.max(
+    eligible.truncated ? 1 : 0,
+    eligible.eligibleItemCount - materialized,
+  );
+  counts.diversity += selection.droppedByReason.diversity;
+  counts.resultLimit += selection.droppedByReason.resultLimit;
+  counts.tokenBudget += selection.droppedByReason.tokenBudget;
+  counts.conflictSuppressed += selection.droppedByReason.conflictSuppressed;
+  const byReason = Object.freeze(counts);
+  return Object.freeze({
+    total: Object.values(byReason).reduce((total, count) => total + count, 0),
+    byReason,
+  });
+}
+
+function withExplanation(
+  base: Omit<RankedInternalRetrievalResult, "explanation" | "explanationTruncated">,
+  request: ValidatedInternalRetrievalRequest,
+  manifest: ProjectionManifestV1,
+): RankedInternalRetrievalResult {
+  if (!request.explain) {
+    return Object.freeze({ ...base, explanationTruncated: false });
+  }
+  const conflictCursor = base.conflicts.find((conflict) => conflict.cursor !== null)?.cursor ?? null;
+  const explanation = buildRetrievalExplanation({
+    eligibleCount: base.eligibleCount,
+    redactedDropCounts: base.redactedDropCounts,
+    channelContributions: base.channelContributions,
+    manifest,
+    requiredEventPosition: base.requiredEventPosition,
+    publishedEventPosition: base.publishedEventPosition,
+    rankingPolicyVersion: base.rankingPolicyVersion,
+    rerankFeatureNames: base.rerankFeatureNames,
+    conflicts: Object.freeze({
+      groupCount: base.conflicts.length,
+      totalMemberCount: base.conflicts.reduce(
+        (total, conflict) => total + conflict.totalMemberCount,
+        0,
+      ),
+      truncated: base.conflictTruncated,
+      cursor: conflictCursor,
+    }),
+    truncated: base.truncated,
+  });
+  if (Buffer.byteLength(JSON.stringify(explanation), "utf8") > request.explainByteLimit) {
+    return Object.freeze({ ...base, explanationTruncated: true });
+  }
+  return Object.freeze({ ...base, explanation, explanationTruncated: false });
+}
+
+function vectorDiagnostic(
+  result: VectorChannelResult,
+  request: ValidatedInternalRetrievalRequest,
+): VectorChannelDiagnostic {
+  if (!Array.isArray(result.candidates) || result.candidates.length > request.candidateLimit) {
+    throw new TypeError("VECTOR_CHANNEL_INVALID");
+  }
+  if (!result.used) {
+    if (result.candidates.length !== 0 || result.manifest !== null) {
+      throw new TypeError("VECTOR_CHANNEL_INVALID");
+    }
+    if (result.failureCode === null) {
+      return Object.freeze({
+        used: false,
+        failureCode: null,
+        candidateCount: 0,
+        manifest: null,
+      });
+    }
+    if (result.failureCode === "PROVIDER_UNAVAILABLE") {
+      return Object.freeze({
+        used: false,
+        failureCode: "PROVIDER_UNAVAILABLE",
+        candidateCount: 0,
+        manifest: null,
+      });
+    }
+    throw new TypeError("VECTOR_CHANNEL_INVALID");
+  }
+  if (result.failureCode !== null) throw new TypeError("VECTOR_CHANNEL_INVALID");
+  if (result.manifest === null) throw new TypeError("VECTOR_CHANNEL_INVALID");
+  const seen = new Set<string>();
+  let candidateCount = 0;
+  for (const candidate of result.candidates) {
+    if (
+      typeof candidate.candidateId !== "string"
+      || candidate.candidateId.length === 0
+      || Buffer.byteLength(candidate.candidateId, "utf8") > 4_096
+      || !Number.isSafeInteger(candidate.rank)
+      || candidate.rank < 1
+      || typeof candidate.similarity !== "number"
+      || !Number.isFinite(candidate.similarity)
+      || candidate.similarity < -1
+      || candidate.similarity > 1
+    ) throw new TypeError("VECTOR_CHANNEL_INVALID");
+    const key = `${candidate.item.kind}:${candidate.item.id}`;
+    if (seen.has(key) || denialReason(candidate.item, request) !== null) continue;
+    seen.add(key);
+    candidateCount += 1;
+  }
+  const manifest = parseVectorCacheManifest(result.manifest);
+  return Object.freeze({
+    used: true,
+    failureCode: null,
+    candidateCount,
+    manifest,
+  });
+}
+
+async function searchOptionalVectorChannel(
+  channel: VectorCandidateChannel | undefined,
+  request: ValidatedInternalRetrievalRequest,
+  lease: Parameters<VectorCandidateChannel["search"]>[1],
+  invocationDeadline?: ShadowMigrationInvocationDeadline,
+): Promise<VectorChannelDiagnostic> {
+  const remaining = checkInvocationDeadline(invocationDeadline);
+  if (!request.vector.enabled || channel === undefined) {
+    return vectorDiagnostic(disabledVectorChannel(), request);
+  }
+  const vectorRequest = remaining === undefined ? request : Object.freeze({
+    ...request,
+    consistency: Object.freeze({
+      ...request.consistency,
+      deadlineMs: Math.min(request.consistency.deadlineMs, remaining),
+    }),
+  });
+  let diagnostic: VectorChannelDiagnostic;
+  try {
+    const result = await withVectorDeadline(
+      vectorRequest.consistency.deadlineMs,
+      (signal) => channel.search(vectorRequest, lease, signal),
+    );
+    diagnostic = vectorDiagnostic(result, vectorRequest);
+  } catch (error) {
+    if (error instanceof ShadowMigrationError && error.code === "MIGRATION_RETRY_EXHAUSTED") {
+      throw error;
+    }
+    diagnostic = vectorDiagnostic(unavailableVectorChannel(), request);
+  }
+  checkInvocationDeadline(invocationDeadline);
+  return diagnostic;
+}
+
+function checkInvocationDeadline(deadline: ShadowMigrationInvocationDeadline | undefined): number | undefined {
+  if (deadline === undefined) return undefined;
+  const remaining = deadline.remainingMs();
+  if (deadline.signal.aborted || !Number.isSafeInteger(remaining) || remaining < 1) {
+    throw new ShadowMigrationError("MIGRATION_RETRY_EXHAUSTED");
+  }
+  return remaining;
+}
+
+export class InternalRetrievalService {
+  readonly #projections: ProjectionLeaseProvider;
+  readonly #candidates: RetrievalCandidateRepository;
+  readonly #customRanker: RetrievalRanker | undefined;
+  readonly #vectorChannel: VectorCandidateChannel | undefined;
+
+  constructor(options: InternalRetrievalServiceOptions) {
+    this.#projections = options.projections;
+    this.#candidates = options.candidates;
+    this.#customRanker = options.ranker;
+    this.#vectorChannel = options.vectorChannel;
+  }
+
+  async retrieve(
+    input: InternalRetrievalRequest,
+    invocationDeadline?: ShadowMigrationInvocationDeadline,
+  ): Promise<RankedInternalRetrievalResult> {
+    const validated = validateInternalRetrievalRequest(input);
+    const remaining = checkInvocationDeadline(invocationDeadline);
+    const request = remaining === undefined ? validated : Object.freeze({
+      ...validated,
+      consistency: Object.freeze({
+        ...validated.consistency,
+        deadlineMs: Math.min(validated.consistency.deadlineMs, remaining),
+      }),
+    });
+    const lease = await this.#projections.pin(request.binding, request.consistency);
+    let primaryFailure: Readonly<{ error: unknown }> | undefined;
+    let result: RankedInternalRetrievalResult;
+    try {
+      checkInvocationDeadline(invocationDeadline);
+      let manifest: ProjectionManifestV1;
+      try {
+        manifest = parseProjectionManifest(lease.manifest, request.binding);
+      } catch {
+        throw new InternalRetrievalError("PROJECTION_SCOPE_MISMATCH");
+      }
+      const available = BigInt(manifest.terminalEventPosition);
+      if (available < request.consistency.requiredEventPosition) {
+        throw new ProjectionLagError(request.consistency.requiredEventPosition, available);
+      }
+      checkInvocationDeadline(invocationDeadline);
+      const collected = this.#candidates.collectEligible(lease, request);
+      checkInvocationDeadline(invocationDeadline);
+      const filtered = filterCandidates(collected, request);
+      checkInvocationDeadline(invocationDeadline);
+      const vector = await searchOptionalVectorChannel(this.#vectorChannel, request, lease, invocationDeadline);
+      checkInvocationDeadline(invocationDeadline);
+      const fused = fuseCandidates(rankingChannels(filtered.collection), DEFAULT_RANKING_POLICY);
+      checkInvocationDeadline(invocationDeadline);
+      const ranked = this.#customRanker === undefined
+        ? rerankCandidates(fused, request, DEFAULT_RANKING_POLICY)
+        : validateCustomRanking(this.#customRanker.select(fused, request), fused);
+      checkInvocationDeadline(invocationDeadline);
+      const selection = selectRankedCandidates(ranked, {
+        limit: request.limit,
+        tokenBudget: request.tokenBudget,
+      }, DEFAULT_RANKING_POLICY);
+      checkInvocationDeadline(invocationDeadline);
+      const items = resultItems(selection);
+      const conflicts = selection.conflicts;
+      const candidateCount = fused.length;
+      const rankedTruncated = selection.truncated;
+
+      const selectedIds = new Set(items.map((item) => `${item.kind}:${item.id}`));
+      const dropCounts = redactedDropCounts(
+        collected,
+        filtered.defensiveDrops.byReason,
+        selection,
+      );
+      const truncated = collected.truncated
+        || rankedTruncated
+        || candidateCount > items.length;
+      const conflictTruncated = conflicts.some((conflict) => conflict.truncated);
+      const conflictCursor = conflicts.find((conflict) => conflict.cursor !== null)?.cursor ?? null;
+      const base = Object.freeze({
+        items,
+        generation: manifest.generation,
+        terminalEventPosition: available,
+        candidateCount,
+        truncated,
+        eligibleCount: filtered.collection.eligibleItemCount,
+        rankingPolicyVersion: DEFAULT_RANKING_POLICY.version,
+        rerankFeatureNames: RERANK_FEATURE_NAMES,
+        redactedDropCounts: dropCounts,
+        channelContributions: channelContributions(filtered.collection, fused, selectedIds),
+        requiredEventPosition: request.consistency.requiredEventPosition,
+        publishedEventPosition: available,
+        conflicts,
+        conflictTruncated,
+        conflictCursor,
+        channels: Object.freeze({ vector }),
+      });
+      result = withExplanation(base, request, manifest);
+      checkInvocationDeadline(invocationDeadline);
+    } catch (error) {
+      primaryFailure = { error };
+      throw error;
+    } finally {
+      try {
+        lease.close();
+      } catch (error) {
+        if (primaryFailure === undefined) throw error;
+      }
+    }
+    checkInvocationDeadline(invocationDeadline);
+    return result;
+  }
+}
