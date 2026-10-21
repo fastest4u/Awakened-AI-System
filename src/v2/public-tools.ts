@@ -1,5 +1,5 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
@@ -1342,7 +1342,7 @@ export class V2PublicToolRouter {
     const row = this.#connection
       .prepare(
         `SELECT session_id FROM session_authority
-         WHERE project_id = $projectId AND session_kind = 'root' AND terminal_at IS NULL
+         WHERE project_id = $projectId AND session_kind = 'root' AND terminal_at IS NULL AND semantic_state = 'active'
          ORDER BY authority_event_position DESC LIMIT 1`,
       )
       .get({ $projectId: this.#identity.projectId }) as { session_id?: string } | undefined;
@@ -1654,26 +1654,7 @@ export class V2PublicToolRouter {
       deploymentDirectory,
       compositionEpoch: `v2-mcp-${state.generation.toString()}`,
     });
-    if (state.mode === "read-only-recovery") {
-      const tailRow = this.#connection
-        .prepare(
-          `SELECT global_position, event_hash FROM events
-           WHERE project_id = $projectId
-           ORDER BY global_position DESC LIMIT 1`,
-        )
-        .get({ $projectId: this.#identity.projectId }) as
-        | { global_position?: bigint; event_hash?: string }
-        | undefined;
-      const tailPosition = tailRow?.global_position ?? 0n;
-      const tailHash = tailRow?.event_hash ?? GENESIS_GLOBAL_HASH;
-      if (
-        state.recoveryPosition === null
-        || state.recoveryHash === null
-        || state.recoveryPosition !== tailPosition
-        || state.recoveryHash !== tailHash
-      ) {
-        throw new FreshStartError("FRESH_START_RECOVERY_REQUIRED");
-      }
+    const runInProcessVerifiedRead = async (): Promise<T> => {
       const bytes = readFileSync(
         join(this.#route.storeRoot, "projections", manifest.databaseFile),
       );
@@ -1775,12 +1756,69 @@ export class V2PublicToolRouter {
       } finally {
         image.close();
       }
+    };
+
+    if (state.mode === "read-only-recovery") {
+      const tailRow = this.#connection
+        .prepare(
+          `SELECT global_position, event_hash FROM events
+           WHERE project_id = $projectId
+           ORDER BY global_position DESC LIMIT 1`,
+        )
+        .get({ $projectId: this.#identity.projectId }) as
+        | { global_position?: bigint; event_hash?: string }
+        | undefined;
+      const tailPosition = tailRow?.global_position ?? 0n;
+      const tailHash = tailRow?.event_hash ?? GENESIS_GLOBAL_HASH;
+      if (
+        state.recoveryPosition === null
+        || state.recoveryHash === null
+        || state.recoveryPosition !== tailPosition
+        || state.recoveryHash !== tailHash
+      ) {
+        throw new FreshStartError("FRESH_START_RECOVERY_REQUIRED");
+      }
+      return await runInProcessVerifiedRead();
     }
-    const adapter = createVerifiedReadAdapter(binding);
+
+    const ownerFile = join(
+      this.#route.storeRoot,
+      "verified-read-executor",
+      "verified-read-owner.json",
+    );
     try {
-      return await fn(adapter);
-    } finally {
-      await adapter.close();
+      if (existsSync(ownerFile)) {
+        const parsedOwner = JSON.parse(readFileSync(ownerFile, "utf8")) as { state?: string };
+        if (parsedOwner?.state === "incomplete") {
+          rmSync(ownerFile, { force: true });
+        }
+      }
+    } catch {
+      // Ignore stale owner check races.
+    }
+
+    try {
+      const adapter = createVerifiedReadAdapter(binding);
+      try {
+        return await fn(adapter);
+      } finally {
+        await adapter.close();
+      }
+    } catch (err) {
+      if (err instanceof FreshStartError) {
+        throw err;
+      }
+      try {
+        if (existsSync(ownerFile)) {
+          const parsedOwner = JSON.parse(readFileSync(ownerFile, "utf8")) as { state?: string };
+          if (parsedOwner?.state === "incomplete") {
+            rmSync(ownerFile, { force: true });
+          }
+        }
+      } catch {
+        // Ignore cleanup races.
+      }
+      return await runInProcessVerifiedRead();
     }
   }
 
@@ -1803,7 +1841,7 @@ export class V2PublicToolRouter {
         sessionId: started.sessionId,
         conversationId: started.conversationId,
         status: "active",
-        mode: state.mode,
+        mode: state.mode, latestCheckpoint: this.#readLatestProjectCheckpoint(), sessions: await this.#listProjectSessionsWithActivity(),
       };
     }
 
@@ -1846,7 +1884,7 @@ export class V2PublicToolRouter {
       sessionId: started.sessionId,
       conversationId: started.conversationId,
       status: "active",
-      mode: state.mode,
+      mode: state.mode, latestCheckpoint: this.#readLatestProjectCheckpoint(), sessions: await this.#listProjectSessionsWithActivity(),
       awaken,
       contextPack: awaken.contextPack,
       selfCheck,
@@ -1871,8 +1909,72 @@ export class V2PublicToolRouter {
       state: row?.semanticState ?? "active",
       ownerGeneration: row?.ownerGeneration?.toString() ?? "1",
       latestCheckpointId: row?.latestCheckpointId ?? null,
-      mode: state.mode,
+      mode: state.mode, latestCheckpoint: this.#readLatestProjectCheckpoint(), sessions: await this.#listProjectSessionsWithActivity(),
     };
+  }
+
+  async #listProjectSessionsWithActivity(): Promise<Array<Record<string, unknown>>> {
+    const rows = this.#connection
+      .prepare(
+        `SELECT session_id, session_kind, parent_session_id, semantic_state,
+                root_handle_issued_at, child_handle_issued_at, latest_checkpoint_id
+         FROM session_authority
+         WHERE project_id = $projectId
+         ORDER BY authority_event_position DESC LIMIT 30`,
+      )
+      .all({ $projectId: this.#identity.projectId }) as Array<{
+      session_id: string;
+      session_kind: string;
+      parent_session_id: string | null;
+      semantic_state: string;
+      root_handle_issued_at: string | null;
+      child_handle_issued_at: string | null;
+      latest_checkpoint_id: string | null;
+    }>;
+
+    const allNotes = await this.#listProjectNotesFromProjection();
+    const notesBySession = new Map<string, typeof allNotes>();
+    for (const n of allNotes) {
+      if (!n.sessionId) continue;
+      const list = notesBySession.get(n.sessionId) ?? [];
+      list.push(n);
+      notesBySession.set(n.sessionId, list);
+    }
+    const latestCp = this.#readLatestProjectCheckpoint();
+
+    return rows.map((r) => {
+      const sNotes = notesBySession.get(r.session_id) ?? [];
+      const sLog = sNotes.find((n) => n.recordKind === "session-log");
+      const firstNote = sNotes[0];
+      const isCpMatch = latestCp?.sessionId === r.session_id;
+      const currentTask =
+        isCpMatch && latestCp?.taskSummary
+          ? latestCp.taskSummary
+          : sLog
+            ? sLog.summary || sLog.title
+            : firstNote
+              ? `จัดการความจำ: ${firstNote.title}`
+              : r.semantic_state === "active"
+                ? "AI กำลังทำงานและซิงก์บริบทในเซสชันนี้ (Active AI Session)"
+                : "เซสชันดำเนินการเสร็จสิ้น";
+      return {
+        sessionId: r.session_id,
+        kind: r.session_kind,
+        parentSessionId: r.parent_session_id,
+        semanticState: r.semantic_state,
+        leaseState: r.semantic_state === "active" ? "active-lease" : "released",
+        issuedAt: r.root_handle_issued_at ?? r.child_handle_issued_at ?? null,
+        latestCheckpointId: r.latest_checkpoint_id,
+        currentTask,
+        inProgressItems: isCpMatch ? latestCp?.inProgressItems ?? [] : [],
+        nextActions: isCpMatch ? latestCp?.nextActions ?? [] : [],
+        blockers: isCpMatch ? latestCp?.blockers ?? [] : [],
+        noteCount: sNotes.length,
+        noteIds: sNotes.map((n) => n.recordId),
+        noteTitles: sNotes.map((n) => n.title),
+        filesTouched: [...new Set(sNotes.flatMap((n) => n.filePaths))],
+      };
+    });
   }
 
   #extractFilePathsAndSymbols(text: string): {
@@ -1975,8 +2077,8 @@ export class V2PublicToolRouter {
       readonly lowerSearchText: string;
     }>
   > {
-    return this.#withProjectedImage((db) => {
-      const rows = db
+    const projectedRows = await this.#withProjectedImage((db) => {
+      return db
         .prepare(
           `SELECT c.item_id, c.session_id, c.normalized_key, c.status, c.confidence,
                   c.verification_method, c.valid_from, c.valid_to, c.summary,
@@ -2002,33 +2104,173 @@ export class V2PublicToolRouter {
         record_kind: string | null;
         body: string | null;
       }>;
-      return rows.map((r) => {
-        const recordKind = r.record_kind ?? "insight";
-        const colonIdx = r.summary.indexOf(": ");
-        const title = colonIdx > 0 ? r.summary.slice(0, colonIdx) : r.summary;
-        const body = r.body ?? "";
-        const extracted = this.#extractFilePathsAndSymbols(`${r.summary}\n${body}`);
-        const lowerSearchText = `${title} ${r.summary} ${r.normalized_key} ${body}`.toLowerCase();
-        return Object.freeze({
-          id: r.item_id,
-          recordId: r.item_id,
-          kind: recordKind,
-          recordKind,
-          normalizedKey: r.normalized_key,
-          title,
-          summary: r.summary,
-          body,
-          status: r.status,
-          verificationMethod: r.verification_method,
-          confidence: r.confidence,
-          validFrom: r.valid_from,
-          validTo: r.valid_to,
-          sourceEventPosition: Number(r.source_event_position),
-          sessionId: r.session_id,
-          filePaths: extracted.filePaths,
-          symbols: extracted.symbols,
-          lowerSearchText,
-        });
+    });
+
+    const mergedById = new Map<
+      string,
+      {
+        item_id: string;
+        session_id: string | null;
+        normalized_key: string;
+        status: string;
+        confidence: string;
+        verification_method: string;
+        valid_from: string;
+        valid_to: string | null;
+        summary: string;
+        source_event_position: number;
+        record_kind: string | null;
+        body: string | null;
+      }
+    >();
+
+    for (const r of projectedRows) {
+      mergedById.set(r.item_id, {
+        ...r,
+        source_event_position: Number(r.source_event_position),
+      });
+    }
+
+    try {
+      const eventRows = this.#connection
+        .prepare(
+          `SELECT global_position, event_type, event_schema_version, session_id, payload_json
+           FROM events
+           WHERE project_id = $projectId
+             AND (event_type = 'MemorySourceRecorded' OR stream_type = 'governed-lifecycle')
+           ORDER BY global_position ASC`,
+        )
+        .all({ $projectId: this.#identity.projectId }) as Array<{
+        global_position: number | bigint;
+        event_type: string;
+        event_schema_version: number | bigint;
+        session_id: string | null;
+        payload_json: string;
+      }>;
+
+      for (const row of eventRows) {
+        const eventType = String(row.event_type);
+        const schemaVersion = Number(row.event_schema_version);
+        const payload = JSON.parse(String(row.payload_json)) as Record<string, unknown>;
+        if (eventType === "MemorySourceRecorded") {
+          const item = (schemaVersion >= 3 ? payload.item : payload) as Record<string, unknown> | undefined;
+          if (!item || typeof item.itemId !== "string") continue;
+          const itemId = item.itemId;
+          const normalizedKey = String(item.normalizedKey ?? `governed-note/insight/${itemId}`);
+          const recordKind =
+            typeof item.recordKind === "string"
+              ? item.recordKind
+              : normalizedKey.startsWith("governed-note/")
+                ? (normalizedKey.split("/")[1] ?? "insight")
+                : "insight";
+          const contentObj = item.content as { body?: unknown } | undefined;
+          const body = typeof contentObj?.body === "string" ? contentObj.body : "";
+          const bindingObj = payload.binding as { sessionId?: unknown } | undefined;
+          const sessionId =
+            typeof row.session_id === "string"
+              ? row.session_id
+              : typeof bindingObj?.sessionId === "string"
+                ? bindingObj.sessionId
+                : null;
+          const existing = mergedById.get(itemId);
+          if (!existing) {
+            mergedById.set(itemId, {
+              item_id: itemId,
+              session_id: sessionId,
+              normalized_key: normalizedKey,
+              status: typeof item.status === "string" ? item.status : "candidate",
+              confidence: typeof item.confidence === "string" ? item.confidence : "high",
+              verification_method:
+                typeof item.verificationMethod === "string"
+                  ? item.verificationMethod
+                  : "governed-note-unverified-v2",
+              valid_from: typeof item.validFrom === "string" ? item.validFrom : "",
+              valid_to: typeof item.validTo === "string" ? item.validTo : null,
+              summary: typeof item.summary === "string" ? item.summary : "",
+              source_event_position: Number(row.global_position),
+              record_kind: recordKind,
+              body,
+            });
+          } else if (!existing.body && body) {
+            existing.body = body;
+          }
+        } else {
+          const erasedIds = Array.isArray(payload.erasedRecordIds)
+            ? payload.erasedRecordIds.map(String)
+            : [];
+          if (eventType === "EvidenceErased") {
+            for (const targetId of [String(payload.recordId ?? ""), ...erasedIds]) {
+              if (targetId) mergedById.delete(targetId);
+            }
+          } else if (typeof payload.recordId === "string") {
+            const target = mergedById.get(payload.recordId);
+            if (target) {
+              const nextStatus =
+                typeof payload.targetStatus === "string" ? payload.targetStatus : target.status;
+              if (
+                nextStatus === "retracted"
+                || nextStatus === "superseded"
+                || nextStatus === "expired"
+                || nextStatus === "erased-evidence"
+              ) {
+                mergedById.delete(payload.recordId);
+              } else {
+                target.status = nextStatus;
+                if (typeof payload.verificationMethod === "string") {
+                  target.verification_method = payload.verificationMethod;
+                }
+                if (typeof payload.validFrom === "string") {
+                  target.valid_from = payload.validFrom;
+                }
+                if (payload.validTo === null || typeof payload.validTo === "string") {
+                  target.valid_to = payload.validTo;
+                }
+              }
+            }
+          }
+        }
+      }
+    } catch {
+      // Fall back to projected rows if direct event fold fails.
+    }
+
+    const combinedRows = [...mergedById.values()]
+      .filter(
+        (r) =>
+          !["retracted", "superseded", "expired", "erased-evidence"].includes(r.status),
+      )
+      .sort(
+        (a, b) =>
+          b.source_event_position - a.source_event_position
+          || a.item_id.localeCompare(b.item_id),
+      );
+
+    return combinedRows.map((r) => {
+      const recordKind = r.record_kind ?? "insight";
+      const colonIdx = r.summary.indexOf(": ");
+      const title = colonIdx > 0 ? r.summary.slice(0, colonIdx) : r.summary;
+      const body = r.body ?? "";
+      const extracted = this.#extractFilePathsAndSymbols(`${r.summary}\n${body}`);
+      const lowerSearchText = `${title} ${r.summary} ${r.normalized_key} ${body}`.toLowerCase();
+      return Object.freeze({
+        id: r.item_id,
+        recordId: r.item_id,
+        kind: recordKind,
+        recordKind,
+        normalizedKey: r.normalized_key,
+        title,
+        summary: r.summary,
+        body,
+        status: r.status,
+        verificationMethod: r.verification_method,
+        confidence: r.confidence,
+        validFrom: r.valid_from,
+        validTo: r.valid_to,
+        sourceEventPosition: Number(r.source_event_position),
+        sessionId: r.session_id,
+        filePaths: extracted.filePaths,
+        symbols: extracted.symbols,
+        lowerSearchText,
       });
     });
   }
@@ -2411,7 +2653,7 @@ export class V2PublicToolRouter {
       fileSpecificWarnings,
       openConflicts,
       preFlightChecklist,
-      mode: state.mode,
+      mode: state.mode, latestCheckpoint: this.#readLatestProjectCheckpoint(), sessions: await this.#listProjectSessionsWithActivity(),
     };
   }
 
@@ -2572,7 +2814,7 @@ export class V2PublicToolRouter {
 
     await this.#publishProjectionV3();
     if (recordKind === "adr" || recordKind === "mistake") {
-      await this.#syncIdeMemoryRulesFile();
+      await this.#publishProjectionV3(); await this.#syncIdeMemoryRulesFile();
     }
     return {
       ok: true,
@@ -2620,7 +2862,7 @@ export class V2PublicToolRouter {
     const id = String(args.id ?? args.recordId ?? args.noteId ?? "").trim();
     if (!id) throw new FreshStartError("FRESH_START_INPUT_INVALID");
     const sessionId = this.#resolveNoteSessionId(id, args.sessionId);
-    return this.#withVerifiedReadAdapter(state, release, sessionId, async (adapter) => {
+    const verified = await this.#withVerifiedReadAdapter(state, release, sessionId, async (adapter) => {
       const res = await adapter.queryFullNote({
         operation: "get-full-note",
         consistency: sessionId ? "session-strong" : "project-strong",
@@ -2643,6 +2885,39 @@ export class V2PublicToolRouter {
         conflict: res.content.conflict,
       };
     });
+    if (verified.ok === false) {
+      const allNotes = await this.#listProjectNotesFromProjection();
+      const fallback = allNotes.find((n) => n.id === id || n.recordId === id);
+      if (fallback) {
+        return {
+          ok: true,
+          id: fallback.id,
+          recordId: fallback.recordId,
+          kind: fallback.recordKind,
+          recordKind: fallback.recordKind,
+          normalizedKey: fallback.normalizedKey,
+          title: fallback.title,
+          summary: fallback.summary,
+          text: fallback.summary,
+          body: fallback.body,
+          content: {
+            format: "markdown",
+            body: fallback.body,
+          },
+          status: fallback.status,
+          confidence: fallback.confidence,
+          verificationMethod: fallback.verificationMethod,
+          validFrom: fallback.validFrom,
+          validTo: fallback.validTo,
+          sessionId: fallback.sessionId,
+          sourceEventPosition: String(fallback.sourceEventPosition),
+          filePaths: fallback.filePaths,
+          symbols: fallback.symbols,
+          conflict: null,
+        };
+      }
+    }
+    return verified;
   }
 
   async #handleSearch(
@@ -2659,7 +2934,7 @@ export class V2PublicToolRouter {
         consistency: sessionId ? "session-strong" : "project-strong",
         minimumEventPosition: "0",
         budgetMs: 5000,
-        parameters: { query, limit },
+        parameters: { query, limit: Math.max(1, Math.min(10, Math.trunc(limit))) },
       });
       return {
         ok: true,
@@ -2702,7 +2977,7 @@ export class V2PublicToolRouter {
           confidence: note.confidence,
           validFrom: note.validFrom,
           validTo: note.validTo,
-          sourceEventPosition: note.sourceEventPosition.toString(),
+          sessionId: note.sessionId, sourceEventPosition: note.sourceEventPosition.toString(),
           filePaths: note.filePaths,
           symbols: note.symbols,
           hybridScore: score,
@@ -2729,11 +3004,11 @@ export class V2PublicToolRouter {
         consistency: sessionId ? "session-strong" : "project-strong",
         minimumEventPosition: "0",
         budgetMs: 5000,
-        parameters: { limit },
+        parameters: { limit: Math.max(1, Math.min(10, Math.trunc(limit))) },
       });
       const content = res.content as NativeCanonicalPageResult;
       const items = content.items.map((entry) => ({
-        ...entry.item,
+        ...entry.item, recordId: entry.item.id, summary: entry.item.text,
         conflict: entry.conflict,
       }));
       return {
@@ -2744,10 +3019,28 @@ export class V2PublicToolRouter {
       };
     });
 
-    const items = [...(verifiedResult.items as Array<Record<string, unknown>>)];
+    const allProjectNotes = await this.#listProjectNotesFromProjection();
+    const noteMap = new Map(allProjectNotes.map((n) => [n.id, n]));
+    const items = (verifiedResult.items as Array<Record<string, unknown>>).map((i) => {
+      const enriched = noteMap.get(String(i.id ?? i.recordId ?? ""));
+      return enriched
+        ? {
+            ...i,
+            id: enriched.id,
+            recordId: enriched.recordId,
+            kind: enriched.recordKind,
+            recordKind: enriched.recordKind,
+            title: enriched.title,
+            summary: enriched.summary,
+            body: enriched.body,
+            sessionId: enriched.sessionId,
+            filePaths: enriched.filePaths,
+            symbols: enriched.symbols,
+          }
+        : i;
+    });
     const seenIds = new Set<string>(items.map((i) => String(i.id ?? "")));
     if (items.length < limit) {
-      const allProjectNotes = await this.#listProjectNotesFromProjection();
       for (const note of allProjectNotes) {
         if (items.length >= limit) break;
         if (seenIds.has(note.id)) continue;
@@ -2760,11 +3053,15 @@ export class V2PublicToolRouter {
           normalizedKey: note.normalizedKey,
           title: note.title,
           summary: note.summary,
+          body: note.body,
           status: note.status,
           confidence: note.confidence,
           validFrom: note.validFrom,
           validTo: note.validTo,
+          sessionId: note.sessionId,
           sourceEventPosition: note.sourceEventPosition.toString(),
+          filePaths: note.filePaths,
+          symbols: note.symbols,
         });
       }
     }
@@ -2788,11 +3085,11 @@ export class V2PublicToolRouter {
         consistency: sessionId ? "session-strong" : "project-strong",
         minimumEventPosition: "0",
         budgetMs: 5000,
-        parameters: { limit },
+        parameters: { limit: Math.max(1, Math.min(10, Math.trunc(limit))) },
       });
       const content = res.content as NativeCanonicalPageResult;
       const items = content.items.map((entry) => ({
-        ...entry.item,
+        ...entry.item, recordId: entry.item.id, summary: entry.item.text,
         conflict: entry.conflict,
       }));
       return {
@@ -2803,10 +3100,28 @@ export class V2PublicToolRouter {
       };
     });
 
-    const items = [...(verifiedResult.items as Array<Record<string, unknown>>)];
+    const allProjectNotes = await this.#listProjectNotesFromProjection();
+    const noteMap = new Map(allProjectNotes.map((n) => [n.id, n]));
+    const items = (verifiedResult.items as Array<Record<string, unknown>>).map((i) => {
+      const enriched = noteMap.get(String(i.id ?? i.recordId ?? ""));
+      return enriched
+        ? {
+            ...i,
+            id: enriched.id,
+            recordId: enriched.recordId,
+            kind: enriched.recordKind,
+            recordKind: enriched.recordKind,
+            title: enriched.title,
+            summary: enriched.summary,
+            body: enriched.body,
+            sessionId: enriched.sessionId,
+            filePaths: enriched.filePaths,
+            symbols: enriched.symbols,
+          }
+        : i;
+    });
     const seenIds = new Set<string>(items.map((i) => String(i.id ?? "")));
     if (items.length < limit) {
-      const allProjectNotes = await this.#listProjectNotesFromProjection();
       for (const note of allProjectNotes) {
         if (items.length >= limit) break;
         if (seenIds.has(note.id)) continue;
@@ -2819,11 +3134,15 @@ export class V2PublicToolRouter {
           normalizedKey: note.normalizedKey,
           title: note.title,
           summary: note.summary,
+          body: note.body,
           status: note.status,
           confidence: note.confidence,
           validFrom: note.validFrom,
           validTo: note.validTo,
+          sessionId: note.sessionId,
           sourceEventPosition: note.sourceEventPosition.toString(),
+          filePaths: note.filePaths,
+          symbols: note.symbols,
         });
       }
     }
@@ -2924,7 +3243,7 @@ export class V2PublicToolRouter {
         consistency: sessionId ? "session-strong" : "project-strong",
         minimumEventPosition: "0",
         budgetMs: 5000,
-        parameters: { limit },
+        parameters: { limit: Math.max(1, Math.min(10, Math.trunc(limit))) },
       });
       return {
         ok: true,
@@ -3067,7 +3386,7 @@ export class V2PublicToolRouter {
     return {
       ok: true,
       sessionId,
-      mode: state.mode,
+      mode: state.mode, latestCheckpoint: this.#readLatestProjectCheckpoint(), sessions: await this.#listProjectSessionsWithActivity(),
       contextPack,
       continuity: {
         latestCheckpoint,
@@ -3311,7 +3630,7 @@ export class V2PublicToolRouter {
       reason: typeof args.reason === "string" ? args.reason : undefined,
       conflictKey: typeof args.conflictKey === "string" ? args.conflictKey : null,
     });
-    await this.#syncIdeMemoryRulesFile();
+    await this.#publishProjectionV3(); await this.#syncIdeMemoryRulesFile();
     return {
       ok: true,
       ...serializeMutationReceipt(receipt),
@@ -3340,7 +3659,7 @@ export class V2PublicToolRouter {
       declareConflict: args.declareConflict === true,
       conflictKey: typeof args.conflictKey === "string" ? args.conflictKey : null,
     });
-    await this.#syncIdeMemoryRulesFile();
+    await this.#publishProjectionV3(); await this.#syncIdeMemoryRulesFile();
     return {
       ok: true,
       ...serializeMutationReceipt(receipt),
@@ -3357,7 +3676,7 @@ export class V2PublicToolRouter {
       recordId,
       reason,
     });
-    await this.#syncIdeMemoryRulesFile();
+    await this.#publishProjectionV3(); await this.#syncIdeMemoryRulesFile();
     return {
       ok: true,
       ...serializeMutationReceipt(receipt),

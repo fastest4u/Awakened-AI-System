@@ -74,6 +74,7 @@ import {
   type FreshStartStatus,
 } from "./composition.js";
 import { isProductionReleaseManifest, loadV2LaunchConfig } from "./config.js";
+import { startV2WebUiServer } from "./webui.js";
 
 const FOUNDATION_COMMANDS = ["initialize-fresh", "resume-initialization", "status"] as const;
 const TRANSITION_COMMANDS = ["activate", "enter-recovery", "exit-recovery", "disable"] as const;
@@ -90,6 +91,7 @@ const ALL_COMMANDS = new Set<string>([
   "generate-client-configs",
   "bootstrap-project",
   "sync-build",
+  "webui",
 ]);
 
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
@@ -1134,6 +1136,29 @@ export async function runV2Admin(argv: readonly string[]): Promise<unknown> {
   }
 
   // 10. bootstrap-project & sync-build (multi-project onboarding and engine upgrade sync)
+  if (command === "webui") {
+    assertAllowedFlags(
+      values,
+      [],
+      ["--project-root", "--port", "--host"],
+      ["--port", "--host"],
+    );
+    const defaultProjectRoot = values["--project-root"] ?? process.cwd();
+    const port = values["--port"] ? Number(values["--port"]) : 4321;
+    const host = values["--host"] ?? "127.0.0.1";
+    const entryUrl = pathToFileURL(resolveCompiledV2EntryPath()).href;
+    const handle = await startV2WebUiServer({
+      defaultProjectRoot,
+      port,
+      host,
+      entryUrl,
+    });
+    process.stderr.write(`Project Memory V2 WebUI listening at ${handle.url}\n`);
+    await new Promise<void>(() => {
+      // Keep server process alive until terminated
+    });
+    return { ok: true, url: handle.url };
+  }
   if (command === "bootstrap-project" || command === "sync-build") {
     assertAllowedFlags(
       values,
