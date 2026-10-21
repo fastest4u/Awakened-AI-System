@@ -35,6 +35,7 @@
     "test:v2-shadow-migration": "npm run test:build && node --test --test-concurrency=1 --test-reporter=spec dist-test/tests/sqlite-driver.test.js dist-test/tests/v2-shadow-migration-contracts.test.js dist-test/tests/v2-shadow-migration-runtime.test.js dist-test/tests/v1-source-copy.test.js dist-test/tests/v2-migration-package.test.js dist-test/tests/v2-shadow-migration-repository.test.js dist-test/tests/v2-shadow-importer.test.js dist-test/tests/v2-imported-event-reader.test.js dist-test/tests/v2-shadow-projection.test.js dist-test/tests/v2-parity-lifecycle-fixture.test.js dist-test/tests/recording-git-command-runner.test.js dist-test/tests/v2-snapshot-parity.test.js dist-test/tests/retrieval-evaluation.test.js dist-test/tests/retrieval-service.test.js dist-test/tests/stable-compatibility-directory.test.js dist-test/tests/v2-shadow-compatibility.test.js dist-test/tests/v2-shadow-migration-runner.test.js dist-test/tests/v2-shadow-migration-rehearsal.test.js dist-test/tests/ci-lifecycle-gates.test.js",
     "rehearse:v2-shadow-migration": "npm run build && node scripts/run-v2-shadow-migration-rehearsal.js",
     "test:v2-fresh-start-foundation": "node scripts/run-v2-fresh-start-foundation.js",
+    "verify:v2-fresh-start-release": "node scripts/run-v2-fresh-start-release.js",
     "test:v2-internal-verified-read": "node scripts/run-v2-internal-verified-read.js",
     "test:v2-native-content": "node scripts/run-v2-native-content.js",
     "test:v2-native-read-workflows": "node scripts/run-v2-native-read-workflows.js",

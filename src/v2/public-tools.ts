@@ -22,7 +22,10 @@ import {
   governedNoteCreateProofTargetV2,
 } from "../orchestrator/governed-notes/authority.js";
 import { decodeGovernedNoteCommandV2 } from "../orchestrator/governed-notes/codec.js";
-import type { GovernedNoteKind } from "../orchestrator/governed-notes/contracts.js";
+import type {
+  GovernedNoteKind,
+  GovernedNoteStoredReceiptV2,
+} from "../orchestrator/governed-notes/contracts.js";
 import { validateGovernedNotePairAny } from "../orchestrator/governed-notes/pair-validation.js";
 import { GovernedNoteRepository } from "../orchestrator/governed-notes/repository.js";
 import { GovernedNoteRuntimeFactory } from "../orchestrator/governed-notes/runtime.factory.js";
@@ -810,6 +813,41 @@ export class V2PublicToolRouter {
     return row?.session_id ?? null;
   }
 
+  #resolveReadSessionId(explicitSessionId?: unknown): string | null {
+    if (typeof explicitSessionId === "string" && explicitSessionId.trim().length > 0) {
+      return explicitSessionId.trim();
+    }
+    const activeSessionId = this.#resolveActiveRootSessionId();
+    const latestNoteSession = this.#connection
+      .prepare(
+        `SELECT session_id FROM events
+         WHERE project_id = $projectId
+           AND event_type IN ('GovernedNoteCreated', 'MemorySourceRecorded')
+           AND session_id IS NOT NULL
+         ORDER BY global_position DESC LIMIT 1`,
+      )
+      .get({ $projectId: this.#identity.projectId }) as { session_id?: string } | undefined;
+    if (activeSessionId !== null) {
+      const activeHasNote = this.#connection
+        .prepare(
+          `SELECT 1 FROM events
+           WHERE project_id = $projectId
+             AND session_id = $sessionId
+             AND event_type IN ('GovernedNoteCreated', 'MemorySourceRecorded')
+           LIMIT 1`,
+        )
+        .get({
+          $projectId: this.#identity.projectId,
+          $sessionId: activeSessionId,
+        });
+      if (activeHasNote || !latestNoteSession?.session_id) {
+        return activeSessionId;
+      }
+      return latestNoteSession.session_id;
+    }
+    return latestNoteSession?.session_id ?? null;
+  }
+
   async #ensureActiveRootSession(explicitSessionId?: unknown): Promise<string> {
     const existing = this.#resolveActiveRootSessionId(explicitSessionId);
     if (existing !== null) return existing;
@@ -1295,6 +1333,43 @@ export class V2PublicToolRouter {
         ? args.confidence
         : ("high" as const);
 
+    const rawIdempotencyKey =
+      typeof args.idempotencyKey === "string" && args.idempotencyKey.trim().length > 0
+        ? args.idempotencyKey.trim()
+        : null;
+    const rawCommandId =
+      typeof args.commandId === "string" && args.commandId.trim().length > 0
+        ? args.commandId.trim()
+        : null;
+    const toCanonicalUuidV4 = (namespace: string, text: string): string => {
+      if (/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(text)) {
+        return text.toLowerCase();
+      }
+      const bytes = Buffer.from(
+        createHash("sha256").update(`${namespace}:${text}`, "utf8").digest().subarray(0, 16),
+      );
+      bytes[6] = (bytes[6]! & 0x0f) | 0x40;
+      bytes[8] = (bytes[8]! & 0x3f) | 0x80;
+      const hex = bytes.toString("hex");
+      return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
+    };
+    const idempotencyKey = rawIdempotencyKey
+      ? toCanonicalUuidV4("v2-governed-note-idempotency", rawIdempotencyKey)
+      : randomUUID();
+    const commandId = rawCommandId
+      ? toCanonicalUuidV4("v2-governed-note-command", rawCommandId)
+      : rawIdempotencyKey
+        ? toCanonicalUuidV4("v2-governed-note-command", rawIdempotencyKey)
+        : randomUUID();
+
+    const prior =
+      rawIdempotencyKey !== null || rawCommandId !== null
+        ? new GovernedNoteRepository(this.#connection).findGovernedNotePriorAny(
+            commandId,
+            idempotencyKey,
+          )
+        : null;
+
     const explicitProvenance =
       Array.isArray(args.provenance) && args.provenance.length > 0
         ? args.provenance
@@ -1314,6 +1389,12 @@ export class V2PublicToolRouter {
           break;
         }
       }
+    } else if (prior !== null) {
+      provenance = prior.witness.provenance.map((p) => ({
+        kind: p.kind,
+        identity: p.identity,
+      }));
+      evidenceId = prior.witness.provenance[0]?.identity ?? null;
     } else {
       const retained = this.#retainEvidenceForSession(
         sessionId,
@@ -1326,8 +1407,8 @@ export class V2PublicToolRouter {
     const command = decodeGovernedNoteCommandV2({
       version: 2,
       operation: "create-governed-note",
-      commandId: randomUUID(),
-      idempotencyKey: randomUUID(),
+      commandId,
+      idempotencyKey,
       recordKind,
       summary: rawSummary,
       confidence,
@@ -1345,33 +1426,50 @@ export class V2PublicToolRouter {
     const proof = this.#mintProof(sessionId, this.#rootContext, (scope) =>
       governedNoteCreateProofTargetV2(command, scope, noteBinding, randomUUID()),
     );
-    const created = this.#governedNoteRuntime.createV2(
-      {
-        command,
-        authorization: {
-          kind: "protected",
-          authoritySessionId: sessionId as SessionId,
-          targetSessionId: sessionId as SessionId,
-          proof,
-          approval: null,
-          childBindingGrant: null,
+    let responseReceipt: GovernedNoteStoredReceiptV2;
+    try {
+      const created = this.#governedNoteRuntime.createV2(
+        {
+          command,
+          authorization: {
+            kind: "protected",
+            authoritySessionId: sessionId as SessionId,
+            targetSessionId: sessionId as SessionId,
+            proof,
+            approval: null,
+            childBindingGrant: null,
+          },
         },
-      },
-      this.#rootContext,
-    );
+        this.#rootContext,
+      );
+      responseReceipt = created.response;
+    } catch (err) {
+      if (
+        prior !== null
+        && prior.witness.witnessVersion === 2
+        && prior.witness.binding.sessionId === sessionId
+        && err instanceof Error
+        && "code" in err
+        && (err as { code?: unknown }).code === "SESSION_OWNERSHIP_MISMATCH"
+      ) {
+        responseReceipt = prior.result.response as GovernedNoteStoredReceiptV2;
+      } else {
+        throw err;
+      }
+    }
 
     await this.#publishProjectionV3();
     return {
       ok: true,
-      recordId: created.response.recordId,
-      recordKind: created.response.recordKind,
-      status: created.response.status,
-      verificationStatus: created.response.verificationStatus,
-      eventId: created.response.sourceEventIds[0],
-      sourceEventIds: created.response.sourceEventIds,
+      recordId: responseReceipt.recordId,
+      recordKind: responseReceipt.recordKind,
+      status: responseReceipt.status,
+      verificationStatus: responseReceipt.verificationStatus,
+      eventId: responseReceipt.sourceEventIds[0],
+      sourceEventIds: responseReceipt.sourceEventIds,
       evidenceId,
-      bodyContentHash: created.response.content.contentHash,
-      terminalPosition: created.response.terminalPosition,
+      bodyContentHash: responseReceipt.content.contentHash,
+      terminalPosition: responseReceipt.terminalPosition,
     };
   }
 
@@ -1437,7 +1535,7 @@ export class V2PublicToolRouter {
   ): Promise<Record<string, unknown>> {
     const query = String(args.query ?? args.area ?? "").trim() || "governed";
     const limit = typeof args.limit === "number" ? args.limit : 10;
-    const sessionId = this.#resolveActiveRootSessionId(args.sessionId);
+    const sessionId = this.#resolveReadSessionId(args.sessionId);
     return this.#withVerifiedReadAdapter(state, release, sessionId, async (adapter) => {
       const res = await adapter.query({
         operation: "search-projected-content",
@@ -1459,7 +1557,7 @@ export class V2PublicToolRouter {
     release: FreshStartRelease,
   ): Promise<Record<string, unknown>> {
     const limit = typeof args.limit === "number" ? args.limit : 20;
-    const sessionId = this.#resolveActiveRootSessionId(args.sessionId);
+    const sessionId = this.#resolveReadSessionId(args.sessionId);
     return this.#withVerifiedReadAdapter(state, release, sessionId, async (adapter) => {
       const res = await adapter.query({
         operation: "list-canonical-records",
@@ -1488,7 +1586,7 @@ export class V2PublicToolRouter {
     release: FreshStartRelease,
   ): Promise<Record<string, unknown>> {
     const limit = typeof args.limit === "number" ? args.limit : 20;
-    const sessionId = this.#resolveActiveRootSessionId(args.sessionId);
+    const sessionId = this.#resolveReadSessionId(args.sessionId);
     return this.#withVerifiedReadAdapter(state, release, sessionId, async (adapter) => {
       const res = await adapter.query({
         operation: "recent-canonical-records",
@@ -1517,7 +1615,7 @@ export class V2PublicToolRouter {
     release: FreshStartRelease,
   ): Promise<Record<string, unknown>> {
     const query = String(args.area ?? args.query ?? args.task ?? "context").trim() || "context";
-    const sessionId = this.#resolveActiveRootSessionId(args.sessionId);
+    const sessionId = this.#resolveReadSessionId(args.sessionId);
     return this.#withVerifiedReadAdapter(state, release, sessionId, async (adapter) => {
       const res = await adapter.query({
         operation: "build-context-pack",
@@ -1540,7 +1638,7 @@ export class V2PublicToolRouter {
     release: FreshStartRelease,
   ): Promise<Record<string, unknown>> {
     const limit = typeof args.limit === "number" ? args.limit : 10;
-    const sessionId = this.#resolveActiveRootSessionId(args.sessionId);
+    const sessionId = this.#resolveReadSessionId(args.sessionId);
     return this.#withVerifiedReadAdapter(state, release, sessionId, async (adapter) => {
       const res = await adapter.query({
         operation: "follow-up-radar",
@@ -1892,13 +1990,25 @@ export class V2PublicToolRouter {
     return (row?.pos ?? 0n).toString();
   }
 
+  #requireSessionAuthority(sessionId: string): SessionAuthorityRecord {
+    const authority = this.#authorityRepo.get(
+      this.#connection,
+      this.#rootContext.binding.projectId,
+      sessionId,
+    );
+    if (!authority || authority.ownerGeneration === null) {
+      throw new FreshStartError("FRESH_START_INPUT_INVALID");
+    }
+    return authority;
+  }
+
   async #handleCheckpoint(args: Record<string, unknown>): Promise<Record<string, unknown>> {
     const sessionId = await this.#ensureActiveRootSession(args.sessionId);
     const taskSummary = String(
       args.taskSummary ?? args.summary ?? "Session lifecycle checkpoint",
     );
     const b = this.#rootContext.binding;
-    const authority = this.#authorityRepo.get(this.#connection, b.projectId, sessionId)!;
+    const authority = this.#requireSessionAuthority(sessionId);
     const generation = authority.ownerGeneration!.toString();
     const command = decodeLifecycleSemanticCommandDraft({
       commandType: "record-checkpoint",
@@ -1976,7 +2086,7 @@ export class V2PublicToolRouter {
       args.parentSessionId ?? args.sessionId,
     );
     const b = this.#rootContext.binding;
-    const authority = this.#authorityRepo.get(this.#connection, b.projectId, parentSessionId)!;
+    const authority = this.#requireSessionAuthority(parentSessionId);
     const childSessionId = randomUUID();
     const command = decodeLifecycleSemanticCommandDraft({
       commandType: "fork-child",
