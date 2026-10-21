@@ -157,6 +157,11 @@ const failureMappings = {
   "v2-governed-note-entry": {
     "source": "tests/v2-governed-note-entry.test.ts",
     "sha256": "f694910b699bbdd48fc678451530e734e410f3e9b3d588680bb3ad2ff2b3cf94",
+    "sha256s": [
+      "f694910b699bbdd48fc678451530e734e410f3e9b3d588680bb3ad2ff2b3cf94",
+      "225276e433fbfc299e4c01e74a4934b101d35bea0790cc525c45ff340bd7391f",
+      "bb43523d9fad9b02a993dd5a9f62eb767c5c32c9e73d939f7b0db1be06ad2817"
+    ],
     "titles": [
       "closed fixture actions admit a bounded owned clock snapshot without invoking accessors",
       "bootstrap proof mint and mutation use one controlled local worker owner",
@@ -189,6 +194,11 @@ const failureMappings = {
   "v2-governed-note-ownership": {
     "source": "tests/v2-governed-note-ownership.test.ts",
     "sha256": "feab26c807734d07c0c3b904f1951c3c97bdbd71e64f7defbb1e326295064df7",
+    "sha256s": [
+      "feab26c807734d07c0c3b904f1951c3c97bdbd71e64f7defbb1e326295064df7",
+      "619d3cde85f7af678626e0ce6613f4b929dc2ac73bbf15acd3620b9b273c97ee",
+      "330ff1cd44ba9229c1b86fdc7a710f4661a20b60bb2b2eb45194c887bc5a6d7b"
+    ],
     "titles": [
       "governed identity worker selection refuses missing or mismatched current artifacts",
       "mandatory timing rejects before allocation or owner side effects",
@@ -359,7 +369,7 @@ async function runGate({ root = repository, timeoutMs = maximumMs, signal } = {}
     beforeStages(currentRoot) {
       root = currentRoot; assertOwnedLock(currentRoot);
       identity = sourceIdentity(currentRoot, inputs => {
-        for (const [stage, mapping] of Object.entries(failureMappings)) mappingBindings.set(stage, inputs.some(input => input.path === mapping.source && input.sha256 === mapping.sha256));
+        for (const [stage, mapping] of Object.entries(failureMappings)) mappingBindings.set(stage, inputs.some(input => input.path === mapping.source && mapping.sha256s.includes(input.sha256)));
       }); runtimeSha256 = sha(readFileSync(process.execPath));
       assertWithinBound(); emit({ observation: 'candidate', ...identity, runtimeSha256 });
     },

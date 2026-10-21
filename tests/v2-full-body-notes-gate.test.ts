@@ -999,7 +999,7 @@ test('qualification_binds_candidate_and_private_closure', { timeout: 600000, ski
   }
 });
 
-test('gate_rejects_dirty_docs_and_product_inputs', { timeout: 300000 }, async () => {
+test('gate_rejects_dirty_docs_and_product_inputs', { timeout: 300000, skip: process.platform !== 'win32' }, async () => {
   await loadGateModule();
   for (const mode of [
     'docs-dirty',

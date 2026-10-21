@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
-import { lstatSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { lstatSync, mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -126,7 +126,7 @@ async function historical(f: Domain) {
 
 // Break caught: schema3 takes legacy checkpoint/alias SQL, loses summary channels, or leaks body into old replies.
 test("ordinary_schema3_text_and_ranking_are_summary_only", async () => {
-  const f = await makeGovernedNoteDomainFixture(), root = mkdtempSync(join(tmpdir(), "summary-profile-"));
+  const f = await makeGovernedNoteDomainFixture(), root = realpathSync.native(mkdtempSync(join(tmpdir(), "summary-profile-")));
   try {
     const corpus = await historical(f), c = publication(f, root), p2 = await c.ensurePublished(scope(f), 0n, 15000), db2 = capture(p2);
     try {
@@ -195,7 +195,7 @@ test("ordinary_schema3_text_and_ranking_are_summary_only", async () => {
 
 // Break caught: schema3 nullable rich rows, temporal/session eligibility, conflict closure, and deterministic ties regress.
 test("schema3_uses_rich_columns", async () => {
-  const f = await makeGovernedNoteDomainFixture(), root = mkdtempSync(join(tmpdir(), "summary-rich-"));
+  const f = await makeGovernedNoteDomainFixture(), root = realpathSync.native(mkdtempSync(join(tmpdir(), "summary-rich-")));
   try {
     const corpus = await historical(f), c = publication(f, root), p = await c.ensurePublishedV3(scope(f), 0n, 15000), db = capture(p);
     try {
@@ -245,7 +245,7 @@ test("schema3_uses_rich_columns", async () => {
 
 // Break caught: hardcoded schema2 cursors, omitted image/selection binding, or limit erroneously invalidates continuation.
 test("same_position_schema_upgrade_invalidates_cursor", async () => {
-  const f = await makeGovernedNoteDomainFixture(), root = mkdtempSync(join(tmpdir(), "summary-cursor-"));
+  const f = await makeGovernedNoteDomainFixture(), root = realpathSync.native(mkdtempSync(join(tmpdir(), "summary-cursor-")));
   try {
     await historical(f); const c = publication(f, root), p2 = await c.ensurePublished(scope(f), 0n, 15000), db2 = capture(p2);
     try {

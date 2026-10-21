@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createHash } from "node:crypto";
-import { mkdtempSync, readFileSync, rmSync, renameSync, writeFileSync, existsSync, readdirSync, truncateSync } from "node:fs";
+import { mkdtempSync, readFileSync, realpathSync, rmSync, renameSync, writeFileSync, existsSync, readdirSync, truncateSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -38,7 +38,7 @@ function sourceBinding(f:Awaited<ReturnType<typeof makeGovernedNoteDomainFixture
 }
 
 test("same_position_no_events_requires_schema3_generation",async()=>{
-  const root=mkdtempSync(join(tmpdir(),"full-body-publication-"));
+  const root=realpathSync.native(mkdtempSync(join(tmpdir(),"full-body-publication-")));
   try {
     const builder=new ImmutableProjectionBuilder({driver,projectionDirectory:root}),eventReader=emptyReader();
     const c=new V2ProjectionBuildCoordinator({builder,eventReader,projectionDirectory:root,schema3:{builder,eventReader}});
@@ -66,7 +66,7 @@ test("same_position_no_events_requires_schema3_generation",async()=>{
 });
 
 test("owned_image_contains_and_checks_body_and_rejects_rehashed_tampering",async()=>{
-  const f=await makeGovernedNoteDomainFixture(),root=mkdtempSync(join(tmpdir(),"body-image-"));
+  const f=await makeGovernedNoteDomainFixture(),root=realpathSync.native(mkdtempSync(join(tmpdir(),"body-image-")));
   try {
     const legacy=f.command({recordKind:"adr"});f.service().create(f.prepareCreate(legacy),f.rootContext);
     const command=f.commandV2({content:{format:"markdown",body:literalBody}});f.service().createV2(f.prepareCreateV2(command),f.rootContext);
@@ -122,7 +122,7 @@ test("owned_image_contains_and_checks_body_and_rejects_rehashed_tampering",async
 });
 
 test("legacy_genesis_schema3_rebuild_is_deterministic",async()=>{
-  const f=freshInitializationFixture(),root=mkdtempSync(join(tmpdir(),"body-rebuild-"));
+  const f=freshInitializationFixture(),root=realpathSync.native(mkdtempSync(join(tmpdir(),"body-rebuild-")));
   try{
     const receipt=await new FreshStartInitializer(f.dependencies).initializeFresh(f.input);assert.equal("genesisVersion" in receipt,false);
     const journal=JSON.parse(readFileSync(f.journalPath,"utf8")),b=Object.fromEntries(["projectId","vaultId","storeId","workspaceId","branchScopeId","branchRef","sessionId"].map(key=>[key,journal.projection[key]])) as unknown as ProjectBinding;
@@ -157,7 +157,7 @@ for(const boundary of ["after-journal-reserved","after-store-published","after-p
 }
 
 test("schema3_orphan_uses_shared_floor_and_exact_profile_retirement",async()=>{
-  const root=mkdtempSync(join(tmpdir(),"body-orphan-"));
+  const root=realpathSync.native(mkdtempSync(join(tmpdir(),"body-orphan-")));
   try{
     const builder=new ImmutableProjectionBuilder({driver,projectionDirectory:root}),reader=emptyReader();
     const orphan=await builder.buildV3(empty(),99);renameSync(orphan.temporaryDatabasePath,join(root,orphan.manifest.databaseFile));
@@ -170,7 +170,7 @@ test("schema3_orphan_uses_shared_floor_and_exact_profile_retirement",async()=>{
 });
 
 test("same_position_upgrade_deadline_releases_reusable_owner",async()=>{
-  const root=mkdtempSync(join(tmpdir(),"body-deadline-"));
+  const root=realpathSync.native(mkdtempSync(join(tmpdir(),"body-deadline-")));
   try{
     let time=0;const builder=new ImmutableProjectionBuilder({driver,projectionDirectory:root}),reader=emptyReader();
     const c=new V2ProjectionBuildCoordinator({builder,eventReader:reader,projectionDirectory:root,now:()=>time,schema3:{builder,eventReader:reader}});
@@ -181,7 +181,7 @@ test("same_position_upgrade_deadline_releases_reusable_owner",async()=>{
 });
 
 test("schema3_interrupted_install_retains_orphan_for_reconciliation",async()=>{
-  const root=mkdtempSync(join(tmpdir(),"body-interrupted-"));
+  const root=realpathSync.native(mkdtempSync(join(tmpdir(),"body-interrupted-")));
   try{
     const builder=new ImmutableProjectionBuilder({driver,projectionDirectory:root}),reader=emptyReader();
     const c=new V2ProjectionBuildCoordinator({builder,eventReader:reader,projectionDirectory:root,schema3:{builder,eventReader:reader},faultInjector:{hit(at){if(at==="after-v2-generation-install-before-manifest")throw Error("owned interruption");}}});
@@ -196,7 +196,7 @@ test("schema3_interrupted_install_retains_orphan_for_reconciliation",async()=>{
 });
 
 test("schema3_capture_refuses_more_than_64MiB_before_reading",async()=>{
-  const root=mkdtempSync(join(tmpdir(),"body-cap-"));
+  const root=realpathSync.native(mkdtempSync(join(tmpdir(),"body-cap-")));
   try{
     const file=join(root,"projections-3-1.sqlite");writeFileSync(file,"");truncateSync(file,64*1024*1024+1);
     const lease=acquireProjectionManifestPublicationLease(root);
@@ -208,7 +208,7 @@ test("actual_encoded_checksum_and_source_declarations_keep_capacity_limits",asyn
   const row={body:"\t".repeat(65536)},rows=Array.from({length:257},()=>row);
   assert.ok(Buffer.byteLength(JSON.stringify(rows),"utf8")>32*1024*1024);
   assert.throws(()=>projectionCoreChecksum("governedNotes",3,binding.projectId,1n,rows),{message:"PROJECTION_CHECKSUM_INVALID"});
-  const root=mkdtempSync(join(tmpdir(),"body-limits-"));
+  const root=realpathSync.native(mkdtempSync(join(tmpdir(),"body-limits-")));
   try{
     const builder=new ImmutableProjectionBuilder({driver,projectionDirectory:root});
     for(const patch of [{eventCount:100001},{aggregateBytes:64*1024*1024+1}])await assert.rejects(builder.buildV3({...empty(),...patch},1),integrityFailure);
@@ -216,7 +216,7 @@ test("actual_encoded_checksum_and_source_declarations_keep_capacity_limits",asyn
 });
 
 test("interleaved_scopes_keep_global_attestation_and_filtered_owned_dispositions",async()=>{
-  const root=mkdtempSync(join(tmpdir(),"body-scope-")),sourcePath=join(root,"events.sqlite"),projectionDirectory=join(root,"images");
+  const root=realpathSync.native(mkdtempSync(join(tmpdir(),"body-scope-"))),sourcePath=join(root,"events.sqlite"),projectionDirectory=join(root,"images");
   const source=new DatabaseSync(sourcePath);
   try{
     const { eventHash, payloadHash }=await import("../src/orchestrator/crypto/event-hash.js");
@@ -289,7 +289,7 @@ test("schema3_capture_counts_exact_canonical_array_bytes_at_32MiB",async()=>{
 });
 
 test("schema3_ambiguous_manifest_observation_retains_publication_evidence",async()=>{
-  const root=mkdtempSync(join(tmpdir(),"body-ambiguous-"));
+  const root=realpathSync.native(mkdtempSync(join(tmpdir(),"body-ambiguous-")));
   try{
     const builder=new ImmutableProjectionBuilder({driver,projectionDirectory:root}),reader=emptyReader();
     const c=new V2ProjectionBuildCoordinator({builder,eventReader:reader,projectionDirectory:root,schema3:{builder,eventReader:reader},
@@ -308,7 +308,7 @@ test("schema3_ambiguous_manifest_observation_retains_publication_evidence",async
 
 test("schema3_full_replay_rejects_coherent_image_ahead_of_store_terminal", async () => {
   const fixture = await makeGovernedNoteDomainFixture();
-  const root = mkdtempSync(join(tmpdir(), "body-terminal-attestation-"));
+  const root = realpathSync.native(mkdtempSync(join(tmpdir(), "body-terminal-attestation-")));
   try {
     const command = fixture.commandV2({ content: { format: "markdown", body: literalBody } });
     fixture.service().createV2(fixture.prepareCreateV2(command), fixture.rootContext);

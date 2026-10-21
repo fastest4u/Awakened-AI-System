@@ -1346,8 +1346,8 @@ function registerFailureMetadataTests() {
             assert.deepEqual(actual, metadataRegistrations[stage as keyof typeof metadataRegistrations]);
             const fileHash = createHash('sha256').update(readFileSync(path)).digest('hex');
             assert.ok((stage.endsWith('entry')
-                ? ['f694910b699bbdd48fc678451530e734e410f3e9b3d588680bb3ad2ff2b3cf94', '225276e433fbfc299e4c01e74a4934b101d35bea0790cc525c45ff340bd7391f']
-                : ['feab26c807734d07c0c3b904f1951c3c97bdbd71e64f7defbb1e326295064df7', '619d3cde85f7af678626e0ce6613f4b929dc2ac73bbf15acd3620b9b273c97ee']).includes(fileHash));
+                ? ['f694910b699bbdd48fc678451530e734e410f3e9b3d588680bb3ad2ff2b3cf94', '225276e433fbfc299e4c01e74a4934b101d35bea0790cc525c45ff340bd7391f', 'bb43523d9fad9b02a993dd5a9f62eb767c5c32c9e73d939f7b0db1be06ad2817']
+                : ['feab26c807734d07c0c3b904f1951c3c97bdbd71e64f7defbb1e326295064df7', '619d3cde85f7af678626e0ce6613f4b929dc2ac73bbf15acd3620b9b273c97ee', '330ff1cd44ba9229c1b86fdc7a710f4661a20b60bb2b2eb45194c887bc5a6d7b']).includes(fileHash));
             const x = metadataTranscript(stage); assert.equal(derive(stage, x.text, x.counts, metadataOptions()).status, 'candidate');
             assert.equal(derive(stage, x.text, x.counts, { ...metadataOptions(), mappingBound: false }).reason, 'mapping-unavailable');
         }

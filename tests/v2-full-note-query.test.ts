@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
-import { lstatSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { lstatSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -55,7 +55,7 @@ test("schema3_full_note_query_contract", async t => {
   const module = await import(path).catch(() => ({})) as Record<string, (db: DatabaseSync, manifest: unknown, ctx: unknown) => any>;
   assert.equal(typeof module.queryNativeFullNote, "function", "full_note_has_summary_and_literal_body requires the dedicated same-image query");
   const query = module.queryNativeFullNote!;
-  const f = await makeGovernedNoteDomainFixture(), root = mkdtempSync(join(tmpdir(), "full-note-query-"));
+  const f = await makeGovernedNoteDomainFixture(), root = realpathSync.native(mkdtempSync(join(tmpdir(), "full-note-query-")));
   let db: DatabaseSync | undefined;
   try {
     const body = "# body-only needle\r\n\t```ts\n  e\u0301 é ไทย 😀  \n```\n";
