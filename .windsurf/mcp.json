@@ -1,8 +1,15 @@
-﻿{
+{
   "mcpServers": {
     "project-memory": {
+      "command": "node",
+      "args": [
+        "C:\\Users\\Server\\Desktop\\Awakened-AI-System\\dist\\v2.js"
+      ],
       "env": {
-        "MEMORY_PROJECT_ROOT": "dynamic"
+        "MEMORY_PROJECT_ROOT": "C:\\Users\\Server\\Desktop\\Awakened-AI-System",
+        "MEMORY_V2_VAULT_PATH": "C:\\Users\\Server\\Desktop\\Awakened-AI-System\\memory-v2",
+        "MEMORY_V1_ARCHIVE_PATH": "C:\\Users\\Server\\Desktop\\Awakened-AI-System\\memory",
+        "MEMORY_V2_RELEASE_ID": "d45b1956-e05b-4316-b68d-7014d7dda665"
       }
     }
   }
