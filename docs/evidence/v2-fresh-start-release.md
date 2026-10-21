@@ -4,15 +4,15 @@
 
 This document records the compiled-artifact verification evidence for the V2 Fresh-Start production cutover gate (`npm run verify:v2-fresh-start-release` / `node scripts/run-v2-fresh-start-release.js`).
 
-- **Status**: `ready-for-activation`
+- **Status**: `ready-for-activation` (Release Qualification) / `live-operation-verified` (F4 Live Cutover)
 - **Production Ready**: `true`
 - **Schema Version**: `1`
-- **Build Identity Hash**: `a72b296290d57b0b1403f3d7382e09cd847a31624db188c129054c4b2514e573`
+- **Build Identity Hash**: `8eb071df26881b26c93a99dd4f0a83a7622256536d4f671e8523db8bca295843`
 - **Schema Identity Hash**: `f10eb1976f2fd97d899163d930a91e21f66daaccf448a76334d5c9b13ffd6df1`
 - **Capability Manifest Hash**: `69b56af9f0b267422e6e241d90cae312111a12caf45dae9dde47eacfe5f16870`
 - **Recovery Policy Hash**: `ac2e271e0320cdb0797316a61ab2edc3f42fa8f0926c51623c95eae0cef8a7c8`
-- **Report Digest**: `a23b4812ed7bf5743918ab66b86f13ac23fa13b150166275dd5270e3e22434a5`
-- **Generated At**: `2026-10-21T02:12:48.238Z`
+- **Report Digest**: `4cad0bcd5bbe2be66f2df2daa6261513e7fc6ada50d013154a7a79053d086580`
+- **Generated At**: `2026-10-21T03:05:02.409Z`
 
 ---
 
@@ -47,5 +47,42 @@ All 8 release scenarios were executed against the compiled `dist/` bundle:
 ## Canonical Release Evidence Report JSON
 
 ```json
-{"buildIdentityHash":"a72b296290d57b0b1403f3d7382e09cd847a31624db188c129054c4b2514e573","capabilityManifestHash":"69b56af9f0b267422e6e241d90cae312111a12caf45dae9dde47eacfe5f16870","generatedAt":"2026-10-21T02:12:48.238Z","productionReady":true,"recoveryPolicyHash":"ac2e271e0320cdb0797316a61ab2edc3f42fa8f0926c51623c95eae0cef8a7c8","reportDigest":"a23b4812ed7bf5743918ab66b86f13ac23fa13b150166275dd5270e3e22434a5","scenarios":[{"id":"scenario-1-empty-start-write-restart-retrieval","passed":true},{"id":"scenario-2-public-workflows-and-governance","passed":true},{"id":"scenario-3-v1-archive-isolation-and-path-overlap","passed":true},{"id":"scenario-4-binding-capability-and-generation-refusals","passed":true},{"id":"scenario-5-crash-recovery-and-idempotent-fencing","passed":true},{"id":"scenario-6-verified-backup-isolated-restore-replay-and-rollback","passed":true},{"id":"scenario-7-privacy-redaction-encryption-key-rotation-and-erasure-after-restore","passed":true},{"id":"scenario-8-bounded-failures-and-operational-limits","passed":true}],"schemaIdentityHash":"f10eb1976f2fd97d899163d930a91e21f66daaccf448a76334d5c9b13ffd6df1","schemaVersion":1,"status":"ready-for-activation"}
+{"buildIdentityHash":"8eb071df26881b26c93a99dd4f0a83a7622256536d4f671e8523db8bca295843","capabilityManifestHash":"69b56af9f0b267422e6e241d90cae312111a12caf45dae9dde47eacfe5f16870","generatedAt":"2026-10-21T03:05:02.409Z","productionReady":true,"recoveryPolicyHash":"ac2e271e0320cdb0797316a61ab2edc3f42fa8f0926c51623c95eae0cef8a7c8","reportDigest":"4cad0bcd5bbe2be66f2df2daa6261513e7fc6ada50d013154a7a79053d086580","scenarios":[{"id":"scenario-1-empty-start-write-restart-retrieval","passed":true},{"id":"scenario-2-public-workflows-and-governance","passed":true},{"id":"scenario-3-v1-archive-isolation-and-path-overlap","passed":true},{"id":"scenario-4-binding-capability-and-generation-refusals","passed":true},{"id":"scenario-5-crash-recovery-and-idempotent-fencing","passed":true},{"id":"scenario-6-verified-backup-isolated-restore-replay-and-rollback","passed":true},{"id":"scenario-7-privacy-redaction-encryption-key-rotation-and-erasure-after-restore","passed":true},{"id":"scenario-8-bounded-failures-and-operational-limits","passed":true}],"schemaIdentityHash":"f10eb1976f2fd97d899163d930a91e21f66daaccf448a76334d5c9b13ffd6df1","schemaVersion":1,"status":"ready-for-activation"}
 ```
+
+---
+
+## F4 Live Cutover & Production Operation Receipt (`live-operation-verified`)
+
+Following explicit user authorization (`Option (A)`), F4 Live Cutover was executed on `C:\Users\Server\Desktop\Awakened-AI-System`:
+
+- **Live Project Root**: `C:\Users\Server\Desktop\Awakened-AI-System`
+- **Live V2 Vault Root**: `C:\Users\Server\Desktop\Awakened-AI-System\memory-v2`
+- **Frozen V1 Archive Root**: `C:\Users\Server\Desktop\Awakened-AI-System\memory`
+- **Project ID**: `4111e02a-6f30-4425-acef-967641cff6bc`
+- **Vault ID**: `68e7e9ab-8ec5-488e-a2f0-eb84887919ac`
+- **Store ID**: `dc9b7303-ef48-41c0-b668-b581f03e3a5f`
+- **Release ID**: `d45b1956-e05b-4316-b68d-7014d7dda665`
+- **Gate 1 — Frozen & Verified V1 Archive**:
+  - `fileCount`: `1525` (`verifiedFiles`: `1525`, `writeDenied`: `true`)
+  - `manifestSha256`: `3cf58085b8871d8353f8bb8019539f36ca13e35d7b311e3792c241bf934c4680`
+- **Gate 2 — Operator Approval & Active V2 Store**:
+  - `approvalId`: `dc662237-e674-4418-bdc9-7e31931e9fbe`
+  - `requestDigest`: `05b8dff43435254b5681584f45a4bd0aaa5a4781704b4ab15d3f37440d08bb4e`
+  - `mode`: `active`, `generation`: `1`, `productionReady`: `true`, `schemaVersion`: `9`
+- **Generated Client MCP Configurations**:
+  - `.codex/config.toml`
+  - `opencode.json`
+  - `.antigravity/mcp.json`
+  - `.cursor/mcp.json`
+  - `.zed/settings.json`
+  - `.windsurf/mcp.json`
+  - `.mcp.json`
+  - `.claude/settings.local.json`
+- **Live V2 MCP Stdio Verification**:
+  - Verified `memory_v2Status`, `memory_sessionStart`, `memory_contextPack`, `memory_selfCheck`, `memory_writeADR` (`recordId: 8f7942d6-a5b6-4b32-8db6-5d5303a1b4c7`), `memory_get`, `memory_search`, `memory_verifyVault`, and `memory_sessionEnd`.
+- **Initial Verified V2 Backup & Recovery Check**:
+  - `backupId`: `630940e2-ea86-4336-aa9d-ae67356aeed4`
+  - `backupManifestDigest`: `31dd6afed59b926ca3d74ff9c6afd1bc01e32b3ef91ab7936634d2625fd0bb82`
+  - `verify-recovery`: `ok: true`, `healthy: true`, `compatible: true`
+
