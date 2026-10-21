@@ -17,7 +17,7 @@ import {
 import { hostname, userInfo } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import {
   decodeFreshStartRelease,
   FreshStartError,
@@ -70,6 +70,7 @@ import { inspectV2Build } from "./build-identity.js";
 import {
   assertPreparedRelease,
   createV2Foundation,
+  ensureProjectV2StoreReady,
   type FreshStartStatus,
 } from "./composition.js";
 import { isProductionReleaseManifest, loadV2LaunchConfig } from "./config.js";
@@ -87,6 +88,8 @@ const ALL_COMMANDS = new Set<string>([
   "freeze-v1-archive",
   "verify-v1-archive",
   "generate-client-configs",
+  "bootstrap-project",
+  "sync-build",
 ]);
 
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
@@ -1128,6 +1131,43 @@ export async function runV2Admin(argv: readonly string[]): Promise<unknown> {
       clients,
       writtenFiles,
     });
+  }
+
+  // 10. bootstrap-project & sync-build (multi-project onboarding and engine upgrade sync)
+  if (command === "bootstrap-project" || command === "sync-build") {
+    assertAllowedFlags(
+      values,
+      ["--project-root"],
+      ["--v2-vault-root", "--v1-archive-root", "--release-id", "--freeze-v1"],
+      ["--release-id", "--freeze-v1"],
+    );
+    const entryUrl = pathToFileURL(resolveCompiledV2EntryPath()).href;
+    const config = await ensureProjectV2StoreReady({
+      projectRoot: values["--project-root"]!,
+      ...(values["--v2-vault-root"] ? { v2VaultRoot: values["--v2-vault-root"] } : {}),
+      ...(values["--v1-archive-root"] ? { v1ArchiveRoot: values["--v1-archive-root"] } : {}),
+      ...(values["--release-id"] ? { releaseId: values["--release-id"] } : {}),
+      entryUrl,
+      syncBuild: true,
+      ensureActive: command === "bootstrap-project",
+    });
+    const paths = await assertFreshStartPaths(config);
+    if (command === "bootstrap-project" && values["--freeze-v1"] === "true") {
+      freezeV1Archive(paths);
+    }
+    const foundation = await createV2Foundation(config, { entryUrl });
+    try {
+      const status = await foundation.status();
+      return Object.freeze({
+        ok: true,
+        projectRoot: paths.projectRoot,
+        v2VaultRoot: paths.v2VaultRoot,
+        v1ArchiveRoot: paths.v1ArchiveRoot,
+        ...status,
+      });
+    } finally {
+      await foundation.close();
+    }
   }
 
   throw new FreshStartError("FRESH_START_RELEASE_NOT_READY");

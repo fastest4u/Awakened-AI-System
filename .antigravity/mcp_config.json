@@ -3,11 +3,50 @@
     "project-memory": {
       "command": "node",
       "args": [
-        "C:/Users/Server/Desktop/Awakened-AI-System/dist/index.js"
+        "C:\\Users\\Server\\Desktop\\Awakened-AI-System\\dist\\v2.js"
       ],
       "env": {
-        "MEMORY_PROJECT_ROOT": "dynamic"
+        "MEMORY_PROJECT_ROOT": "C:\\Users\\Server\\Desktop\\Awakened-AI-System",
+        "MEMORY_V2_VAULT_PATH": "C:\\Users\\Server\\Desktop\\Awakened-AI-System\\memory-v2",
+        "MEMORY_V1_ARCHIVE_PATH": "C:\\Users\\Server\\Desktop\\Awakened-AI-System\\memory",
+        "MEMORY_V2_RELEASE_ID": "d45b1956-e05b-4316-b68d-7014d7dda665"
       },
+      "autoApprove": [
+        "memory_search",
+        "memory_get",
+        "memory_list",
+        "memory_recent",
+        "memory_contextPack",
+        "memory_followUpRadar",
+        "memory_writeSessionLog",
+        "memory_writeInsight",
+        "memory_writeMistake",
+        "memory_writeADR",
+        "memory_sessionStart",
+        "memory_sessionEnd",
+        "memory_lifecycleStatus",
+        "memory_selfCheck",
+        "memory_awaken",
+        "memory_verifyVault",
+        "memory_verifyNote",
+        "memory_verifySourceTruth",
+        "memory_findDuplicates",
+        "memory_checkStaleness",
+        "memory_v2Status",
+        "memory_checkpoint",
+        "memory_recoverSession",
+        "memory_sessionFork",
+        "memory_recordChildResult",
+        "memory_completeChildSession",
+        "memory_amendSessionEnd",
+        "memory_cancelSessionEnd",
+        "memory_recordEvidenceBatch",
+        "memory_promote",
+        "memory_supersede",
+        "memory_retract",
+        "memory_expire",
+        "memory_forgetEvidence"
+      ],
       "disabledTools": [],
       "disabled": false
     }
