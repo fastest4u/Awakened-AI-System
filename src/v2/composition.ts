@@ -3,7 +3,11 @@ import { existsSync, mkdirSync, realpathSync, writeFileSync } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { FreshStartInitializer } from "../orchestrator/fresh-start/fresh-start-initializer.js";
-import { assertFreshStartPaths, assertFreshStartOwnedDirectory } from "../orchestrator/fresh-start/fresh-start-paths.js";
+import {
+  assertFreshStartOwnedDirectory,
+  assertFreshStartPaths,
+  freshStartPathContains,
+} from "../orchestrator/fresh-start/fresh-start-paths.js";
 import { FreshStartError, type FreshStartIdentity, type FreshStartMode, type FreshStartRelease } from "../orchestrator/fresh-start/contracts.js";
 import { SqliteFreshStartRepository } from "../orchestrator/fresh-start/fresh-start.repository.js";
 import { DENY_FRESH_START_PROMOTION } from "../orchestrator/fresh-start/operator-approval.js";
@@ -362,8 +366,22 @@ export async function createV2Foundation(
     if (!isAbsolute(trimmed)) {
       throw new FreshStartError("FRESH_START_INPUT_INVALID");
     }
-    mkdirSync(trimmed, { recursive: true });
-    const canonicalTarget = realpathSync.native(resolve(trimmed));
+    const resolvedTarget = resolve(trimmed);
+    if (
+      freshStartPathContains(paths.v1ArchiveRoot, resolvedTarget) ||
+      freshStartPathContains(resolvedTarget, paths.v1ArchiveRoot) ||
+      freshStartPathContains(paths.v2VaultRoot, resolvedTarget)
+    ) {
+      throw new FreshStartError("FRESH_START_PATH_OVERLAP");
+    }
+    mkdirSync(resolvedTarget, { recursive: true });
+    const canonicalTarget = realpathSync.native(resolvedTarget);
+    if (
+      freshStartPathContains(paths.v1ArchiveRoot, canonicalTarget) ||
+      freshStartPathContains(paths.v2VaultRoot, canonicalTarget)
+    ) {
+      throw new FreshStartError("FRESH_START_PATH_OVERLAP");
+    }
     if (canonicalTarget === paths.projectRoot) {
       return null;
     }

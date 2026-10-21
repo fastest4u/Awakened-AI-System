@@ -138,6 +138,11 @@ export const STATUS_TOOL_DEFINITION: McpToolDefinition = Object.freeze({
   }),
 });
 
+const THAI_WORD_SEGMENTER =
+  typeof Intl !== "undefined" && typeof Intl.Segmenter === "function"
+    ? new Intl.Segmenter("th", { granularity: "word" })
+    : null;
+
 const READ_ONLY_PUBLIC_TOOLS = new Set<string>([
   "memory_v2Status",
   "memory_search",
@@ -1912,9 +1917,8 @@ export class V2PublicToolRouter {
     ];
 
     if (/[\u0E00-\u0E7F]/u.test(lower)) {
-      if (typeof Intl !== "undefined" && typeof Intl.Segmenter === "function") {
-        const segmenter = new Intl.Segmenter("th", { granularity: "word" });
-        for (const seg of segmenter.segment(lower)) {
+      if (THAI_WORD_SEGMENTER) {
+        for (const seg of THAI_WORD_SEGMENTER.segment(lower)) {
           const word = seg.segment.trim();
           if (seg.isWordLike && word.length >= 2) {
             tokens.push(word);
@@ -1968,6 +1972,7 @@ export class V2PublicToolRouter {
       readonly sessionId: string | null;
       readonly filePaths: readonly string[];
       readonly symbols: readonly string[];
+      readonly lowerSearchText: string;
     }>
   > {
     return this.#withProjectedImage((db) => {
@@ -2003,6 +2008,7 @@ export class V2PublicToolRouter {
         const title = colonIdx > 0 ? r.summary.slice(0, colonIdx) : r.summary;
         const body = r.body ?? "";
         const extracted = this.#extractFilePathsAndSymbols(`${r.summary}\n${body}`);
+        const lowerSearchText = `${title} ${r.summary} ${r.normalized_key} ${body}`.toLowerCase();
         return Object.freeze({
           id: r.item_id,
           recordId: r.item_id,
@@ -2021,6 +2027,7 @@ export class V2PublicToolRouter {
           sessionId: r.session_id,
           filePaths: extracted.filePaths,
           symbols: extracted.symbols,
+          lowerSearchText,
         });
       });
     });
@@ -2073,6 +2080,7 @@ export class V2PublicToolRouter {
       readonly summary: string;
       readonly body: string;
       readonly normalizedKey: string;
+      readonly lowerSearchText?: string;
     }>,
   ): number {
     const qLower = rawQuery.trim().toLowerCase();
@@ -2107,7 +2115,9 @@ export class V2PublicToolRouter {
       if (!corpusNotes || corpusNotes.length <= 1) return 1.0;
       let df = 0;
       for (const doc of corpusNotes) {
-        const docText = `${doc.title} ${doc.summary} ${doc.normalizedKey} ${doc.body}`.toLowerCase();
+        const docText =
+          doc.lowerSearchText ??
+          `${doc.title} ${doc.summary} ${doc.normalizedKey} ${doc.body}`.toLowerCase();
         if (docText.includes(token)) df += 1;
       }
       return Math.max(0.4, Math.log(1 + (totalDocs - df + 0.5) / (df + 0.5)) + 0.5);
@@ -3225,6 +3235,9 @@ export class V2PublicToolRouter {
     const antigravityDir = join(this.#paths.projectRoot, ".antigravity");
     if (!existsSync(antigravityDir)) return null;
     try {
+      if (lstatSync(antigravityDir).isSymbolicLink()) return null;
+      const targetPath = join(antigravityDir, "MEMORY_RULES.md");
+      if (existsSync(targetPath) && lstatSync(targetPath).isSymbolicLink()) return null;
       const notes = await this.#listProjectNotesFromProjection();
       const adrs = notes.filter((n) => n.recordKind === "adr").slice(0, 15);
       const mistakes = notes.filter((n) => n.recordKind === "mistake").slice(0, 15);
@@ -3252,7 +3265,6 @@ export class V2PublicToolRouter {
         }
       }
       lines.push("");
-      const targetPath = join(antigravityDir, "MEMORY_RULES.md");
       writeFileSync(targetPath, lines.join("\n"), "utf8");
       return targetPath;
     } catch {
