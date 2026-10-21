@@ -198,14 +198,16 @@ export class OverviewModel {
     projectRoot: string,
     foundation: V2Foundation,
   ): Promise<Record<string, unknown>> {
-    const status = await foundation.status();
-    const lifecycle = (await foundation.content.invoke("memory_lifecycleStatus", {})) as {
-      sessions?: Array<Record<string, unknown>>;
-      latestCheckpoint?: unknown;
-    };
     const curator = new V2MemoryCuratorAgent(foundation);
-    const audit = await curator.auditVault();
-    const notes = await MemoryNoteModel.listEnrichedNotes(foundation, undefined, 100);
+    const [status, lifecycle, audit, notes] = await Promise.all([
+      foundation.status(),
+      foundation.content.invoke("memory_lifecycleStatus", {}) as Promise<{
+        sessions?: Array<Record<string, unknown>>;
+        latestCheckpoint?: unknown;
+      }>,
+      curator.auditVault(),
+      MemoryNoteModel.listEnrichedNotes(foundation, undefined, 100),
+    ]);
 
     const byStatus: Record<string, number> = {
       verified: audit.counts.verifiedNotes,

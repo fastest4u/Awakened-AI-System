@@ -261,12 +261,26 @@ test("Task 2: V2 WebUI Server, Knowledge Graph, Multi-Project Switcher, Governan
     assert.ok(html.includes("Project Memory V2"));
     assert.ok(html.includes("AI Memory Curator"));
 
-    // 3. Reject invalid/relative project path (Review Focus #4)
+    // 3. Reject invalid/relative project path (Review Focus #4) and unallowed MCP tool name
     const badProjectRes = await fetch(`${baseUrl}/api/overview?project=relative/traversal`);
     assert.equal(badProjectRes.status, 400);
     const badProjectJson = (await badProjectRes.json()) as { ok: boolean; error: string };
     assert.equal(badProjectJson.ok, false);
     assert.equal(badProjectJson.error, "INVALID_PROJECT_ROOT");
+
+    const badToolRes = await fetch(`${baseUrl}/api/mcp/call`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        projectRoot: fixture.projectRoot,
+        tool: "non_existent_tool_xyz",
+        args: {},
+      }),
+    });
+    assert.equal(badToolRes.status, 400);
+    const badToolJson = (await badToolRes.json()) as { ok: boolean; error: string };
+    assert.equal(badToolJson.ok, false);
+    assert.equal(badToolJson.error, "INVALID_MCP_TOOL");
 
     // 4. List discovered projects via GET /api/projects
     const projectsRes = await fetch(`${baseUrl}/api/projects`);

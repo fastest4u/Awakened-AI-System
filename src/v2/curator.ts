@@ -345,80 +345,82 @@ export class V2MemoryCuratorAgent {
     }> = [];
     const supersededSet = new Set<string>();
 
-    if (resolveDuplicates) {
-      for (const group of auditBefore.duplicateGroups) {
-        const keeperId = group.keeperRecordId;
-        for (const dupId of group.duplicateRecordIds) {
-          if (dupId === keeperId || supersededSet.has(dupId)) continue;
-          const reason = `Auto-superseded duplicate of ${keeperId} by AI Memory Curator`;
-          await this.#foundation.content.invoke("memory_supersede", {
-            sessionId,
-            recordId: dupId,
-            supersedingRecordId: keeperId,
-            reason,
-          });
-          supersededSet.add(dupId);
-          superseded.push(
-            Object.freeze({
-              recordId: dupId,
-              supersedingRecordId: keeperId,
-              reason,
-            }),
-          );
-        }
-      }
-    }
-
     const promoted: Array<{
       readonly recordId: string;
       readonly title: string;
       readonly status: string;
     }> = [];
-
-    if (promoteCandidates) {
-      for (const candidate of auditBefore.candidateQueue) {
-        if (supersededSet.has(candidate.recordId)) continue;
-        await this.#foundation.content.invoke("memory_promote", {
-          sessionId,
-          recordId: candidate.recordId,
-          targetStatus: "verified",
-          verificationMethod: "user-confirmed",
-          reason: "Auto-promoted verified candidate by AI Memory Curator",
-        });
-        promoted.push(
-          Object.freeze({
-            recordId: candidate.recordId,
-            title: candidate.title,
-            status: "verified",
-          }),
-        );
-      }
-    }
-
     const expired: Array<{ readonly recordId: string }> = [];
-    if (expireStale) {
-      for (const stale of auditBefore.staleNotes) {
-        if (
-          supersededSet.has(stale.recordId) ||
-          stale.status === "expired" ||
-          stale.status === "superseded" ||
-          stale.status === "retracted"
-        ) {
-          continue;
-        }
-        await this.#foundation.content.invoke("memory_expire", {
-          sessionId,
-          recordId: stale.recordId,
-          reason: "Auto-expired stale memory record by AI Memory Curator",
-        });
-        expired.push(Object.freeze({ recordId: stale.recordId }));
-      }
-    }
 
-    await this.#foundation.content.invoke("memory_sessionEnd", {
-      sessionId,
-      summary: `AI Memory Curator completed: promoted ${promoted.length}, superseded ${superseded.length}, expired ${expired.length}.`,
-    });
+    try {
+      if (resolveDuplicates) {
+        for (const group of auditBefore.duplicateGroups) {
+          const keeperId = group.keeperRecordId;
+          for (const dupId of group.duplicateRecordIds) {
+            if (dupId === keeperId || supersededSet.has(dupId)) continue;
+            const reason = `Auto-superseded duplicate of ${keeperId} by AI Memory Curator`;
+            await this.#foundation.content.invoke("memory_supersede", {
+              sessionId,
+              recordId: dupId,
+              supersedingRecordId: keeperId,
+              reason,
+            });
+            supersededSet.add(dupId);
+            superseded.push(
+              Object.freeze({
+                recordId: dupId,
+                supersedingRecordId: keeperId,
+                reason,
+              }),
+            );
+          }
+        }
+      }
+
+      if (promoteCandidates) {
+        for (const candidate of auditBefore.candidateQueue) {
+          if (supersededSet.has(candidate.recordId)) continue;
+          await this.#foundation.content.invoke("memory_promote", {
+            sessionId,
+            recordId: candidate.recordId,
+            targetStatus: "verified",
+            verificationMethod: "user-confirmed",
+            reason: "Auto-promoted verified candidate by AI Memory Curator",
+          });
+          promoted.push(
+            Object.freeze({
+              recordId: candidate.recordId,
+              title: candidate.title,
+              status: "verified",
+            }),
+          );
+        }
+      }
+
+      if (expireStale) {
+        for (const stale of auditBefore.staleNotes) {
+          if (
+            supersededSet.has(stale.recordId) ||
+            stale.status === "expired" ||
+            stale.status === "superseded" ||
+            stale.status === "retracted"
+          ) {
+            continue;
+          }
+          await this.#foundation.content.invoke("memory_expire", {
+            sessionId,
+            recordId: stale.recordId,
+            reason: "Auto-expired stale memory record by AI Memory Curator",
+          });
+          expired.push(Object.freeze({ recordId: stale.recordId }));
+        }
+      }
+    } finally {
+      await this.#foundation.content.invoke("memory_sessionEnd", {
+        sessionId,
+        summary: `AI Memory Curator completed: promoted ${promoted.length}, superseded ${superseded.length}, expired ${expired.length}.`,
+      });
+    }
 
     const auditAfter = await this.auditVault();
 

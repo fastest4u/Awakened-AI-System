@@ -1145,6 +1145,9 @@ export async function runV2Admin(argv: readonly string[]): Promise<unknown> {
     );
     const defaultProjectRoot = values["--project-root"] ?? process.cwd();
     const port = values["--port"] ? Number(values["--port"]) : 4321;
+    if (!Number.isInteger(port) || port < 0 || port > 65_535) {
+      throw new FreshStartError("FRESH_START_INPUT_INVALID");
+    }
     const host = values["--host"] ?? "127.0.0.1";
     const entryUrl = pathToFileURL(resolveCompiledV2EntryPath()).href;
     const handle = await startV2WebUiServer({

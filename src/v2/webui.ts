@@ -678,6 +678,11 @@ export function createV2WebUiHandler(options: V2WebUiOptions) {
           return;
         }
         const toolName = typeof body.tool === "string" ? body.tool.trim() : "";
+        const isAllowedTool = V2_PUBLIC_TOOL_DEFINITIONS.some((t) => t.name === toolName);
+        if (!toolName || !isAllowedTool) {
+          sendJson(res, 400, { ok: false, error: "INVALID_MCP_TOOL" });
+          return;
+        }
         const toolArgs =
           body.args && typeof body.args === "object" && !Array.isArray(body.args)
             ? (body.args as Record<string, unknown>)

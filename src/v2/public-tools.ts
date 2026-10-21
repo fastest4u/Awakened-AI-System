@@ -2151,7 +2151,15 @@ export class V2PublicToolRouter {
       for (const row of eventRows) {
         const eventType = String(row.event_type);
         const schemaVersion = Number(row.event_schema_version);
-        const payload = JSON.parse(String(row.payload_json)) as Record<string, unknown>;
+        let payload: Record<string, unknown>;
+        try {
+          payload = JSON.parse(String(row.payload_json)) as Record<string, unknown>;
+        } catch (parseErr) {
+          process.stderr.write(
+            `[v2-public-tools] Skipped malformed event payload at position ${String(row.global_position)}: ${parseErr instanceof Error ? parseErr.message : String(parseErr)}\n`,
+          );
+          continue;
+        }
         if (eventType === "MemorySourceRecorded") {
           const item = (schemaVersion >= 3 ? payload.item : payload) as Record<string, unknown> | undefined;
           if (!item || typeof item.itemId !== "string") continue;
@@ -2230,8 +2238,11 @@ export class V2PublicToolRouter {
           }
         }
       }
-    } catch {
+    } catch (foldErr) {
       // Fall back to projected rows if direct event fold fails.
+      process.stderr.write(
+        `[v2-public-tools] Event fold fallback to projected rows: ${foldErr instanceof Error ? foldErr.message : String(foldErr)}\n`,
+      );
     }
 
     const combinedRows = [...mergedById.values()]
