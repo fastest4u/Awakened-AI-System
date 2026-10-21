@@ -18,6 +18,7 @@
     "start": "node dist/index.js",
     "start:v2": "npm run check:runtime && node dist/v2.js",
     "v2-admin": "npm run check:runtime && node dist/v2-admin.js",
+    "webui": "npm run check:runtime && node dist/v2-admin.js webui",
     "check:runtime": "node scripts/check-runtime.js",
     "prestart": "npm run check:runtime",
     "prebuild": "npm run check:runtime",
