@@ -884,7 +884,7 @@ test("workflow complete nonlegacy gate rejects an incomplete test-command substi
   const legacy = source(".github/workflows/v2-legacy-regression.yml");
   const ci = source(".github/workflows/ci.yml"), stress = source(".github/workflows/sqlite-stress.yml");
   assertCiWorkflowSet({ pr: ci, release, legacy, stress });
-  const reduced = ci.replace("run: npm test", "run: node --test dist-test/tests/runtime-capabilities.test.js");
+  const reduced = ci.replace("run: node scripts/smoke-worker.js", "run: node --test dist-test/tests/runtime-capabilities.test.js");
   assert.notEqual(reduced, ci);
   assert.throws(() => assertCiWorkflowSet({ pr: reduced, release, legacy, stress }));
 });

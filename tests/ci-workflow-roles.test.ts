@@ -277,7 +277,7 @@ function roleFixtures(): CiWorkflowSet {
       "",
       "",
       "      - name: Run tests",
-      "        run: npm test",
+      "        run: node scripts/smoke-worker.js",
       "",
       "  minimum-runtime-rejection:",
       "    name: Reject Node 22.22.3",
@@ -666,7 +666,7 @@ const prMutations: readonly [string, string, string][] = [
   ["arbitrary environment keys", "        run: npm ci --ignore-scripts --include=dev --include=optional", "        env:\n          NODE_ENV: production\n        run: npm ci --ignore-scripts --include=dev --include=optional"],
   ["broadened checkout inputs", "          fetch-depth: 0", "          fetch-depth: 0\n          path: alternate"],
   ["broadened setup inputs", "          node-version: ${{ matrix.node-version }}", "          node-version: ${{ matrix.node-version }}\n          fetch-depth: 0"],
-  ["reduced or full replacement profile", "run: npm test", "run: npm run test:all"],
+  ["reduced or full replacement profile", "run: node scripts/smoke-worker.js", "run: npm run test:all"],
   ["push branch widening", "      - main", "      - feature"],
   ["push cancellation", "cancel-in-progress: ${{ github.event_name == 'pull_request' }}", "cancel-in-progress: true"],
 ];

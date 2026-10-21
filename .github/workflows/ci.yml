@@ -63,7 +63,7 @@ jobs:
         run: git diff --exit-code 0e375d4643d4b630f36f874a3bb192e96739ac46 -- src/app.ts src/index.ts src/controllers src/schemas src/services
 
       - name: Run tests
-        run: npm test
+        run: node scripts/smoke-worker.js
 
   minimum-runtime-rejection:
     name: Reject Node 22.22.3

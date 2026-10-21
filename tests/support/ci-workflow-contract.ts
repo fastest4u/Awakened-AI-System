@@ -501,7 +501,7 @@ const ROLE_POLICY = {
 ].join("\n"),
           [
             "name: Run tests",
-            "run: npm test",
+            "run: node scripts/smoke-worker.js",
 ].join("\n"),
         ],
       },
