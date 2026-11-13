@@ -23,6 +23,7 @@
 - `localStorage` theme key `pm-v2-theme` with values `dark` | `light`; default `dark`; applied as class on `<html>`.
 - Every keydown handler that acts on Enter/shortcuts ignores events where `isComposing === true` or `keyCode === 229`.
 - Thai UI copy, element ids, caps (≤3 files, ≤4 symbols, ≤56 graph nodes, ≤14 per flow column, ≤10 orbital spotlight labels), and colors are copied verbatim from the feature inventory.
+- Component layering (reuse rule): `webui/src/components/ui/` = shadcn primitives only; `webui/src/components/shared/` = app-level reusable components used by 2+ features (`KindBadge`, `StatusBadge`, `CopyButton`, `EmptyState`, `StatCard`, `NoteBadgeList`); `webui/src/features/<view>/` composes them; `webui/src/lib/` = pure logic with no React imports except `markdown.tsx`. A feature never imports another feature's internals — if two features need a piece, it moves to `components/shared/` or `lib/`.
 - `npm run typecheck`, `npm test`, `npm run test:build-artifacts`, `npm run test:webui`, `npm --prefix webui run typecheck`, and `npm run build:webui` all pass at the end of every task that touches their inputs.
 
 ## Review Focus
@@ -102,7 +103,7 @@ test('renders the Memory Studio brand', () => {
 ### Task 3: Client core — API, routing, theme, app shell, command palette
 
 **Files:**
-- Create: `webui/src/api/types.ts`, `webui/src/api/client.ts`, `webui/src/api/queries.ts`, `webui/src/lib/search.ts`, `webui/src/lib/keyboard.ts`, `webui/src/hooks/use-debounced-value.ts`, `webui/src/providers/theme-provider.tsx`, `webui/src/providers/app-providers.tsx`, `webui/src/router.tsx`, `webui/src/routes/*.tsx` (root layout + 5 lazy route stubs), `webui/src/components/shell/{app-sidebar,mobile-nav,topbar,project-switcher,command-palette}.tsx`, `webui/src/test/render-app.tsx` (test helper: memory history + fresh QueryClient + stub fetch)
+- Create: `webui/src/api/types.ts`, `webui/src/api/client.ts`, `webui/src/api/queries.ts`, `webui/src/lib/search.ts`, `webui/src/lib/keyboard.ts`, `webui/src/lib/status.ts`, `webui/src/hooks/use-debounced-value.ts`, `webui/src/providers/theme-provider.tsx`, `webui/src/providers/app-providers.tsx`, `webui/src/router.tsx`, `webui/src/routes/*.tsx` (root layout + 5 lazy route stubs), `webui/src/components/shell/{app-sidebar,mobile-nav,topbar,project-switcher,command-palette}.tsx`, `webui/src/components/shared/{kind-badge,status-badge,copy-button,empty-state}.tsx`, `webui/src/test/render-app.tsx` (test helper: memory history + fresh QueryClient + stub fetch)
 - Modify: `webui/src/main.tsx`, `webui/src/App.tsx` (becomes `RouterProvider`)
 - Test: `webui/src/api/client.test.ts`, `webui/src/lib/search.test.ts`, `webui/src/components/shell/shell.test.tsx`
 
@@ -114,10 +115,12 @@ test('renders the Memory Studio brand', () => {
   - `queries.ts`: `pmKeys.projects()`, `pmKeys.project(p)`, `pmKeys.overview(p)`, `pmKeys.notes(p, f: { query?: string; kind?: string; status?: string })`, `pmKeys.note(p, id)`, `pmKeys.graph(p)`, `pmKeys.audit(p)`, `pmKeys.mcpTools()`; matching `queryOptions` factories `projectsQuery()`, `overviewQuery(p)`, `notesQuery(p, f)`, `noteQuery(p, id)`, `graphQuery(p)`, `auditQuery(p)`, `mcpToolsQuery()`; `invalidateProject(qc: QueryClient, p: string): Promise<void>`.
   - `search.ts`: `type TabId = 'overview'|'kanban'|'graph'|'curator'|'mcp'`, `interface AppSearch { project?: string; note?: string; q?: string; kind?: string; status?: string; node?: string; session?: string }`, `validateAppSearch(raw: Record<string, unknown>): AppSearch`, `legacyHashToHref(hash: string): string | null`.
   - `keyboard.ts`: `isImeComposing(e: { isComposing?: boolean; keyCode?: number; nativeEvent?: { isComposing?: boolean; keyCode?: number } }): boolean`, `isEditableTarget(el: Element | null): boolean`.
+  - `status.ts`: `statusBadgeVariant(status: string): 'success'|'warning'|'destructive'|'secondary'` (mapping as in `<StatusBadge>` below).
   - `useDebouncedValue<T>(value: T, delayMs: number): T`.
   - `useTheme(): { theme: 'dark' | 'light'; toggleTheme(): void }`.
   - `useProjectRoot(): string` — `search.project ?? bootstrap.defaultProjectRoot`.
   - `useOpenNote(): (recordId: string | null) => void` — sets/removes `note` search param with `replace: true`.
+  - Shared components: `<KindBadge kind={string} />` (ADR/Insight/Mistake/Session Log with inventory colors + lucide icons `Landmark`/`Lightbulb`/`AlertTriangle`/`FileText`), `<StatusBadge status={string} />` (variant from status: verified|active → success, candidate|provisional → warning, conflicted|expired|superseded|retracted → destructive, else secondary), `<CopyButton value={string} label={string} toastMessage?={string} />` (clipboard + sonner toast), `<EmptyState icon={LucideIcon} title={string} description?={string} />`.
   - Router: browser history, `defaultPreload: 'intent'`, `defaultViewTransition: true`, `/` → redirect `/overview`; on boot, if `location.hash` yields `legacyHashToHref`, `router.history.replace(href)`.
 
 - [ ] **Step 1: Write failing tests**:
@@ -150,7 +153,7 @@ test('renders the Memory Studio brand', () => {
 **Interfaces:**
 - Consumes: `noteQuery`, `useOpenNote`, `useProjectRoot` (Task 3).
 - Produces:
-  - `note.ts`: `extractNoteBodyText(body: unknown): string` (string → itself; `{ body: string }` / `{ content: { body } }` → body; else `''`), `deriveHumanTitle(note: Pick<NoteItem,'title'|'summary'|'recordId'> & { body?: unknown }): string` (skips generic headings `Problem`, `Context`, `Summary`, `Background`, `Overview`, `ปัญหา`, `บริบท`), `statusBadgeVariant(status: string): 'success'|'warning'|'destructive'|'secondary'`.
+  - `note.ts`: `extractNoteBodyText(body: unknown): string` (string → itself; `{ body: string }` / `{ content: { body } }` → body; else `''`), `deriveHumanTitle(note: Pick<NoteItem,'title'|'summary'|'recordId'> & { body?: unknown }): string` (skips generic headings `Problem`, `Context`, `Summary`, `Background`, `Overview`, `ปัญหา`, `บริบท`). Status badges use Task 3's `<StatusBadge>`; copy buttons use `<CopyButton>`.
   - `markdown.tsx`: `isSafeMarkdownHref(href: string): boolean` (allow `http:`, `https:`, `mailto:`, `vscode:`, `cursor:`, `#…`), `<InlineMarkdown text={string} onWikilink={(target: string) => void} />`, `<MarkdownBlocks text={string} onWikilink={…} />`; no `dangerouslySetInnerHTML`.
   - `NoteDetailSheet` (shadcn `Sheet`, side right, width `sm:max-w-2xl`) — copy and controls per inventory "Note detail view"; wikilink `note:<id>` → `openNote(id)`, other targets → navigate `/kanban?q=<target>`; files/symbols → `/graph?q=<value>`; `ดูความเชื่อมโยงในกราฟ` → `/graph?node=<recordId>` and closes.
 
@@ -172,7 +175,7 @@ test('renders the Memory Studio brand', () => {
 ### Task 5: Overview page
 
 **Files:**
-- Create: `webui/src/lib/overview-math.ts`, `webui/src/features/overview/{overview-page,kpi-cards,health-gauge-card,distribution-card,activity-card,session-activity-map,causal-triads-card,recommendations-card,sessions-table}.tsx`
+- Create: `webui/src/lib/overview-math.ts`, `webui/src/components/shared/stat-card.tsx`, `webui/src/features/overview/{overview-page,kpi-cards,health-gauge-card,distribution-card,activity-card,session-activity-map,causal-triads-card,recommendations-card,sessions-table}.tsx`
 - Modify: `webui/src/routes/overview.tsx`
 - Test: `webui/src/lib/overview-math.test.ts`, `webui/src/features/overview/overview.test.tsx`
 
@@ -195,7 +198,7 @@ test('renders the Memory Studio brand', () => {
 ### Task 6: Kanban & table page
 
 **Files:**
-- Create: `webui/src/lib/kanban.ts`, `webui/src/features/kanban/{kanban-page,quick-entry,kanban-toolbar,kanban-board,note-card,notes-table,governance-confirm-dialog,use-governance}.tsx|ts`
+- Create: `webui/src/lib/kanban.ts`, `webui/src/components/shared/note-badge-list.tsx`, `webui/src/features/kanban/{kanban-page,quick-entry,kanban-toolbar,kanban-board,note-card,notes-table,governance-confirm-dialog,use-governance}.tsx|ts`
 - Modify: `webui/src/routes/kanban.tsx`
 - Test: `webui/src/lib/kanban.test.ts`, `webui/src/features/kanban/kanban.test.tsx`
 
