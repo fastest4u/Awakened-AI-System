@@ -366,6 +366,26 @@ export class V2MemoryCuratorAgent {
     const expireStale = options?.expireStale !== false;
 
     const auditBefore = await this.auditVault();
+    const hasDuplicateWork = resolveDuplicates && auditBefore.duplicateGroups.length > 0;
+    const hasCandidateWork = promoteCandidates && auditBefore.candidateQueue.length > 0;
+    const hasStaleWork =
+      expireStale &&
+      auditBefore.staleNotes.some(
+        (s) => s.status !== "expired" && s.status !== "superseded" && s.status !== "retracted",
+      );
+    if (!hasDuplicateWork && !hasCandidateWork && !hasStaleWork) {
+      return Object.freeze({
+        ok: true,
+        sessionId: "noop-clean-vault",
+        executedAt: new Date().toISOString(),
+        beforeHealthScore: auditBefore.healthScore,
+        afterHealthScore: auditBefore.healthScore,
+        promoted: Object.freeze([]),
+        superseded: Object.freeze([]),
+        expired: Object.freeze([]),
+      });
+    }
+
     const sessionStart = (await this.#foundation.content.invoke("memory_sessionStart", {
       agentName: "v2-ai-memory-curator",
       taskSummary: "Autonomous AI Memory Curator governance pass",
@@ -514,12 +534,31 @@ export class V2MemoryCuratorAgent {
     const rawMessage = String(request.message ?? "").trim();
     const executedTools: string[] = [];
 
-    // 1. Write ADR intent (Thai & English)
-    const adrMatch =
+    const isInterrogative =
+      /[?？]|(?:กี่(?:อัน|รายการ|กลุ่ม|ตัว|ข้อ)?|เท่าไหร่|เท่าไร|อันไหน|ตัวไหน|ยังไง|อย่างไร|หรือไม่|หรือเปล่า|หรือยัง|ไหม|มั้ย|อะไรบ้าง)|\b(?:how\s+many|which\s+ones?|what\s+can)\b/iu.test(
+        rawMessage,
+      );
+
+    // 1. Write ADR intent (Thai & English — supports colon, dash, 'เรื่อง', or natural whitespace)
+    const explicitAdrMatch =
       rawMessage.match(/^(?:บันทึก|สร้าง|เขียน|เพิ่ม)?\s*adr\s*[:：-]\s*(.+)$/iu) ??
-      rawMessage.match(/^(?:write|create|record)\s+adr\s*[:：-]\s*(.+)$/iu);
+      rawMessage.match(/^(?:write|create|record)\s+adr\s*[:：-]\s*(.+)$/iu) ??
+      rawMessage.match(/^(?:บันทึก|สร้าง|เขียน|เพิ่ม)\s+adr\s+เรื่อง\s+(.+)$/iu);
+    const naturalAdrMatch = !isInterrogative
+      ? rawMessage.match(/^(?:บันทึก|สร้าง|เขียน|เพิ่ม|write|create|record)\s+adr\s+(.+)$/iu)
+      : null;
+    const adrMatch = explicitAdrMatch ?? naturalAdrMatch;
     if (adrMatch) {
       const text = adrMatch[1]!.trim();
+      if (request.autoExecute === false) {
+        return Object.freeze({
+          ok: true,
+          intent: "write_adr",
+          reply: `[Dry-Run Preview] เตรียมบันทึก ADR: "${text}" (autoExecute=false จึงยังไม่เขียนลงคลังความจำ)`,
+          executedTools: Object.freeze([]),
+          data: { preview: true, title: text.slice(0, 90), summary: text },
+        });
+      }
       executedTools.push("memory_writeADR");
       const created = (await this.#foundation.content.invoke("memory_writeADR", {
         title: text.slice(0, 90),
@@ -536,12 +575,31 @@ export class V2MemoryCuratorAgent {
     }
 
     // 2. Write Mistake intent (Thai & English)
-    const mistakeMatch =
+    const explicitMistakeMatch =
       rawMessage.match(
         /^(?:บันทึก|สร้าง|เขียน|เพิ่ม)?\s*(?:mistake|ข้อผิดพลาด|บั๊ก)\s*[:：-]\s*(.+)$/iu,
-      ) ?? rawMessage.match(/^(?:write|create|record)\s+mistake\s*[:：-]\s*(.+)$/iu);
+      ) ??
+      rawMessage.match(/^(?:write|create|record)\s+mistake\s*[:：-]\s*(.+)$/iu) ??
+      rawMessage.match(
+        /^(?:บันทึก|สร้าง|เขียน|เพิ่ม)\s+(?:mistake|ข้อผิดพลาด|บั๊ก)\s+เรื่อง\s+(.+)$/iu,
+      );
+    const naturalMistakeMatch = !isInterrogative
+      ? rawMessage.match(
+          /^(?:บันทึก|สร้าง|เขียน|เพิ่ม|write|create|record)\s+(?:mistake|ข้อผิดพลาด|บั๊ก)\s+(.+)$/iu,
+        )
+      : null;
+    const mistakeMatch = explicitMistakeMatch ?? naturalMistakeMatch;
     if (mistakeMatch) {
       const text = mistakeMatch[1]!.trim();
+      if (request.autoExecute === false) {
+        return Object.freeze({
+          ok: true,
+          intent: "write_mistake",
+          reply: `[Dry-Run Preview] เตรียมบันทึกข้อผิดพลาด (Mistake): "${text}" (autoExecute=false)`,
+          executedTools: Object.freeze([]),
+          data: { preview: true, title: text.slice(0, 90), summary: text },
+        });
+      }
       executedTools.push("memory_writeMistake");
       const created = (await this.#foundation.content.invoke("memory_writeMistake", {
         title: text.slice(0, 90),
@@ -558,12 +616,31 @@ export class V2MemoryCuratorAgent {
     }
 
     // 3. Write Insight intent (Thai & English)
-    const insightMatch =
+    const explicitInsightMatch =
       rawMessage.match(
         /^(?:บันทึก|สร้าง|เขียน|เพิ่ม)?\s*(?:insight|บทเรียน|ความรู้)\s*[:：-]\s*(.+)$/iu,
-      ) ?? rawMessage.match(/^(?:write|create|record)\s+insight\s*[:：-]\s*(.+)$/iu);
+      ) ??
+      rawMessage.match(/^(?:write|create|record)\s+insight\s*[:：-]\s*(.+)$/iu) ??
+      rawMessage.match(
+        /^(?:บันทึก|สร้าง|เขียน|เพิ่ม)\s+(?:insight|บทเรียน|ความรู้)\s+เรื่อง\s+(.+)$/iu,
+      );
+    const naturalInsightMatch = !isInterrogative
+      ? rawMessage.match(
+          /^(?:บันทึก|สร้าง|เขียน|เพิ่ม|write|create|record)\s+(?:insight|บทเรียน|ความรู้)\s+(.+)$/iu,
+        )
+      : null;
+    const insightMatch = explicitInsightMatch ?? naturalInsightMatch;
     if (insightMatch) {
       const text = insightMatch[1]!.trim();
+      if (request.autoExecute === false) {
+        return Object.freeze({
+          ok: true,
+          intent: "write_insight",
+          reply: `[Dry-Run Preview] เตรียมบันทึก Insight: "${text}" (autoExecute=false)`,
+          executedTools: Object.freeze([]),
+          data: { preview: true, title: text.slice(0, 90), summary: text },
+        });
+      }
       executedTools.push("memory_writeInsight");
       const created = (await this.#foundation.content.invoke("memory_writeInsight", {
         title: text.slice(0, 90),
@@ -579,8 +656,9 @@ export class V2MemoryCuratorAgent {
       });
     }
 
-    // 4. Auto-curate / Promote candidates / Resolve duplicates intent
+    // 4. Auto-curate / Promote candidates / Resolve duplicates intent (commands only — never interrogative questions!)
     if (
+      !isInterrogative &&
       /(?:อนุมัติ|promote|auto[\s-]?curate|จัดระเบียบ|ทำความสะอาด|รวมความจำซ้ำ|resolve duplicate)/iu.test(
         rawMessage,
       )
@@ -604,16 +682,17 @@ export class V2MemoryCuratorAgent {
         resolveDuplicates: true,
         expireStale: true,
       });
-      executedTools.push(
-        "memory_sessionStart",
-        "memory_list",
-        "memory_findDuplicates",
-        "memory_checkStaleness",
-      );
+      const isNoopCleanVault = receipt.sessionId === "noop-clean-vault";
+      if (!isNoopCleanVault) {
+        executedTools.push("memory_sessionStart");
+      }
+      executedTools.push("memory_list", "memory_findDuplicates", "memory_checkStaleness");
       if (receipt.promoted.length > 0) executedTools.push("memory_promote");
       if (receipt.superseded.length > 0) executedTools.push("memory_supersede");
       if (receipt.expired.length > 0) executedTools.push("memory_expire");
-      executedTools.push("memory_sessionEnd");
+      if (!isNoopCleanVault) {
+        executedTools.push("memory_sessionEnd");
+      }
       return Object.freeze({
         ok: true,
         intent: "auto_curate",
@@ -628,11 +707,13 @@ export class V2MemoryCuratorAgent {
       });
     }
 
-    // 5. Audit / Health / Duplicate check intent
+    // 5. Audit / Health / Duplicate / Candidate-count check intent
     if (
-      /(?:ตรวจสุขภาพ|สุขภาพความจำ|ความจำซ้ำ|duplicate|audit|health|stale|ล้าสมัย)/iu.test(
+      /(?:ตรวจสุขภาพ|สุขภาพความจำ|ความจำซ้ำ|รออนุมัติ|duplicate|audit|health|stale|ล้าสมัย)/iu.test(
         rawMessage,
-      )
+      ) ||
+      (isInterrogative &&
+        /(?:อนุมัติ|promote|candidate|ความจำ|โน้ต|notes?|ซ้ำ|คลัง)/iu.test(rawMessage))
     ) {
       executedTools.push("memory_list", "memory_findDuplicates", "memory_checkStaleness");
       const audit = await this.auditVault();

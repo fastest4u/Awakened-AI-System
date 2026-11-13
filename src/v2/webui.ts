@@ -1,8 +1,9 @@
-import { randomBytes, timingSafeEqual } from "node:crypto";
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { gzipSync } from "node:zlib";
 import { buildWikilinkResolver } from "../utils/links.js";
 import {
   createV2Foundation,
@@ -105,6 +106,48 @@ export interface BuildKnowledgeGraphOptions {
   readonly filterMissingRepoFiles?: boolean;
 }
 
+const REPO_FILE_SYMBOLS_CACHE_MAX = 512;
+const REPO_FILE_SYMBOLS_CACHE = new Map<
+  string,
+  { readonly mtimeMs: number; readonly size: number; readonly symbols: ReadonlySet<string> }
+>();
+const FILE_DECL_SYMBOL_RE =
+  /(?:export\s+)?(?:default\s+)?(?:abstract\s+)?(?:async\s+)?(?:class|function|interface|type|const|let|var|enum)\s+([A-Za-z_$][A-Za-z0-9_$]*)\b/gu;
+
+function getDeclaredSymbolsInRepoFile(
+  projectRoot: string,
+  relPath: string,
+): ReadonlySet<string> | null {
+  try {
+    const contained = resolveContainedWorkspaceFile(projectRoot, relPath, 512 * 1024);
+    if (!contained) return null;
+    const st = statSync(contained.absPath);
+    const cached = REPO_FILE_SYMBOLS_CACHE.get(contained.absPath);
+    if (cached && cached.mtimeMs === st.mtimeMs && cached.size === st.size) {
+      REPO_FILE_SYMBOLS_CACHE.delete(contained.absPath);
+      REPO_FILE_SYMBOLS_CACHE.set(contained.absPath, cached);
+      return cached.symbols;
+    }
+    const content = readFileSync(contained.absPath, "utf8");
+    const declared = new Set<string>();
+    for (const match of content.matchAll(FILE_DECL_SYMBOL_RE)) {
+      if (match[1]) declared.add(match[1]);
+    }
+    const entry = Object.freeze({ mtimeMs: st.mtimeMs, size: st.size, symbols: declared });
+    if (
+      REPO_FILE_SYMBOLS_CACHE.size >= REPO_FILE_SYMBOLS_CACHE_MAX &&
+      !REPO_FILE_SYMBOLS_CACHE.has(contained.absPath)
+    ) {
+      const oldest = REPO_FILE_SYMBOLS_CACHE.keys().next().value;
+      if (oldest !== undefined) REPO_FILE_SYMBOLS_CACHE.delete(oldest);
+    }
+    REPO_FILE_SYMBOLS_CACHE.set(contained.absPath, entry);
+    return declared;
+  } catch {
+    return null;
+  }
+}
+
 export function buildMemoryKnowledgeGraph(
   notes: readonly Record<string, unknown>[],
   sessions: readonly Record<string, unknown>[] = [],
@@ -113,47 +156,16 @@ export function buildMemoryKnowledgeGraph(
   const nodesMap = new Map<string, GraphNode>();
   const edges: GraphEdge[] = [];
   const edgeKeys = new Set<string>();
-  const fileContentsCache = new Map<string, string | null>();
-
-  const cacheFileEntry = (key: string, value: string | null): void => {
-    if (!fileContentsCache.has(key) && fileContentsCache.size >= 256) {
-      const oldest = fileContentsCache.keys().next().value;
-      if (oldest !== undefined) {
-        fileContentsCache.delete(oldest);
-      }
-    }
-    fileContentsCache.set(key, value);
-  };
-
-  const readRepoFileCached = (relPath: string): string | null => {
-    if (!options?.projectRoot) return null;
-    if (fileContentsCache.has(relPath)) {
-      return fileContentsCache.get(relPath) ?? null;
-    }
-    try {
-      const contained = resolveContainedWorkspaceFile(options.projectRoot, relPath, 512 * 1024);
-      if (!contained) {
-        cacheFileEntry(relPath, null);
-        return null;
-      }
-      const content = readFileSync(contained.absPath, "utf8");
-      cacheFileEntry(relPath, content);
-      return content;
-    } catch {
-      cacheFileEntry(relPath, null);
-      return null;
-    }
-  };
+  const perCallSymbolSets = new Map<string, ReadonlySet<string> | null>();
 
   const fileDefinesSymbolOnDisk = (relPath: string, sym: string): boolean => {
-    const content = readRepoFileCached(relPath);
-    if (!content) return false;
-    const escaped = sym.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
-    const declRe = new RegExp(
-      `(?:export\\s+)?(?:default\\s+)?(?:abstract\\s+)?(?:async\\s+)?(?:class|function|interface|type|const|let|var|enum)\\s+${escaped}\\b`,
-      "u",
-    );
-    return declRe.test(content);
+    if (!options?.projectRoot) return false;
+    let symbolSet = perCallSymbolSets.get(relPath);
+    if (symbolSet === undefined) {
+      symbolSet = getDeclaredSymbolsInRepoFile(options.projectRoot, relPath);
+      perCallSymbolSets.set(relPath, symbolSet);
+    }
+    return symbolSet ? symbolSet.has(sym) : false;
   };
 
   const addEdge = (
@@ -249,10 +261,20 @@ export function buildMemoryKnowledgeGraph(
         ? raw.sessionId.trim()
         : (noteToSessionFallback.get(recordId) ?? "");
 
-    const extracted = extractMemoryEntities(
-      `${title}\n${summary}\n${String(raw.body ?? "")}`,
-      options?.projectRoot ? { projectRoot: options.projectRoot } : undefined,
-    );
+    const hasProjectedEntities =
+      Array.isArray(raw.filePaths) &&
+      Array.isArray(raw.symbols) &&
+      Array.isArray(raw.wikilinks);
+    const extracted = hasProjectedEntities
+      ? {
+          filePaths: [] as readonly string[],
+          symbols: [] as readonly string[],
+          wikilinks: [] as readonly string[],
+        }
+      : extractMemoryEntities(
+          `${title}\n${summary}\n${String(raw.body ?? "")}`,
+          options?.projectRoot ? { projectRoot: options.projectRoot } : undefined,
+        );
     const safeRawFilePaths = Array.isArray(raw.filePaths)
       ? raw.filePaths
           .filter((p): p is string => typeof p === "string")
@@ -445,10 +467,23 @@ export function buildMemoryKnowledgeGraph(
   });
 }
 
+const DISCOVER_PROJECTS_TTL_MS = 30_000;
+const DISCOVER_PROJECTS_CACHE = new Map<
+  string,
+  { readonly ts: number; readonly roots: readonly string[] }
+>();
+
 export function discoverV2Projects(
   seedProjectRoot: string,
   extraRoots: readonly string[] = [],
 ): string[] {
+  const cacheKey = `${resolve(seedProjectRoot)}::${extraRoots.map((r) => resolve(r)).join("|")}`;
+  const now = Date.now();
+  const cached = DISCOVER_PROJECTS_CACHE.get(cacheKey);
+  if (cached && now - cached.ts <= DISCOVER_PROJECTS_TTL_MS) {
+    return [...cached.roots];
+  }
+
   const discovered = new Set<string>();
   const tryAdd = (candidatePath: string) => {
     try {
@@ -482,7 +517,13 @@ export function discoverV2Projects(
     discovered.add(resolve(seedProjectRoot));
   }
 
-  return [...discovered].sort((a, b) => a.localeCompare(b));
+  const sorted = [...discovered].sort((a, b) => a.localeCompare(b));
+  if (DISCOVER_PROJECTS_CACHE.size >= 32 && !DISCOVER_PROJECTS_CACHE.has(cacheKey)) {
+    const oldest = DISCOVER_PROJECTS_CACHE.keys().next().value;
+    if (oldest !== undefined) DISCOVER_PROJECTS_CACHE.delete(oldest);
+  }
+  DISCOVER_PROJECTS_CACHE.set(cacheKey, { ts: now, roots: Object.freeze([...sorted]) });
+  return sorted;
 }
 
 function validateProjectRootParam(raw: string | null | undefined, fallback: string): string | null {
@@ -554,16 +595,33 @@ function pathContainsOrEquals(root: string, target: string): boolean {
   return rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
 }
 
+const CANONICAL_WEBUI_ROOT_TTL_MS = 5_000;
+const CANONICAL_WEBUI_ROOT_CACHE = new Map<
+  string,
+  { readonly ts: number; readonly canonical: string }
+>();
+
 function canonicalizeProjectRoot(projectRoot: string): string {
   const resolved = resolve(projectRoot);
+  const now = Date.now();
+  const cached = CANONICAL_WEBUI_ROOT_CACHE.get(resolved);
+  if (cached && now - cached.ts <= CANONICAL_WEBUI_ROOT_TTL_MS) {
+    return cached.canonical;
+  }
+  let canonical = resolved;
   try {
     if (existsSync(resolved)) {
-      return realpathSync.native(resolved);
+      canonical = realpathSync.native(resolved);
     }
   } catch {
     // Fall back to resolved path when target is missing
   }
-  return resolved;
+  if (CANONICAL_WEBUI_ROOT_CACHE.size >= 128 && !CANONICAL_WEBUI_ROOT_CACHE.has(resolved)) {
+    const oldest = CANONICAL_WEBUI_ROOT_CACHE.keys().next().value;
+    if (oldest !== undefined) CANONICAL_WEBUI_ROOT_CACHE.delete(oldest);
+  }
+  CANONICAL_WEBUI_ROOT_CACHE.set(resolved, { ts: now, canonical });
+  return canonical;
 }
 
 function canonicalProjectKey(projectRoot: string): string {
@@ -616,13 +674,60 @@ function sendJson(res: ServerResponse, statusCode: number, payload: unknown): vo
   res.end(body);
 }
 
-function sendJs(res: ServerResponse, scriptBody: string): void {
+interface PrecomputedJsAsset {
+  readonly raw: Buffer;
+  readonly gzip: Buffer;
+  readonly etag: string;
+}
+
+function buildPrecomputedJsAsset(scriptBody: string): PrecomputedJsAsset {
+  const raw = Buffer.from(scriptBody, "utf8");
+  const gzip = gzipSync(raw, { level: 6 });
+  const digest = createHash("sha256").update(raw).digest("hex").slice(0, 24);
+  return Object.freeze({
+    raw,
+    gzip,
+    etag: `"pmv2-${digest}"`,
+  });
+}
+
+function sendStaticJsAsset(
+  req: IncomingMessage,
+  res: ServerResponse,
+  asset: PrecomputedJsAsset,
+): void {
+  const ifNoneMatch =
+    typeof req.headers["if-none-match"] === "string" ? req.headers["if-none-match"] : "";
+  if (
+    ifNoneMatch &&
+    ifNoneMatch
+      .split(",")
+      .map((s) => s.trim())
+      .includes(asset.etag)
+  ) {
+    res.writeHead(304, {
+      ...WEBUI_SECURITY_HEADERS,
+      etag: asset.etag,
+      "cache-control": "private, no-cache",
+      vary: "Accept-Encoding",
+    });
+    res.end();
+    return;
+  }
+
+  const acceptEncoding =
+    typeof req.headers["accept-encoding"] === "string" ? req.headers["accept-encoding"] : "";
+  const supportsGzip = /\bgzip\b/iu.test(acceptEncoding);
+  const body = supportsGzip ? asset.gzip : asset.raw;
   res.writeHead(200, {
     ...WEBUI_SECURITY_HEADERS,
     "content-type": "application/javascript; charset=utf-8",
-    "cache-control": "no-store",
+    "cache-control": "private, no-cache",
+    etag: asset.etag,
+    vary: "Accept-Encoding",
+    ...(supportsGzip ? { "content-encoding": "gzip" } : {}),
   });
-  res.end(scriptBody);
+  res.end(body);
 }
 
 export interface V2WebUiOptions {
@@ -637,6 +742,77 @@ export function createV2WebUiHandler(options: V2WebUiOptions) {
   const defaultProjectRoot = canonicalizeProjectRoot(options.defaultProjectRoot);
   const entryUrl = options.entryUrl ?? resolveDefaultEntryUrl();
   const csrfToken = randomBytes(24).toString("hex");
+  const staticMvcAssets: Readonly<Record<string, PrecomputedJsAsset>> = Object.freeze({
+    "/mvc/vendor.js": buildPrecomputedJsAsset(renderVendorRuntimeJs()),
+    "/mvc/models.js": buildPrecomputedJsAsset(renderMvcModelsJs()),
+    "/mvc/controllers.js": buildPrecomputedJsAsset(renderMvcControllersJs()),
+    "/mvc/shadcn-ui.js": buildPrecomputedJsAsset(renderShadcnUiJs()),
+    "/mvc/views.js": buildPrecomputedJsAsset(renderMvcViewsJs()),
+    "/mvc/web-components.js": buildPrecomputedJsAsset(renderWebComponentsJs()),
+  });
+  const inflightApiReads = new Map<string, Promise<unknown>>();
+  const cachedApiReads = new Map<string, { readonly ts: number; readonly payload: unknown }>();
+  const mutationEpochs = new Map<string, number>();
+  let projectsEpoch = 0;
+  const MAX_API_READ_CACHE = 48;
+  const API_READ_CACHE_TTL_MS = 15_000;
+
+  const bumpProjectMutationEpoch = (projectRoot: string): void => {
+    const key = canonicalProjectKey(projectRoot);
+    mutationEpochs.set(key, (mutationEpochs.get(key) ?? 0) + 1);
+    projectsEpoch += 1;
+  };
+
+  const runSingleFlightRead = <T>(key: string, fn: () => Promise<T>): Promise<T> => {
+    const active = inflightApiReads.get(key) as Promise<T> | undefined;
+    if (active) return active;
+    const next = fn().finally(() => {
+      if (inflightApiReads.get(key) === next) {
+        inflightApiReads.delete(key);
+      }
+    });
+    inflightApiReads.set(key, next);
+    return next;
+  };
+
+  const runVersionedProjectRead = async <T>(
+    kind: "overview" | "graph" | "audit",
+    projectRoot: string,
+    compute: (foundation: V2Foundation) => Promise<T>,
+  ): Promise<T> => {
+    const key = canonicalProjectKey(projectRoot);
+    const foundation = await getFoundationForProject(projectRoot);
+    const globalPos =
+      typeof foundation.content.getGlobalPosition === "function"
+        ? foundation.content.getGlobalPosition()
+        : null;
+    const epoch = mutationEpochs.get(key) ?? 0;
+    const cacheKey = `${kind}:${key}:${globalPos ?? "unversioned"}:${epoch}`;
+    if (globalPos !== null) {
+      const hit = cachedApiReads.get(cacheKey);
+      if (hit && Date.now() - hit.ts <= API_READ_CACHE_TTL_MS) {
+        cachedApiReads.delete(cacheKey);
+        cachedApiReads.set(cacheKey, hit);
+        return hit.payload as T;
+      }
+    }
+    return runSingleFlightRead(cacheKey, async () => {
+      const payload = await compute(foundation);
+      const postPos =
+        typeof foundation.content.getGlobalPosition === "function"
+          ? foundation.content.getGlobalPosition()
+          : null;
+      const postEpoch = mutationEpochs.get(key) ?? 0;
+      if (globalPos !== null && postPos === globalPos && postEpoch === epoch) {
+        if (cachedApiReads.size >= MAX_API_READ_CACHE && !cachedApiReads.has(cacheKey)) {
+          const oldest = cachedApiReads.keys().next().value;
+          if (oldest !== undefined) cachedApiReads.delete(oldest);
+        }
+        cachedApiReads.set(cacheKey, { ts: Date.now(), payload });
+      }
+      return payload;
+    });
+  };
   const foundationCache = new Map<string, V2Foundation>();
   const foundationPromiseCache = new Map<string, Promise<V2Foundation>>();
   const ownedFoundations = new Set<V2Foundation>();
@@ -825,28 +1001,8 @@ export function createV2WebUiHandler(options: V2WebUiOptions) {
         res.end(html);
         return;
       }
-      if (method === "GET" && pathname === "/mvc/vendor.js") {
-        sendJs(res, renderVendorRuntimeJs());
-        return;
-      }
-      if (method === "GET" && pathname === "/mvc/models.js") {
-        sendJs(res, renderMvcModelsJs());
-        return;
-      }
-      if (method === "GET" && pathname === "/mvc/controllers.js") {
-        sendJs(res, renderMvcControllersJs());
-        return;
-      }
-      if (method === "GET" && pathname === "/mvc/shadcn-ui.js") {
-        sendJs(res, renderShadcnUiJs());
-        return;
-      }
-      if (method === "GET" && pathname === "/mvc/views.js") {
-        sendJs(res, renderMvcViewsJs());
-        return;
-      }
-      if (method === "GET" && pathname === "/mvc/web-components.js") {
-        sendJs(res, renderWebComponentsJs());
+      if (method === "GET" && Object.prototype.hasOwnProperty.call(staticMvcAssets, pathname)) {
+        sendStaticJsAsset(req, res, staticMvcAssets[pathname]!);
         return;
       }
 
@@ -858,12 +1014,14 @@ export function createV2WebUiHandler(options: V2WebUiOptions) {
 
       // 3. MVC Controller Routes
       if (method === "GET" && pathname === "/api/projects") {
-        const payload = await WebUiMvcController.listProjects(
-          defaultProjectRoot,
-          options.extraProjectRoots ?? [],
-          knownProjects,
-          getFoundationForProject,
-          (root) => foundationCache.has(canonicalProjectKey(root)),
+        const payload = await runSingleFlightRead(`projects:${projectsEpoch}`, () =>
+          WebUiMvcController.listProjects(
+            defaultProjectRoot,
+            options.extraProjectRoots ?? [],
+            knownProjects,
+            getFoundationForProject,
+            (root) => foundationCache.has(canonicalProjectKey(root)),
+          ),
         );
         sendJson(res, 200, payload);
         return;
@@ -910,9 +1068,11 @@ export function createV2WebUiHandler(options: V2WebUiOptions) {
             return;
           }
         }
+        DISCOVER_PROJECTS_CACHE.clear();
         const foundation = await getFoundationForProject(canonicalCandidate, {
           allowBootstrap: true,
         });
+        bumpProjectMutationEpoch(canonicalCandidate);
         const st = await foundation.status();
         sendJson(res, 200, {
           ok: true,
@@ -935,8 +1095,9 @@ export function createV2WebUiHandler(options: V2WebUiOptions) {
           sendJson(res, 403, { ok: false, error: "UNREGISTERED_PROJECT_ROOT" });
           return;
         }
-        const foundation = await getFoundationForProject(projectRoot);
-        const payload = await WebUiMvcController.getOverview(projectRoot, foundation);
+        const payload = await runVersionedProjectRead("overview", projectRoot, (foundation) =>
+          WebUiMvcController.getOverview(projectRoot, foundation),
+        );
         sendJson(res, 200, payload);
         return;
       }
@@ -986,7 +1147,7 @@ export function createV2WebUiHandler(options: V2WebUiOptions) {
         }
         const foundation = await getFoundationForProject(projectRoot);
         const payload = await WebUiMvcController.getNoteDetail(projectRoot, foundation, noteId);
-        sendJson(res, 200, payload);
+        sendJson(res, payload.ok ? 200 : 404, payload);
         return;
       }
 
@@ -1011,6 +1172,7 @@ export function createV2WebUiHandler(options: V2WebUiOptions) {
           foundation,
           body,
         );
+        bumpProjectMutationEpoch(projectRoot);
         sendJson(res, statusCode, payload);
         return;
       }
@@ -1028,8 +1190,9 @@ export function createV2WebUiHandler(options: V2WebUiOptions) {
           sendJson(res, 403, { ok: false, error: "UNREGISTERED_PROJECT_ROOT" });
           return;
         }
-        const foundation = await getFoundationForProject(projectRoot);
-        const payload = await WebUiMvcController.getKnowledgeGraph(projectRoot, foundation);
+        const payload = await runVersionedProjectRead("graph", projectRoot, (foundation) =>
+          WebUiMvcController.getKnowledgeGraph(projectRoot, foundation),
+        );
         sendJson(res, 200, payload);
         return;
       }
@@ -1047,8 +1210,9 @@ export function createV2WebUiHandler(options: V2WebUiOptions) {
           sendJson(res, 403, { ok: false, error: "UNREGISTERED_PROJECT_ROOT" });
           return;
         }
-        const foundation = await getFoundationForProject(projectRoot);
-        const payload = await WebUiMvcController.getCuratorAudit(projectRoot, foundation);
+        const payload = await runVersionedProjectRead("audit", projectRoot, (foundation) =>
+          WebUiMvcController.getCuratorAudit(projectRoot, foundation),
+        );
         sendJson(res, 200, payload);
         return;
       }
@@ -1075,6 +1239,7 @@ export function createV2WebUiHandler(options: V2WebUiOptions) {
           foundation,
           body,
         );
+        bumpProjectMutationEpoch(projectRoot);
         sendJson(res, 200, payload);
         return;
       }
@@ -1107,6 +1272,9 @@ export function createV2WebUiHandler(options: V2WebUiOptions) {
           message,
           body.autoExecute !== false,
         );
+        if (body.autoExecute !== false) {
+          bumpProjectMutationEpoch(projectRoot);
+        }
         sendJson(res, 200, payload);
         return;
       }
@@ -1136,8 +1304,8 @@ export function createV2WebUiHandler(options: V2WebUiOptions) {
           return;
         }
         const toolName = typeof body.tool === "string" ? body.tool.trim() : "";
-        const isAllowedTool = V2_PUBLIC_TOOL_DEFINITIONS.some((t) => t.name === toolName);
-        if (!toolName || !isAllowedTool) {
+        const toolDef = V2_PUBLIC_TOOL_DEFINITIONS.find((t) => t.name === toolName);
+        if (!toolName || !toolDef) {
           sendJson(res, 400, { ok: false, error: "INVALID_MCP_TOOL" });
           return;
         }
@@ -1185,6 +1353,9 @@ export function createV2WebUiHandler(options: V2WebUiOptions) {
           return;
         }
         const result = await foundation.content.invoke(toolName, sanitizedToolArgs);
+        if (!toolDef.annotations.readOnlyHint) {
+          bumpProjectMutationEpoch(effectiveProjectRoot);
+        }
         sendJson(res, 200, {
           ok: true,
           tool: toolName,

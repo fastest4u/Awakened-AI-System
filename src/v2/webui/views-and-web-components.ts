@@ -11,7 +11,12 @@ function escapeHtml(text: string): string {
 
 export function renderMvcViewsJs(): string {
   const toolOptionsJson = JSON.stringify(
-    V2_PUBLIC_TOOL_DEFINITIONS.map((t) => ({ name: t.name, description: t.description })),
+    V2_PUBLIC_TOOL_DEFINITIONS.map((t) => ({
+      name: t.name,
+      description: t.description,
+      inputSchema: t.inputSchema,
+      annotations: t.annotations,
+    })),
   );
 
   return `// ============================================================================
@@ -29,7 +34,7 @@ export function renderMvcViewsJs(): string {
 //   - MissionControlShellView (<pm-mission-control>)
 // ============================================================================
 (function (global) {
-  const { h, useState, useMemo } = global.React;
+  const { h, useState, useEffect, useMemo } = global.React;
   const { useReactTable, getCoreRowModel, getFilteredRowModel, getSortedRowModel, flexRender } =
     global.TanStackTable;
   const {
@@ -83,6 +88,13 @@ export function renderMvcViewsJs(): string {
   // --------------------------------------------------------------------------
   function HealthGaugeChart({ score = 100, verified = 0, candidates = 0, conflicts = 0 }) {
     const numScore = Math.max(0, Math.min(100, Number(score) || 0));
+    const nVer = Math.max(0, Number(verified) || 0);
+    const nCand = Math.max(0, Number(candidates) || 0);
+    const nConf = Math.max(0, Number(conflicts) || 0);
+    const denom = Math.max(1, nVer + nCand + nConf);
+    const verPct = Math.round((nVer / denom) * 100);
+    const candPct = Math.round((nCand / denom) * 100);
+    const confPct = Math.round((nConf / denom) * 100);
     const radius = 58;
     const circumference = 2 * Math.PI * radius;
     const dashOffset = circumference - (numScore / 100) * circumference;
@@ -173,7 +185,7 @@ export function renderMvcViewsJs(): string {
                 h("span", {}, "Verified (ยืนยันแล้ว)"),
                 h("strong", { style: { color: "#10b981" } }, String(verified))
               ),
-              h(Progress, { value: Math.min(100, Number(verified) * 20), color: "#10b981" })
+              h(Progress, { value: verPct, color: "#10b981" })
             ),
             h(
               "div",
@@ -184,7 +196,7 @@ export function renderMvcViewsJs(): string {
                 h("span", {}, "Candidates (รออนุมัติ)"),
                 h("strong", { style: { color: "#f59e0b" } }, String(candidates))
               ),
-              h(Progress, { value: Math.min(100, Number(candidates) * 20), color: "#f59e0b" })
+              h(Progress, { value: candPct, color: "#f59e0b" })
             ),
             h(
               "div",
@@ -195,7 +207,7 @@ export function renderMvcViewsJs(): string {
                 h("span", {}, "Conflicts (ขัดแย้ง/ซ้ำ)"),
                 h("strong", { style: { color: "#ef4444" } }, String(conflicts))
               ),
-              h(Progress, { value: Math.min(100, Number(conflicts) * 25), color: "#ef4444" })
+              h(Progress, { value: confPct, color: "#ef4444" })
             )
           )
         )
@@ -292,11 +304,8 @@ export function renderMvcViewsJs(): string {
     }
     if (!Array.isArray(series) || series.length === 0) {
       series = [
-        { label: "S-4", notes: 1, verified: 1 },
-        { label: "S-3", notes: 2, verified: 1 },
-        { label: "S-2", notes: 3, verified: 2 },
-        { label: "S-1", notes: 4, verified: 3 },
-        { label: "Now", notes: 5, verified: 4 },
+        { label: "S-1", notes: 0, verified: 0 },
+        { label: "Now", notes: 0, verified: 0 },
       ];
     }
 
@@ -488,13 +497,32 @@ export function renderMvcViewsJs(): string {
                       { style: { display: "flex", alignItems: "center", gap: "0.4rem" } },
                       h(
                         Badge,
-                        { variant: isActive ? "success" : isEnding ? "warning" : "secondary" },
-                        h(LucideIcon, { name: isActive ? "activity" : isEnding ? "clock" : "check-circle-2", size: 11 }),
+                        {
+                          variant: isActive
+                            ? "success"
+                            : isEnding
+                              ? "warning"
+                              : s.semanticState === "abandoned"
+                                ? "destructive"
+                                : "secondary",
+                        },
+                        h(LucideIcon, {
+                          name: isActive
+                            ? "activity"
+                            : isEnding
+                              ? "clock"
+                              : s.semanticState === "abandoned"
+                                ? "alert-triangle"
+                                : "check-circle-2",
+                          size: 11,
+                        }),
                         isActive
                           ? "AI กำลังทำงาน (Active)"
                           : isEnding
                             ? "กำลังปิดเซสชัน (Ending)"
-                            : "เสร็จสิ้น (Ended)"
+                            : s.semanticState === "abandoned"
+                              ? "ยกเลิกกลางคัน (Abandoned)"
+                              : "เสร็จสิ้น (Ended)"
                       ),
                       h(
                         Badge,
@@ -521,8 +549,20 @@ export function renderMvcViewsJs(): string {
                         color: "hsl(var(--foreground))",
                       },
                     },
-                    h(LucideIcon, { name: "bot", size: 15, color: "#38bdf8" }),
-                    "AI กำลังทำ: " + String(s.currentTask || "ประมวลผลและดูแลคลังความจำ")
+                    h(LucideIcon, {
+                      name: isActive ? "bot" : isEnding ? "clock" : "check-circle-2",
+                      size: 15,
+                      color: isActive ? "#10b981" : isEnding ? "#f59e0b" : "#38bdf8",
+                    }),
+                    (() => {
+                      const rawTask = String(
+                        s.currentTask || (isActive ? "กำลังประมวลผลภารกิจปัจจุบัน" : "เซสชันการดูแลคลังความจำ")
+                      ).trim();
+                      const shortTask = rawTask.length > 96 ? rawTask.slice(0, 95) + "…" : rawTask;
+                      if (isActive) return "AI กำลังทำ: " + shortTask;
+                      if (isEnding) return "กำลังสรุปปิดงาน: " + shortTask;
+                      return shortTask;
+                    })()
                   ),
                   inProgress.length > 0
                     ? h(
@@ -556,14 +596,16 @@ export function renderMvcViewsJs(): string {
                         },
                       },
                       h(LucideIcon, { name: "layers", size: 13, color: "#6366f1" }),
-                      "ความจำที่เชื่อมโยงกับเซสชันนี้ (" + (s.noteCount || noteTitles.length || 0) + " รายการ):"
+                      "ความจำที่เชื่อมโยงกับเซสชันนี้ (" + (s.noteCount || noteTitles.length || 0) + " รายการ)" + (noteTitles.length > 0 ? ":" : "")
                     ),
                     noteTitles.length === 0
-                      ? h(
-                          "span",
-                          { style: { fontSize: "0.73rem", color: "hsl(var(--muted-foreground))" } },
-                          "ยังไม่มีความจำใหม่ในเซสชันนี้"
-                        )
+                      ? isActive || isEnding
+                        ? h(
+                            "span",
+                            { style: { fontSize: "0.73rem", color: "hsl(var(--muted-foreground))" } },
+                            "ยังไม่มีความจำใหม่ในเซสชันนี้"
+                          )
+                        : null
                       : h(
                           "div",
                           { style: { display: "flex", flexWrap: "wrap", gap: "0.3rem" } },
@@ -581,9 +623,9 @@ export function renderMvcViewsJs(): string {
                                   alignItems: "center",
                                   gap: "0.3rem",
                                   cursor: nid ? "pointer" : "default",
-                                  background: "hsla(var(--primary), 0.14)",
+                                  background: "hsl(var(--primary) / 0.14)",
                                   color: "hsl(var(--foreground))",
-                                  border: "1px solid hsla(var(--primary), 0.35)",
+                                  border: "1px solid hsl(var(--primary) / 0.35)",
                                   borderRadius: "9999px",
                                   padding: "0.18rem 0.55rem",
                                   fontSize: "0.72rem",
@@ -659,13 +701,17 @@ export function renderMvcViewsJs(): string {
         {
           id: "currentTask",
           accessorKey: "currentTask",
-          header: "AI กำลังทำอะไร (Task)",
-          cell: (info) =>
-            h(
+          header: "ภารกิจ AI (Task)",
+          cell: (info) => {
+            const rowState = info.row && info.row.original ? info.row.original.semanticState : "";
+            const fallback = rowState === "active" ? "Active AI Session" : "เซสชันการดูแลคลังความจำ";
+            const raw = String(info.getValue() || fallback).trim();
+            return h(
               "span",
-              { style: { fontSize: "0.78rem", fontWeight: 600 } },
-              String(info.getValue() || "Active AI Session").slice(0, 44)
-            ),
+              { style: { fontSize: "0.78rem", fontWeight: 600 }, title: raw },
+              raw.length > 88 ? raw.slice(0, 87) + "…" : raw
+            );
+          },
         },
         {
           id: "noteCount",
@@ -687,10 +733,25 @@ export function renderMvcViewsJs(): string {
             const st = String(info.getValue() || "");
             return h(
               Badge,
-              { variant: st === "active" ? "success" : "outline" },
+              {
+                variant:
+                  st === "active"
+                    ? "success"
+                    : st === "ending"
+                      ? "warning"
+                      : st === "abandoned"
+                        ? "destructive"
+                        : "outline",
+              },
               st === "active"
                 ? [h(LucideIcon, { key: "i", name: "activity", size: 11 }), "กำลังทำงาน"]
-                : st
+                : st === "ending"
+                  ? [h(LucideIcon, { key: "i", name: "clock", size: 11 }), "กำลังปิดเซสชัน"]
+                  : st === "ended"
+                    ? [h(LucideIcon, { key: "i", name: "check-circle-2", size: 11 }), "เสร็จสิ้น"]
+                    : st === "abandoned"
+                      ? "ยกเลิก"
+                      : st
             );
           },
         },
@@ -1197,7 +1258,12 @@ export function renderMvcViewsJs(): string {
               n.status === "candidate" || n.status === "provisional"
                 ? h(
                     Button,
-                    { variant: "emerald", size: "sm", onClick: () => ctrl.promoteNote(n.recordId) },
+                    {
+                      variant: "emerald",
+                      size: "sm",
+                      disabled: ctrl.governanceMutation.isPending,
+                      onClick: () => ctrl.promoteNote(n.recordId),
+                    },
                     h(LucideIcon, { name: "check", size: 12 }),
                     "อนุมัติ"
                   )
@@ -1223,7 +1289,12 @@ export function renderMvcViewsJs(): string {
               ),
               h(
                 Button,
-                { variant: "destructive", size: "sm", onClick: () => ctrl.retractNote(n.recordId) },
+                {
+                  variant: "destructive",
+                  size: "sm",
+                  disabled: ctrl.governanceMutation.isPending,
+                  onClick: () => ctrl.retractNote(n.recordId, n.title),
+                },
                 "ยกเลิก"
               )
             );
@@ -1266,36 +1337,60 @@ export function renderMvcViewsJs(): string {
             { style: { fontSize: "0.78rem", color: "hsl(var(--muted-foreground))", margin: "0 0 0.45rem" } },
             String(n.summary || "").slice(0, 180)
           ),
-          h(
-            "div",
-            { style: { display: "flex", flexWrap: "wrap", gap: "0.28rem" } },
-            (n.filePaths || []).map((fp) =>
-              h(
-                Badge,
-                {
-                  key: fp,
-                  variant: "outline",
-                  style: { cursor: "pointer" },
-                  onClick: () => mc && mc.openInGraph({ filePath: fp }),
-                },
-                h(LucideIcon, { name: "file-text", size: 11 }),
-                fp
-              )
-            ),
-            (n.symbols || []).map((sym) =>
-              h(
-                Badge,
-                {
-                  key: sym,
-                  variant: "secondary",
-                  style: { cursor: "pointer" },
-                  onClick: () => mc && mc.openInGraph({ symbol: sym }),
-                },
-                h(LucideIcon, { name: "code-2", size: 11 }),
-                sym
-              )
-            )
-          )
+          (() => {
+            const allFiles = Array.isArray(n.filePaths) ? n.filePaths : [];
+            const allSymbols = Array.isArray(n.symbols) ? n.symbols : [];
+            const shownFiles = allFiles.slice(0, 3);
+            const shownSymbols = allSymbols.slice(0, 4);
+            const hiddenMetaCount =
+              Math.max(0, allFiles.length - shownFiles.length) +
+              Math.max(0, allSymbols.length - shownSymbols.length);
+            return h(
+              "div",
+              { style: { display: "flex", flexWrap: "wrap", gap: "0.28rem" } },
+              shownFiles.map((fp) =>
+                h(
+                  Badge,
+                  {
+                    key: fp,
+                    variant: "outline",
+                    style: { cursor: "pointer" },
+                    title: fp,
+                    onClick: () => mc && mc.openInGraph({ filePath: fp }),
+                  },
+                  h(LucideIcon, { name: "file-text", size: 11 }),
+                  fp
+                )
+              ),
+              shownSymbols.map((sym) =>
+                h(
+                  Badge,
+                  {
+                    key: sym,
+                    variant: "secondary",
+                    style: { cursor: "pointer" },
+                    title: sym,
+                    onClick: () => mc && mc.openInGraph({ symbol: sym }),
+                  },
+                  h(LucideIcon, { name: "code-2", size: 11 }),
+                  sym
+                )
+              ),
+              hiddenMetaCount > 0
+                ? h(
+                    Badge,
+                    {
+                      key: "__more_meta__",
+                      variant: "outline",
+                      style: { cursor: "pointer", opacity: 0.85 },
+                      title: "คลิกอ่านรายละเอียดทั้งหมด (" + allFiles.length + " ไฟล์, " + allSymbols.length + " สัญลักษณ์)",
+                      onClick: () => mc && mc.inspectNote(n.recordId),
+                    },
+                    "+" + hiddenMetaCount + " รายการ"
+                  )
+                : null
+            );
+          })()
         ),
         h(
           CardFooter,
@@ -1303,7 +1398,12 @@ export function renderMvcViewsJs(): string {
           n.status === "candidate" || n.status === "provisional"
             ? h(
                 Button,
-                { variant: "emerald", size: "sm", onClick: () => ctrl.promoteNote(n.recordId) },
+                {
+                  variant: "emerald",
+                  size: "sm",
+                  disabled: ctrl.governanceMutation.isPending,
+                  onClick: () => ctrl.promoteNote(n.recordId),
+                },
                 h(LucideIcon, { name: "check", size: 13 }),
                 "อนุมัติ (Promote)"
               )
@@ -1322,12 +1422,22 @@ export function renderMvcViewsJs(): string {
           ),
           h(
             Button,
-            { variant: "outline", size: "sm", onClick: () => ctrl.expireNote(n.recordId) },
+            {
+              variant: "outline",
+              size: "sm",
+              disabled: ctrl.governanceMutation.isPending,
+              onClick: () => ctrl.expireNote(n.recordId, n.title),
+            },
             "หมดอายุ"
           ),
           h(
             Button,
-            { variant: "destructive", size: "sm", onClick: () => ctrl.retractNote(n.recordId) },
+            {
+              variant: "destructive",
+              size: "sm",
+              disabled: ctrl.governanceMutation.isPending,
+              onClick: () => ctrl.retractNote(n.recordId, n.title),
+            },
             "ถอนคืน"
           )
         )
@@ -1355,7 +1465,7 @@ export function renderMvcViewsJs(): string {
           {},
           h(
             "div",
-            { style: { display: "grid", gridTemplateColumns: "180px 1fr 1.5fr auto", gap: "0.6rem" } },
+            { className: "pm-quick-entry-grid" },
             h(
               Select,
               {
@@ -1372,12 +1482,24 @@ export function renderMvcViewsJs(): string {
               placeholder: "หัวข้อสั้นๆ เข้าใจง่าย...",
               value: ctrl.newTitle,
               onChange: (e) => ctrl.setNewTitle(e.target.value),
+              onKeyDown: (e) => {
+                if (e.key === "Enter") {
+                  if (e.preventDefault) e.preventDefault();
+                  ctrl.createNote();
+                }
+              },
             }),
             h(Input, {
               id: "kanban-new-summary",
               placeholder: "รายละเอียด + ระบุไฟล์ เช่น src/v2/webui.ts (startV2WebUiServer)...",
               value: ctrl.newSummary,
               onChange: (e) => ctrl.setNewSummary(e.target.value),
+              onKeyDown: (e) => {
+                if (e.key === "Enter") {
+                  if (e.preventDefault) e.preventDefault();
+                  ctrl.createNote();
+                }
+              },
             }),
             h(
               Button,
@@ -1396,7 +1518,7 @@ export function renderMvcViewsJs(): string {
           { style: { display: "flex", gap: "0.55rem", flex: 1 } },
           h(Input, {
             id: "kanban-search-input",
-            placeholder: "พิมพ์ค้นหาความจำ ชื่อไฟล์ หรือฟังก์ชัน...",
+            placeholder: "พิมพ์ค้นหาความจำ ชื่อไฟล์ หรือฟังก์ชัน... (Ctrl+K)",
             value: ctrl.searchQuery,
             onChange: (e) => ctrl.setSearchQuery(e.target.value),
           }),
@@ -1554,7 +1676,75 @@ export function renderMvcViewsJs(): string {
               ),
               h(CardContent, {}, ctrl.columns.stale.map(renderNoteCard))
             )
-          )
+          ),
+      h(
+        Dialog,
+        {
+          open: Boolean(ctrl.pendingConfirmAction),
+          onOpenChange: (open) => {
+            if (!open) ctrl.cancelConfirmAction();
+          },
+        },
+        ctrl.pendingConfirmAction
+          ? h(
+              "div",
+              { style: { display: "flex", flexDirection: "column", gap: "0.85rem" } },
+              h(
+                "div",
+                { style: { display: "flex", alignItems: "center", gap: "0.5rem" } },
+                h(LucideIcon, { name: "alert-triangle", size: 18, color: "#ef4444" }),
+                h(
+                  "h3",
+                  { style: { margin: 0, fontSize: "1rem", fontWeight: 700 } },
+                  ctrl.pendingConfirmAction.action === "retract"
+                    ? "ยืนยันการถอนคืนความจำ (Confirm Retract)"
+                    : "ยืนยันการตั้งหมดอายุความจำ (Confirm Expire)"
+                )
+              ),
+              h(
+                "p",
+                {
+                  style: {
+                    margin: 0,
+                    fontSize: "0.84rem",
+                    color: "hsl(var(--muted-foreground))",
+                    lineHeight: 1.55,
+                  },
+                },
+                (ctrl.pendingConfirmAction.action === "retract"
+                  ? "รายการนี้จะถูกถอนคืนออกจากชุดความจำใช้งานจริง: "
+                  : "รายการนี้จะถูกเปลี่ยนสถานะเป็นหมดอายุ (Expired): ") +
+                  (ctrl.pendingConfirmAction.title || ctrl.pendingConfirmAction.recordId)
+              ),
+              h(Input, {
+                id: "kanban-confirm-reason-input",
+                placeholder: "ระบุเหตุผลประกอบ (ไม่บังคับ)...",
+                value: ctrl.pendingConfirmAction.reason || "",
+                onChange: (e) => ctrl.setConfirmReason(e.target.value),
+                onKeyDown: (e) => {
+                  if (e.key === "Enter") {
+                    if (e.preventDefault) e.preventDefault();
+                    ctrl.confirmGovernanceAction();
+                  }
+                },
+              }),
+              h(
+                "div",
+                { style: { display: "flex", justifyContent: "flex-end", gap: "0.5rem", marginTop: "0.25rem" } },
+                h(Button, { variant: "secondary", onClick: ctrl.cancelConfirmAction }, "ยกเลิก"),
+                h(
+                  Button,
+                  {
+                    variant: "destructive",
+                    onClick: ctrl.confirmGovernanceAction,
+                    disabled: ctrl.governanceMutation.isPending,
+                  },
+                  ctrl.governanceMutation.isPending ? "กำลังดำเนินการ..." : "ยืนยันการดำเนินการ"
+                )
+              )
+            )
+          : null
+      )
     );
   }
 
@@ -1577,9 +1767,8 @@ export function renderMvcViewsJs(): string {
     if (!node) return "";
     const raw = String(node.label || "");
     if (node.kind === "file") {
-      const parts = raw.split("/");
-      const base = parts[parts.length - 1] || raw;
-      return parts.length > 1 ? base + " (" + parts.slice(0, -1).join("/") + ")" : base;
+      const parts = raw.split(/[\\\\/]/);
+      return parts[parts.length - 1] || raw;
     }
     if (node.kind === "session") {
       const task = String(node.currentTask || "").replace(/^ADR:\\s*|^Mistake:\\s*|^Insight:\\s*/i, "").trim();
@@ -1589,6 +1778,16 @@ export function renderMvcViewsJs(): string {
       return "เซสชัน #" + String(node.sessionId || "").slice(0, 6);
     }
     return raw.replace(/^ADR:\\s*|^Mistake:\\s*|^Insight:\\s*/i, "").trim();
+  }
+
+  function fullNodeTooltipLabel(node) {
+    if (!node) return "";
+    if (node.kind === "file") return "ไฟล์: " + String(node.label || "");
+    if (node.kind === "symbol") return "ฟังก์ชัน/คลาส: " + String(node.label || "");
+    if (node.kind === "session") {
+      return "เซสชัน #" + String(node.sessionId || "").slice(0, 8) + ": " + String(node.currentTask || node.label || "");
+    }
+    return String(node.label || "") + (node.summary ? " — " + String(node.summary).slice(0, 140) : "");
   }
 
   function KnowledgeGraphView({ projectRoot }) {
@@ -1774,11 +1973,106 @@ export function renderMvcViewsJs(): string {
             // Left Pane: Interactive SVG Graph
             h(
               "div",
-              { style: { minWidth: 0, position: "relative" } }, h("div", { id: "graph-zoom-hud", style: { position: "absolute", top: "10px", right: "10px", zIndex: 5, display: "flex", alignItems: "center", gap: "0.3rem", padding: "0.28rem 0.45rem", borderRadius: "0.55rem", background: "hsla(var(--card), 0.9)", border: "1px solid hsl(var(--border))", backdropFilter: "blur(6px)" } }, h(Button, { size: "sm", variant: "outline", onClick: ctrl.zoomOut, title: "ซูมออก" }, h(LucideIcon, { name: "minus", size: 12 })), h(Button, { size: "sm", variant: "outline", onClick: ctrl.resetZoom, title: "รีเซ็ตมุมมอง 100%" }, Math.round(ctrl.zoom * 100) + "%"), h(Button, { size: "sm", variant: "outline", onClick: ctrl.zoomIn, title: "ซูมเข้า" }, h(LucideIcon, { name: "plus", size: 12 })), h(Button, { size: "sm", variant: "default", onClick: () => ctrl.focusNode(), title: "ซูมโฟกัสจุดที่เลือก" }, h(LucideIcon, { name: "crosshair", size: 12 }), "ซูมดูจุดที่เลือก")),
+              { style: { minWidth: 0 } },
+              h(
+                "div",
+                {
+                  style: {
+                    display: "flex",
+                    justifyContent: "space-between",
+                    alignItems: "center",
+                    flexWrap: "wrap",
+                    gap: "0.45rem",
+                    marginBottom: "0.5rem",
+                    padding: "0.35rem 0.55rem",
+                    borderRadius: "var(--radius)",
+                    background: "hsl(var(--card))",
+                    border: "1px solid hsl(var(--border))",
+                  },
+                },
+                h(
+                  "span",
+                  { style: { fontSize: "0.75rem", color: "hsl(var(--muted-foreground))" } },
+                  "แสดง " +
+                    layout.nodes.length +
+                    " โหนดสำคัญ" +
+                    (layout.hiddenNodeCount > 0
+                      ? " (ซ่อนโหนดรอง " + layout.hiddenNodeCount + " รายการเพื่อความอ่านง่าย — ใช้ช่องค้นหาเพื่อเจาะจง)"
+                      : "")
+                ),
+                h(
+                  "div",
+                  {
+                    id: "graph-zoom-hud",
+                    style: {
+                      display: "flex",
+                      alignItems: "center",
+                      gap: "0.3rem",
+                      flexWrap: "wrap",
+                    },
+                  },
+                  h(Button, { size: "sm", variant: "outline", onClick: ctrl.zoomOut, title: "ซูมออก" }, h(LucideIcon, { name: "minus", size: 12 })),
+                  h(Button, { size: "sm", variant: "outline", onClick: ctrl.resetZoom, title: "รีเซ็ตมุมมอง 100%" }, Math.round(ctrl.zoom * 100) + "%"),
+                  h(Button, { size: "sm", variant: "outline", onClick: ctrl.zoomIn, title: "ซูมเข้า" }, h(LucideIcon, { name: "plus", size: 12 })),
+                  h(Button, { size: "sm", variant: "default", onClick: () => ctrl.focusNode(), title: "ซูมโฟกัสจุดที่เลือก" }, h(LucideIcon, { name: "crosshair", size: 12 }), "ซูมดูจุดที่เลือก")
+                )
+              ),
               h(
                 "svg",
                 {
-                  id: "knowledge-graph-canvas", viewBox: (() => { const vw = Math.round(layout.width / ctrl.zoom); const vh = Math.round(layout.height / ctrl.zoom); const vx = Math.round((layout.width - vw) / 2 + (ctrl.pan ? ctrl.pan.x : 0)); const vy = Math.round((layout.height - vh) / 2 + (ctrl.pan ? ctrl.pan.y : 0)); return vx + " " + vy + " " + vw + " " + vh; })(), onWheel: (ev) => { if (!ev.ctrlKey && !ev.metaKey) return; ev.preventDefault(); if (ev.deltaY < 0) ctrl.zoomIn(); else ctrl.zoomOut(); }, onMouseDown: (ev) => { if (ev.button !== 0) return; ctrl.dragRef.current = { startX: ev.clientX, startY: ev.clientY, panX: ctrl.pan ? ctrl.pan.x : 0, panY: ctrl.pan ? ctrl.pan.y : 0 }; }, onMouseMove: (ev) => { if (!ctrl.dragRef.current) return; const dx = (ev.clientX - ctrl.dragRef.current.startX) / ctrl.zoom; const dy = (ev.clientY - ctrl.dragRef.current.startY) / ctrl.zoom; ctrl.setPan({ x: Math.round(ctrl.dragRef.current.panX - dx), y: Math.round(ctrl.dragRef.current.panY - dy) }); }, onMouseUp: () => { ctrl.dragRef.current = null; }, onMouseLeave: () => { ctrl.dragRef.current = null; },
+                  id: "knowledge-graph-canvas",
+                  viewBox: (() => {
+                    const vw = Math.round(layout.width / ctrl.zoom);
+                    const vh = Math.round(layout.height / ctrl.zoom);
+                    const vx = Math.round((layout.width - vw) / 2 + (ctrl.pan ? ctrl.pan.x : 0));
+                    const vy = Math.round((layout.height - vh) / 2 + (ctrl.pan ? ctrl.pan.y : 0));
+                    return vx + " " + vy + " " + vw + " " + vh;
+                  })(),
+                  onWheel: (ev) => {
+                    if (!ev.ctrlKey && !ev.metaKey) return;
+                    ev.preventDefault();
+                    if (ev.deltaY < 0) ctrl.zoomIn();
+                    else ctrl.zoomOut();
+                  },
+                  onMouseDown: (ev) => {
+                    if (ev.button !== undefined && ev.button !== 0) return;
+                    ctrl.wasDraggingRef.current = false;
+                    ctrl.dragRef.current = {
+                      startX: Number(ev.clientX || 0),
+                      startY: Number(ev.clientY || 0),
+                      panX: ctrl.pan ? ctrl.pan.x : 0,
+                      panY: ctrl.pan ? ctrl.pan.y : 0,
+                      didDrag: false,
+                    };
+                  },
+                  onMouseMove: (ev) => {
+                    if (!ctrl.dragRef.current) {
+                      if (ctrl.hoveredNodeId && ev.target === ev.currentTarget) {
+                        ctrl.setHoveredNodeId(null);
+                      }
+                      return;
+                    }
+                    const rawDx = Number(ev.clientX || 0) - ctrl.dragRef.current.startX;
+                    const rawDy = Number(ev.clientY || 0) - ctrl.dragRef.current.startY;
+                    if (!ctrl.dragRef.current.didDrag && Math.hypot(rawDx, rawDy) < 4) {
+                      return;
+                    }
+                    ctrl.dragRef.current.didDrag = true;
+                    const dx = rawDx / ctrl.zoom;
+                    const dy = rawDy / ctrl.zoom;
+                    ctrl.setPan({
+                      x: Math.round(ctrl.dragRef.current.panX - dx),
+                      y: Math.round(ctrl.dragRef.current.panY - dy),
+                    });
+                  },
+                  onMouseUp: () => {
+                    ctrl.wasDraggingRef.current = Boolean(ctrl.dragRef.current && ctrl.dragRef.current.didDrag);
+                    ctrl.dragRef.current = null;
+                  },
+                  onMouseLeave: () => {
+                    ctrl.dragRef.current = null;
+                    ctrl.setHoveredNodeId(null);
+                  },
                   style: {
                     cursor: "grab", userSelect: "none", width: "100%",
                     height: layout.layoutMode === "flow" ? "540px" : "520px",
@@ -1876,152 +2170,231 @@ export function renderMvcViewsJs(): string {
                     const ty = t.y;
                     const c1x = Math.round(sx + (tx - sx) * 0.45);
                     const c2x = Math.round(sx + (tx - sx) * 0.55);
-                    const dFlow = "M " + sx + " " + sy + " C " + c1x + " " + sy + ", " + c2x + " " + ty + ", " + tx + " " + ty; if (isHi) { const isDirect = Boolean(selected && (e.source === selected.id || e.target === selected.id)); return h("g", { key: "edge-hi-" + i }, h("path", { d: dFlow, fill: "none", stroke: strokeColor, "stroke-width": isDirect ? "6.5" : "4.5", opacity: isDirect ? "0.24" : "0.14" }), h("path", { d: dFlow, fill: "none", stroke: strokeColor, "stroke-width": isDirect ? "3" : "2.2", opacity: "0.98" }), h("path", { d: dFlow, fill: "none", stroke: "#ffffff", "stroke-width": "1.2", "stroke-dasharray": "5 7", opacity: isDirect ? "0.7" : "0.4" })); } return h("path", {
+                    const dFlow = "M " + sx + " " + sy + " C " + c1x + " " + sy + ", " + c2x + " " + ty + ", " + tx + " " + ty; if (isHi) { const isDirect = Boolean(selected && (e.source === selected.id || e.target === selected.id)); return h("g", { key: "edge-hi-" + i }, h("path", { d: dFlow, fill: "none", stroke: strokeColor, "stroke-width": isDirect ? "6.5" : "4.5", opacity: isDirect ? "0.24" : "0.14" }), h("path", { d: dFlow, fill: "none", stroke: strokeColor, "stroke-width": isDirect ? "3" : "2.2", opacity: "0.98" }), h("path", { d: dFlow, fill: "none", stroke: "hsl(var(--foreground))", "stroke-width": "1.2", "stroke-dasharray": "5 7", opacity: isDirect ? "0.55" : "0.35" })); } return h("path", {
                       key: "edge-" + i,
                       d: "M " + sx + " " + sy + " C " + c1x + " " + sy + ", " + c2x + " " + ty + ", " + tx + " " + ty,
                       fill: "none",
                       stroke: isHi ? strokeColor : "hsl(var(--border))",
-                      "stroke-width": isHi ? "2.4" : "1.1",
-                      opacity: isHi ? "0.92" : "0.18",
+                      "stroke-width": isHi ? "2.4" : "1",
+                      opacity: isHi ? "0.92" : "0.08",
                     });
                   }
 
                   const mx = Math.round((s.x + t.x) / 2);
-                  const my = Math.round((s.y + t.y) / 2 - 18); const dOrb = "M " + s.x + " " + s.y + " Q " + mx + " " + my + " " + t.x + " " + t.y; if (isHi) { const isDirect = Boolean(selected && (e.source === selected.id || e.target === selected.id)); return h("g", { key: "edge-orb-hi-" + i }, h("path", { d: dOrb, fill: "none", stroke: strokeColor, "stroke-width": isDirect ? "6.5" : "4.5", opacity: isDirect ? "0.26" : "0.15" }), h("path", { d: dOrb, fill: "none", stroke: strokeColor, "stroke-width": isDirect ? "3" : "2.2", opacity: "0.98" }), h("path", { d: dOrb, fill: "none", stroke: "#ffffff", "stroke-width": "1.2", "stroke-dasharray": "5 7", opacity: isDirect ? "0.72" : "0.42" })); }
+                  const my = Math.round((s.y + t.y) / 2 - 18); const dOrb = "M " + s.x + " " + s.y + " Q " + mx + " " + my + " " + t.x + " " + t.y; if (isHi) { const isDirect = Boolean(selected && (e.source === selected.id || e.target === selected.id)); return h("g", { key: "edge-orb-hi-" + i }, h("path", { d: dOrb, fill: "none", stroke: strokeColor, "stroke-width": isDirect ? "6.5" : "4.5", opacity: isDirect ? "0.26" : "0.15" }), h("path", { d: dOrb, fill: "none", stroke: strokeColor, "stroke-width": isDirect ? "3" : "2.2", opacity: "0.98" }), h("path", { d: dOrb, fill: "none", stroke: "hsl(var(--foreground))", "stroke-width": "1.2", "stroke-dasharray": "5 7", opacity: isDirect ? "0.55" : "0.35" })); }
                   return h("path", {
                     key: "edge-" + i,
                     d: "M " + s.x + " " + s.y + " Q " + mx + " " + my + " " + t.x + " " + t.y,
                     fill: "none",
                     stroke: isHi ? strokeColor : "hsl(var(--border))",
-                    "stroke-width": isHi ? "2.3" : "1.1",
-                    opacity: isHi ? "0.9" : "0.16",
+                    "stroke-width": isHi ? "2.3" : "1",
+                    opacity: isHi ? "0.9" : "0.07",
                   });
                 }),
 
                 // Nodes (Readable Pill Cards in Flow Mode, Spotlight Nodes in Orbital Mode)
-                [...layout.nodes].sort((a, b) => (selected && a.id === selected.id ? 2 : hiSet.has(a.id) ? 1 : 0) - (selected && b.id === selected.id ? 2 : hiSet.has(b.id) ? 1 : 0)).map((n) => {
-                  const p = layout.positions.get(n.id);
-                  if (!p) return null;
-                  const color =
-                    n.kind === "session"
-                      ? "#38bdf8"
-                      : n.kind === "note"
-                        ? n.subkind === "adr"
-                          ? "#6366f1"
-                          : n.subkind === "mistake"
-                            ? "#ef4444"
-                            : "#10b981"
-                        : n.kind === "file"
-                          ? "#10b981"
-                          : "#f59e0b";
-                  const isSelected = Boolean(selected && selected.id === n.id);
-                  const isHi = hiSet.has(n.id);
-                  const shortText = shortNodeDisplayLabel(n);
+                (() => {
+                  const visibleNodeIds = new Set((layout.nodes || []).map((vn) => vn.id));
+                  const keepVisible = (arr, limit) =>
+                    (arr || []).filter((item) => item && item.id && visibleNodeIds.has(item.id)).slice(0, limit);
+                  const spotlightLabelIds = new Set();
+                  [
+                    ...keepVisible(story.relatedSessions, 2),
+                    ...keepVisible(story.relatedNotes, 3),
+                    ...keepVisible(story.relatedFiles, 3),
+                    ...keepVisible(story.relatedSymbols, 3),
+                  ]
+                    .slice(0, 10)
+                    .forEach((item) => {
+                      spotlightLabelIds.add(item.id);
+                    });
+                  const cx = layout.width / 2;
+                  const cy = layout.height / 2;
+                  return [...layout.nodes]
+                    .sort(
+                      (a, b) =>
+                        (selected && a.id === selected.id ? 2 : hiSet.has(a.id) ? 1 : 0) -
+                        (selected && b.id === selected.id ? 2 : hiSet.has(b.id) ? 1 : 0)
+                    )
+                    .map((n) => {
+                      const p = layout.positions.get(n.id);
+                      if (!p) return null;
+                      const color =
+                        n.kind === "session"
+                          ? "#38bdf8"
+                          : n.kind === "note"
+                            ? n.subkind === "adr"
+                              ? "#6366f1"
+                              : n.subkind === "mistake"
+                                ? "#ef4444"
+                                : "#10b981"
+                            : n.kind === "file"
+                              ? "#10b981"
+                              : "#f59e0b";
+                      const isSelected = Boolean(selected && selected.id === n.id);
+                      const isHi = hiSet.has(n.id);
+                      const isHovered = ctrl.hoveredNodeId === n.id;
+                      const shortText = shortNodeDisplayLabel(n);
+                      const tooltipText = fullNodeTooltipLabel(n);
 
-                  if (layout.layoutMode === "flow") {
-                    const boxW = 192;
-                    const boxH = 31;
-                    return h(
-                      "g",
-                      {
-                        key: n.id,
-                        style: { cursor: "pointer" },
-                        opacity: isHi ? "1" : "0.38",
-                        onClick: () => ctrl.setSelectedNodeId(n.id),
-                        onDblClick: () => {
-                          ctrl.setSelectedNodeId(n.id);
-                          ctrl.focusNode(n.id);
-                          if (n.kind === "note" && n.recordId && mc) mc.inspectNote(n.recordId);
-                        },
-                      },
-                      isSelected
-                        ? h("g", { key: "sel-flow-pin" }, h("rect", { x: p.x - boxW / 2 - 4, y: p.y - boxH / 2 - 4, width: boxW + 8, height: boxH + 8, rx: 10, fill: "none", stroke: "#f43f5e", "stroke-width": "2.2", "stroke-dasharray": "4 3" }), h("rect", { x: p.x + boxW / 2 - 66, y: p.y - boxH / 2 - 11, width: 64, height: 15, rx: 7, fill: "#f43f5e" }), h("text", { x: p.x + boxW / 2 - 34, y: p.y - boxH / 2 - 1, fill: "#ffffff", "font-size": "8.8", "font-weight": "700", "text-anchor": "middle" }, "● จุดที่เลือก"), h("rect", {
-                            x: p.x - boxW / 2 - 3,
-                            y: p.y - boxH / 2 - 3,
-                            width: boxW + 6,
-                            height: boxH + 6,
-                            rx: 10,
-                            fill: "none",
-                            stroke: color,
-                            "stroke-width": "2",
-                            opacity: "0.55",
-                          })) : null,
-                      h("rect", {
-                        x: p.x - boxW / 2,
-                        y: p.y - boxH / 2,
-                        width: boxW,
-                        height: boxH,
-                        rx: 8,
-                        fill: isSelected ? "hsl(var(--secondary))" : "hsl(var(--card))",
-                        stroke: isSelected || isHi ? color : "hsl(var(--border))",
-                        "stroke-width": isSelected ? "2" : isHi ? "1.4" : "1",
-                      }),
-                      h("circle", {
-                        cx: p.x - boxW / 2 + 13,
-                        cy: p.y,
-                        r: 4.5,
-                        fill: color,
-                      }),
-                      h(
-                        "text",
-                        {
-                          x: p.x - boxW / 2 + 24,
-                          y: p.y + 4,
-                          fill: "hsl(var(--foreground))",
-                          "font-size": "10.8",
-                          "font-weight": isSelected || isHi ? "600" : "500",
-                          "text-anchor": "start",
-                        },
-                        shortText.length > 23 ? shortText.slice(0, 22) + "…" : shortText
-                      )
-                    );
-                  }
-
-                  // Orbital Mode Node
-                  return h(
-                    "g",
-                    {
-                      key: n.id,
-                      style: { cursor: "pointer" },
-                      opacity: isHi ? "1" : "0.48",
-                      onClick: () => ctrl.setSelectedNodeId(n.id),
-                      onDblClick: () => {
-                        ctrl.setSelectedNodeId(n.id);
-                        ctrl.focusNode(n.id);
-                        if (n.kind === "note" && n.recordId && mc) mc.inspectNote(n.recordId);
-                      },
-                    },
-                    h("circle", { cx: p.x, cy: p.y, r: 20, fill: "transparent" }), isSelected ? h("circle", { cx: p.x, cy: p.y, r: 26, fill: "none", stroke: "#f43f5e", "stroke-width": "2.2", "stroke-dasharray": "4 3" }) : null, h("circle", {
-                      cx: p.x,
-                      cy: p.y,
-                      r: isSelected ? 20 : n.kind === "session" ? 16 : n.kind === "note" ? 14 : 10,
-                      fill: color,
-                      opacity: isSelected ? "0.35" : "0.18",
-                    }),
-                    h("circle", {
-                      cx: p.x,
-                      cy: p.y,
-                      r: isSelected ? 11 : n.kind === "session" ? 9 : n.kind === "note" ? 8 : 6,
-                      fill: color,
-                      stroke: isSelected ? "#fff" : "none",
-                      "stroke-width": isSelected ? "2" : "0",
-                    }),
-                    isSelected ? h("g", { key: "orb-pin-" + n.id }, h("rect", { x: p.x - 86, y: p.y - 42, width: 172, height: 20, rx: 10, fill: "#0f172a", stroke: "#f43f5e", "stroke-width": "1.6" }), h("text", { x: p.x, y: p.y - 28, fill: "#ffffff", "font-size": "10", "font-weight": "700", "text-anchor": "middle" }, "● จุดที่เลือก: " + shortText.slice(0, 18))) : null, (isHi || ctrl.zoom >= 1.35)
-                      ? h(
-                          "text",
+                      if (layout.layoutMode === "flow") {
+                        const boxW = 200;
+                        const boxH = 31;
+                        return h(
+                          "g",
                           {
-                            x: p.x,
-                            y: p.y + 21,
-                            fill: "hsl(var(--foreground))",
-                            "font-size": isSelected ? "11.5" : "10",
-                            "font-weight": isSelected ? "700" : "600",
-                            "text-anchor": "middle",
+                            key: n.id,
+                            "data-node-id": n.id,
+                            "data-highlighted": String(isHi),
+                            style: { cursor: "pointer" },
+                            opacity: isHi ? "1" : "0.34",
+                            onClick: () => ctrl.activateNode(n, mc ? mc.inspectNote : null),
                           },
-                          shortText.slice(0, 24)
-                        )
-                      : null
-                  );
-                })
+                          h("title", {}, tooltipText),
+                          isSelected
+                            ? h("g", { key: "sel-flow-pin" }, h("rect", { x: p.x - boxW / 2 - 4, y: p.y - boxH / 2 - 4, width: boxW + 8, height: boxH + 8, rx: 10, fill: "none", stroke: "#f43f5e", "stroke-width": "2.2", "stroke-dasharray": "4 3" }), h("rect", { x: p.x + boxW / 2 - 66, y: p.y - boxH / 2 - 11, width: 64, height: 15, rx: 7, fill: "#f43f5e" }), h("text", { x: p.x + boxW / 2 - 34, y: p.y - boxH / 2 - 1, fill: "#ffffff", "font-size": "8.8", "font-weight": "700", "text-anchor": "middle" }, "● จุดที่เลือก"), h("rect", {
+                                x: p.x - boxW / 2 - 3,
+                                y: p.y - boxH / 2 - 3,
+                                width: boxW + 6,
+                                height: boxH + 6,
+                                rx: 10,
+                                fill: "none",
+                                stroke: color,
+                                "stroke-width": "2",
+                                opacity: "0.55",
+                              })) : null,
+                          h("rect", {
+                            x: p.x - boxW / 2,
+                            y: p.y - boxH / 2,
+                            width: boxW,
+                            height: boxH,
+                            rx: 8,
+                            fill: isSelected ? "hsl(var(--secondary))" : "hsl(var(--card))",
+                            stroke: isSelected || isHi ? color : "hsl(var(--border))",
+                            "stroke-width": isSelected ? "2" : isHi ? "1.4" : "1",
+                          }),
+                          h("circle", {
+                            cx: p.x - boxW / 2 + 13,
+                            cy: p.y,
+                            r: 4.5,
+                            fill: color,
+                          }),
+                          h(
+                            "text",
+                            {
+                              x: p.x - boxW / 2 + 24,
+                              y: p.y + 4,
+                              fill: "hsl(var(--foreground))",
+                              "font-size": "10.2",
+                              "font-weight": isSelected || isHi ? "600" : "500",
+                              "text-anchor": "start",
+                            },
+                            shortText.length > 30 ? shortText.slice(0, 29) + "…" : shortText
+                          )
+                        );
+                      }
+
+                      // Orbital Mode Node (Spotlight + Hover Progressive Disclosure)
+                      const showOrbLabel = !isSelected && (spotlightLabelIds.has(n.id) || isHovered);
+                      const isLeft = p.x < cx - 24;
+                      const isRight = p.x > cx + 24;
+                      const labelX = isLeft ? p.x - 14 : isRight ? p.x + 14 : p.x;
+                      const labelY = isLeft || isRight ? p.y + 4 : p.y < cy ? p.y - 16 : p.y + 22;
+                      const labelAnchor = isLeft ? "end" : isRight ? "start" : "middle";
+                      const pinBelow = p.y < 50;
+                      const pinRectY = pinBelow ? p.y + 18 : p.y - 42;
+                      const pinTextY = pinBelow ? p.y + 32 : p.y - 28;
+
+                      return h(
+                        "g",
+                        {
+                          key: n.id,
+                          "data-node-id": n.id,
+                          "data-highlighted": String(isHi),
+                          style: { cursor: "pointer" },
+                          opacity: isHi || isHovered ? "1" : "0.24",
+                          onMouseEnter: () => ctrl.setHoveredNodeId(n.id),
+                          onMouseLeave: () =>
+                            ctrl.setHoveredNodeId((prev) => (prev === n.id ? null : prev)),
+                          onClick: () => ctrl.activateNode(n, mc ? mc.inspectNote : null),
+                        },
+                        h("title", {}, tooltipText),
+                        h("circle", { cx: p.x, cy: p.y, r: 20, fill: "transparent" }),
+                        isSelected
+                          ? h("circle", {
+                              cx: p.x,
+                              cy: p.y,
+                              r: 26,
+                              fill: "none",
+                              stroke: "#f43f5e",
+                              "stroke-width": "2.2",
+                              "stroke-dasharray": "4 3",
+                            })
+                          : null,
+                        h("circle", {
+                          cx: p.x,
+                          cy: p.y,
+                          r: isSelected ? 20 : n.kind === "session" ? 15 : n.kind === "note" ? 13 : 9,
+                          fill: color,
+                          opacity: isSelected ? "0.35" : isHi ? "0.22" : "0.14",
+                        }),
+                        h("circle", {
+                          cx: p.x,
+                          cy: p.y,
+                          r: isSelected ? 11 : n.kind === "session" ? 8.5 : n.kind === "note" ? 7.5 : 5.5,
+                          fill: color,
+                          stroke: isSelected || isHovered ? "hsl(var(--foreground))" : "none",
+                          "stroke-width": isSelected ? "2" : isHovered ? "1.5" : "0",
+                        }),
+                        isSelected
+                          ? h(
+                              "g",
+                              { key: "orb-pin-" + n.id },
+                              h("rect", {
+                                x: Math.max(4, Math.min(layout.width - 196, p.x - 96)),
+                                y: pinRectY,
+                                width: 192,
+                                height: 21,
+                                rx: 10.5,
+                                fill: "#0f172a",
+                                stroke: "#f43f5e",
+                                "stroke-width": "1.6",
+                              }),
+                              h(
+                                "text",
+                                {
+                                  x: Math.max(100, Math.min(layout.width - 100, p.x)),
+                                  y: pinTextY,
+                                  fill: "#ffffff",
+                                  "font-size": "10",
+                                  "font-weight": "700",
+                                  "text-anchor": "middle",
+                                },
+                                "● จุดที่เลือก: " + shortText.slice(0, 22)
+                              )
+                            )
+                          : null,
+                        showOrbLabel
+                          ? h(
+                              "text",
+                              {
+                                x: labelX,
+                                y: labelY,
+                                fill: "hsl(var(--foreground))",
+                                "font-size": isHovered ? "11" : "10",
+                                "font-weight": isHovered ? "700" : "600",
+                                "text-anchor": labelAnchor,
+                                stroke: "hsl(var(--background))",
+                                "stroke-width": "3.5",
+                                "stroke-linejoin": "round",
+                                "paint-order": "stroke",
+                              },
+                              shortText.length > 26 ? shortText.slice(0, 25) + "…" : shortText
+                            )
+                          : null
+                      );
+                    });
+                })()
               ),
               h(
                 "div",
@@ -2495,15 +2868,84 @@ export function renderMvcViewsJs(): string {
           ),
           h(
             "div",
-            { style: { display: "flex", gap: "0.5rem", marginBottom: "0.6rem" } },
-            h(Input, {
+            {
+              style: {
+                display: "flex",
+                justifyContent: "space-between",
+                alignItems: "center",
+                gap: "0.5rem",
+                flexWrap: "wrap",
+                marginBottom: "0.5rem",
+              },
+            },
+            h(
+              "div",
+              { style: { display: "flex", gap: "0.35rem", flexWrap: "wrap", alignItems: "center" } },
+              h(
+                "span",
+                { style: { fontSize: "0.73rem", color: "hsl(var(--muted-foreground))" } },
+                "แม่แบบ:"
+              ),
+              h(
+                Button,
+                { variant: "outline", size: "sm", onClick: () => ctrl.setChatInput("บันทึก ADR: ") },
+                "+ ADR"
+              ),
+              h(
+                Button,
+                { variant: "outline", size: "sm", onClick: () => ctrl.setChatInput("บันทึก Insight: ") },
+                "+ Insight"
+              ),
+              h(
+                Button,
+                { variant: "outline", size: "sm", onClick: () => ctrl.setChatInput("บันทึก Mistake: ") },
+                "+ Mistake"
+              ),
+              h(
+                Button,
+                { variant: "outline", size: "sm", onClick: () => ctrl.setChatInput("ค้นหา ") },
+                "ค้นหา"
+              )
+            ),
+            h(
+              "label",
+              {
+                style: {
+                  display: "inline-flex",
+                  alignItems: "center",
+                  gap: "0.38rem",
+                  fontSize: "0.74rem",
+                  color: "hsl(var(--muted-foreground))",
+                  cursor: "pointer",
+                  userSelect: "none",
+                },
+              },
+              h("input", {
+                id: "curator-dry-run-toggle",
+                type: "checkbox",
+                checked: !ctrl.autoExecute,
+                onChange: (e) => ctrl.setAutoExecute(!e.target.checked),
+              }),
+              "โหมดจำลองก่อนเขียนจริง (Dry-Run)"
+            )
+          ),
+          h(
+            "div",
+            { style: { display: "flex", gap: "0.5rem", marginBottom: "0.6rem", alignItems: "flex-end" } },
+            h(Textarea, {
               id: "curator-chat-input",
-              placeholder: "พิมพ์คำสั่ง เช่น 'ช่วยตรวจสุขภาพความจำ', 'อนุมัติ candidate ทั้งหมด'...",
+              rows: 2,
+              placeholder:
+                "พิมพ์คำสั่งหรือคำถาม เช่น 'มีรายการรออนุมัติกี่อัน?', 'บันทึก ADR เรื่อง ...' (Enter ส่ง • Shift+Enter ขึ้นบรรทัดใหม่)",
               value: ctrl.chatInput,
               onChange: (e) => ctrl.setChatInput(e.target.value),
               onKeyDown: (e) => {
-                if (e.key === "Enter") ctrl.sendMessage();
+                if (e.key === "Enter" && !e.shiftKey) {
+                  if (e.preventDefault) e.preventDefault();
+                  ctrl.sendMessage();
+                }
               },
+              style: { minHeight: "54px", resize: "vertical" },
             }),
             h(
               Button,
@@ -2605,7 +3047,34 @@ export function renderMvcViewsJs(): string {
                   h(
                     AlertDescription,
                     {},
-                    "รายการหลัก: " + g.keeperRecordId + " | ซ้ำ: " + (g.duplicateRecordIds || []).join(", ")
+                    h(
+                      "div",
+                      { style: { display: "flex", flexWrap: "wrap", alignItems: "center", gap: "0.35rem", marginTop: "0.2rem" } },
+                      h("span", {}, "รายการหลัก:"),
+                      h(
+                        Button,
+                        {
+                          variant: "outline",
+                          size: "sm",
+                          onClick: () => mc && mc.inspectNote(g.keeperRecordId),
+                        },
+                        h(LucideIcon, { name: "file-text", size: 11 }),
+                        String(g.keeperRecordId || "").slice(0, 14)
+                      ),
+                      h("span", {}, "| ซ้ำ:"),
+                      (g.duplicateRecordIds || []).map((dupId) =>
+                        h(
+                          Button,
+                          {
+                            key: dupId,
+                            variant: "secondary",
+                            size: "sm",
+                            onClick: () => mc && mc.inspectNote(dupId),
+                          },
+                          String(dupId || "").slice(0, 14)
+                        )
+                      )
+                    )
                   )
                 )
               )
@@ -2619,7 +3088,28 @@ export function renderMvcViewsJs(): string {
   // --------------------------------------------------------------------------
   function McpConsoleView({ projectRoot }) {
     const mc = MissionControlController.useMissionControl();
-    const ctrl = McpConsoleController.useController(projectRoot, mc ? mc.notify : null);
+    const ctrl = McpConsoleController.useController(projectRoot, mc ? mc.notify : null, MCP_TOOLS_LIST);
+    const annotations = (ctrl.currentToolMeta && ctrl.currentToolMeta.annotations) || {};
+    const isReadOnly = annotations.readOnlyHint === true;
+    const isDestructive = annotations.destructiveHint === true;
+    const safetyLabel = isReadOnly
+      ? "Read-Only (อ่านอย่างเดียว)"
+      : isDestructive
+        ? "Destructive (ลบ/ถอนคืนข้อมูล)"
+        : "Mutating (แก้ไขคลังความจำ)";
+    const safetyVariant = isReadOnly ? "success" : isDestructive ? "destructive" : "warning";
+    const schemaProps =
+      (ctrl.currentToolMeta &&
+        ctrl.currentToolMeta.inputSchema &&
+        ctrl.currentToolMeta.inputSchema.properties) ||
+      {};
+    const requiredSet = new Set(
+      (ctrl.currentToolMeta &&
+        ctrl.currentToolMeta.inputSchema &&
+        ctrl.currentToolMeta.inputSchema.required) ||
+        []
+    );
+    const paramKeys = Object.keys(schemaProps);
 
     return h(
       "div",
@@ -2631,12 +3121,17 @@ export function renderMvcViewsJs(): string {
           CardHeader,
           {},
           h(
-            CardTitle,
-            {},
-            h(LucideIcon, { name: "wrench", size: 17, color: "#6366f1" }),
-            "ทดสอบคำสั่ง MCP (34 V2 Tools)"
+            "div",
+            { style: { display: "flex", justifyContent: "space-between", alignItems: "center", gap: "0.5rem", flexWrap: "wrap" } },
+            h(
+              CardTitle,
+              {},
+              h(LucideIcon, { name: "wrench", size: 17, color: "#6366f1" }),
+              "ทดสอบคำสั่ง MCP (34 V2 Tools)"
+            ),
+            h(Badge, { variant: safetyVariant }, safetyLabel)
           ),
-          h(CardDescription, {}, "เลือกเครื่องมือและส่งพารามิเตอร์ JSON เพื่อทดสอบการทำงาน")
+          h(CardDescription, {}, "เลือกเครื่องมือ ระบบจะสร้าง JSON Template ตาม Schema ให้อัตโนมัติ")
         ),
         h(
           CardContent,
@@ -2655,6 +3150,33 @@ export function renderMvcViewsJs(): string {
                 h("option", { key: t.name, value: t.name }, t.name + " — " + t.description)
               )
             ),
+            paramKeys.length > 0
+              ? h(
+                  "div",
+                  { style: { display: "flex", flexWrap: "wrap", gap: "0.28rem", alignItems: "center" } },
+                  h(
+                    "span",
+                    { style: { fontSize: "0.72rem", color: "hsl(var(--muted-foreground))" } },
+                    "คลิกเพิ่มพารามิเตอร์:"
+                  ),
+                  paramKeys.map((pk) =>
+                    h(
+                      "button",
+                      {
+                        key: pk,
+                        type: "button",
+                        className:
+                          "sh-badge " +
+                          (requiredSet.has(pk) ? "sh-badge-default" : "sh-badge-outline"),
+                        style: { cursor: "pointer" },
+                        title: String((schemaProps[pk] && schemaProps[pk].description) || pk),
+                        onClick: () => ctrl.insertParam && ctrl.insertParam(pk),
+                      },
+                      pk + (requiredSet.has(pk) ? " *" : "")
+                    )
+                  )
+                )
+              : null,
             h(Textarea, {
               id: "mcp-tool-args",
               rows: 6,
@@ -2663,10 +3185,24 @@ export function renderMvcViewsJs(): string {
               style: { fontFamily: "monospace" },
             }),
             h(
-              Button,
-              { variant: "default", onClick: ctrl.executeTool, disabled: ctrl.invokeMutation.isPending },
-              h(LucideIcon, { name: "play", size: 13 }),
-              ctrl.invokeMutation.isPending ? "กำลังรัน..." : "รันคำสั่ง (Execute)"
+              "div",
+              { style: { display: "flex", gap: "0.5rem", flexWrap: "wrap" } },
+              h(
+                Button,
+                {
+                  variant: isDestructive ? "destructive" : "default",
+                  onClick: () => ctrl.executeTool(false),
+                  disabled: ctrl.invokeMutation.isPending,
+                },
+                h(LucideIcon, { name: "play", size: 13 }),
+                ctrl.invokeMutation.isPending ? "กำลังรัน..." : "รันคำสั่ง (Execute)"
+              ),
+              h(
+                Button,
+                { variant: "outline", onClick: ctrl.resetTemplate },
+                h(LucideIcon, { name: "refresh-cw", size: 13 }),
+                "รีเซ็ต Template"
+              )
             )
           )
         )
@@ -2678,10 +3214,29 @@ export function renderMvcViewsJs(): string {
           CardHeader,
           {},
           h(
-            CardTitle,
-            {},
-            h(LucideIcon, { name: "terminal", size: 17, color: "#10b981" }),
-            "ผลลัพธ์ (Response Output)"
+            "div",
+            { style: { display: "flex", justifyContent: "space-between", alignItems: "center", gap: "0.5rem" } },
+            h(
+              CardTitle,
+              {},
+              h(LucideIcon, { name: "terminal", size: 17, color: "#10b981" }),
+              "ผลลัพธ์ (Response Output)"
+            ),
+            h(
+              Button,
+              {
+                variant: "outline",
+                size: "sm",
+                onClick: async () => {
+                  if (typeof navigator !== "undefined" && navigator.clipboard && navigator.clipboard.writeText) {
+                    await navigator.clipboard.writeText(String(ctrl.output || ""));
+                    if (mc && mc.notify) mc.notify("คัดลอกผลลัพธ์ JSON แล้ว", "success");
+                  }
+                },
+              },
+              h(LucideIcon, { name: "copy", size: 12 }),
+              "คัดลอก JSON"
+            )
           ),
           h(CardDescription, {}, "ข้อมูล JSON ที่ส่งกลับจากคลังความจำ V2")
         ),
@@ -2705,6 +3260,46 @@ export function renderMvcViewsJs(): string {
             ctrl.output
           )
         )
+      ),
+      h(
+        Dialog,
+        {
+          open: Boolean(ctrl.pendingDestructiveArgs),
+          onOpenChange: (open) => {
+            if (!open) ctrl.cancelDestructiveExecution();
+          },
+        },
+        ctrl.pendingDestructiveArgs
+          ? h(
+              "div",
+              { style: { display: "flex", flexDirection: "column", gap: "0.85rem" } },
+              h(
+                "div",
+                { style: { display: "flex", alignItems: "center", gap: "0.5rem" } },
+                h(LucideIcon, { name: "alert-triangle", size: 18, color: "#ef4444" }),
+                h(
+                  "h3",
+                  { style: { margin: 0, fontSize: "1rem", fontWeight: 700 } },
+                  "ยืนยันรันคำสั่งที่มีผลลบ/ถอนคืนข้อมูล (" + ctrl.selectedTool + ")"
+                )
+              ),
+              h(
+                "p",
+                { style: { margin: 0, fontSize: "0.84rem", color: "hsl(var(--muted-foreground))" } },
+                "คำสั่งนี้ถูกทำเครื่องหมายเป็น Destructive กรุณาตรวจสอบ JSON Arguments ก่อนยืนยัน"
+              ),
+              h(
+                "div",
+                { style: { display: "flex", justifyContent: "flex-end", gap: "0.5rem" } },
+                h(Button, { variant: "secondary", onClick: ctrl.cancelDestructiveExecution }, "ยกเลิก"),
+                h(
+                  Button,
+                  { variant: "destructive", onClick: ctrl.confirmDestructiveExecution },
+                  "ยืนยันรันคำสั่ง"
+                )
+              )
+            )
+          : null
       )
     );
   }
@@ -2787,8 +3382,8 @@ export function renderMvcViewsJs(): string {
                 padding: "0.06rem 0.45rem",
                 margin: "0 0.12rem",
                 borderRadius: "9999px",
-                border: "1px solid hsla(var(--primary), 0.45)",
-                background: "hsla(var(--primary), 0.14)",
+                border: "1px solid hsl(var(--primary) / 0.45)",
+                background: "hsl(var(--primary) / 0.14)",
                 color: "hsl(var(--foreground))",
                 fontSize: "0.76rem",
                 fontWeight: 600,
@@ -2922,6 +3517,9 @@ export function renderMvcViewsJs(): string {
   function MissionControlShellView({ defaultProjectRoot }) {
     const mc = MissionControlController.useController(defaultProjectRoot);
     const [showRawJson, setShowRawJson] = useState(false);
+    useEffect(() => {
+      setShowRawJson(false);
+    }, [mc.inspectedRecordId]);
     const projects = (mc.projectsQuery.data && mc.projectsQuery.data.projects) || [];
     const inspectedNote = mc.noteDetailQuery.data && mc.noteDetailQuery.data.note;
 
@@ -3059,7 +3657,15 @@ export function renderMvcViewsJs(): string {
                         p.name + " (" + p.mode + ")"
                       )
                     )
-              )
+              ),
+              mc.overviewQuery && mc.overviewQuery.isFetching
+                ? h(
+                    Badge,
+                    { variant: "secondary" },
+                    h(LucideIcon, { name: "refresh-cw", size: 11 }),
+                    "กำลังซิงก์ข้อมูล..."
+                  )
+                : null
             ),
             h(
               "div",
@@ -3101,22 +3707,6 @@ export function renderMvcViewsJs(): string {
               )
             )
           ),
-          mc.toastMessage
-            ? h(
-                "div",
-                {
-                  style: {
-                    margin: "0.75rem 1.75rem 0",
-                    padding: "0.6rem 1rem",
-                    borderRadius: "var(--radius)",
-                    background: "hsla(var(--primary), 0.14)",
-                    border: "1px solid hsla(var(--primary), 0.35)",
-                    fontSize: "0.81rem",
-                  },
-                },
-                mc.toastMessage.text
-              )
-            : null,
           h(
             "main",
             { className: "pm-content" },
@@ -3135,7 +3725,39 @@ export function renderMvcViewsJs(): string {
             mc.activeTab === "mcp"
               ? h("pm-mcp-console", { "project-root": mc.currentProject })
               : null
-          )
+          ),
+          mc.toastMessage
+            ? h(
+                "div",
+                {
+                  role: "status",
+                  "aria-live": "polite",
+                  className:
+                    "pm-toast-floating" +
+                    (mc.toastMessage.tone === "error" ? " sh-alert-destructive" : ""),
+                },
+                h(
+                  "div",
+                  { style: { display: "flex", alignItems: "center", gap: "0.5rem" } },
+                  h(LucideIcon, {
+                    name:
+                      mc.toastMessage.tone === "error"
+                        ? "alert-triangle"
+                        : mc.toastMessage.tone === "warning"
+                          ? "clock"
+                          : "check-circle-2",
+                    size: 15,
+                    color:
+                      mc.toastMessage.tone === "error"
+                        ? "#ef4444"
+                        : mc.toastMessage.tone === "warning"
+                          ? "#f59e0b"
+                          : "#10b981",
+                  }),
+                  h("span", {}, mc.toastMessage.text)
+                )
+              )
+            : null
         ),
         h(
           Dialog,
@@ -3156,9 +3778,22 @@ export function renderMvcViewsJs(): string {
               "ปิดหน้าต่าง"
             )
           ),
-          !inspectedNote
-            ? h("div", { style: { padding: "1rem", fontSize: "0.85rem" } }, "กำลังโหลดข้อมูลความจำ...")
-            : h(
+          mc.noteDetailQuery && mc.noteDetailQuery.isError
+            ? h(
+                Alert,
+                { variant: "destructive" },
+                h(LucideIcon, { name: "alert-triangle", size: 15 }),
+                "ไม่พบข้อมูลความจำที่ระบุ หรือรายการนี้อาจถูกยกเลิก/ยุบรวมไปแล้ว (" +
+                  String(
+                    mc.noteDetailQuery.error && mc.noteDetailQuery.error.message
+                      ? mc.noteDetailQuery.error.message
+                      : "404"
+                  ) +
+                  ")"
+              )
+            : !inspectedNote
+              ? h("div", { style: { padding: "1rem", fontSize: "0.85rem" } }, "กำลังโหลดข้อมูลความจำ...")
+              : h(
                 "div",
                 { style: { display: "flex", flexDirection: "column", gap: "0.85rem" } },
                 h(
@@ -3188,49 +3823,180 @@ export function renderMvcViewsJs(): string {
                         h(LucideIcon, { name: "share-2", size: 12 }),
                         "ดูความเชื่อมโยงในกราฟ"
                       )
-                    : null
-                ),
-                h(
-                  "h2",
-                  { style: { margin: 0, fontSize: "1.15rem", fontWeight: 700, lineHeight: 1.35 } },
-                  inspectedNote.title || inspectedNote.recordId
-                ),
-                h(
-                  "div",
-                  {
-                    style: {
-                      padding: "0.85rem 1rem",
-                      borderRadius: "var(--radius)",
-                      background: "hsla(var(--primary), 0.1)",
-                      border: "1px solid hsla(var(--primary), 0.3)",
+                    : null,
+                  inspectedNote.recordId
+                    ? h(
+                        Button,
+                        {
+                          variant: "outline",
+                          size: "sm",
+                          onClick: async () => {
+                            if (
+                              typeof navigator !== "undefined" &&
+                              navigator.clipboard &&
+                              navigator.clipboard.writeText
+                            ) {
+                              await navigator.clipboard.writeText(String(inspectedNote.recordId));
+                              if (mc && mc.notify) {
+                                mc.notify("คัดลอก Record ID แล้ว: " + inspectedNote.recordId, "success");
+                              }
+                            }
+                          },
+                        },
+                        h(LucideIcon, { name: "copy", size: 12 }),
+                        "คัดลอก ID"
+                      )
+                    : null,
+                  h(
+                    Button,
+                    {
+                      variant: "outline",
+                      size: "sm",
+                      onClick: async () => {
+                        const rawMd =
+                          (typeof inspectedNote.body === "string" && inspectedNote.body.trim()) ||
+                          (typeof inspectedNote.content === "string" && inspectedNote.content.trim()) ||
+                          "# " +
+                            (inspectedNote.title || inspectedNote.recordId || "") +
+                            "\\n\\n" +
+                            (inspectedNote.summary || "");
+                        if (
+                          typeof navigator !== "undefined" &&
+                          navigator.clipboard &&
+                          navigator.clipboard.writeText
+                        ) {
+                          await navigator.clipboard.writeText(rawMd);
+                          if (mc && mc.notify) mc.notify("คัดลอกเนื้อหา Markdown แล้ว", "success");
+                        }
+                      },
                     },
-                  },
-                  h(
-                    "div",
-                    { style: { display: "inline-flex", alignItems: "center", gap: "0.35rem", fontSize: "0.75rem", fontWeight: 700, color: "hsl(var(--primary))", marginBottom: "0.25rem" } },
-                    h(LucideIcon, { name: "sparkles", size: 13, color: "#f59e0b" }),
-                    "สรุปใจความสำคัญ (Key Takeaway)"
-                  ),
-                  h(
-                    "div",
-                    { style: { fontSize: "0.86rem", lineHeight: 1.6 } },
-                    renderSafeInlineMarkdown(inspectedNote.summary || inspectedNote.text || inspectedNote.title, mc)
+                    h(LucideIcon, { name: "copy", size: 12 }),
+                    "คัดลอก Markdown"
                   )
                 ),
-                inspectedNote.body || inspectedNote.content
-                  ? h(
+                (() => {
+                  const modalBodyText =
+                    typeof inspectedNote.body === "string" && inspectedNote.body.trim()
+                      ? inspectedNote.body
+                      : typeof inspectedNote.content === "string"
+                        ? inspectedNote.content
+                        : inspectedNote.content &&
+                            typeof inspectedNote.content === "object" &&
+                            typeof inspectedNote.content.body === "string"
+                          ? inspectedNote.content.body
+                          : "";
+                  const headingMatch = modalBodyText ? /^\\s*#\\s+(.+)$/m.exec(modalBodyText) : null;
+                  const rawH1 = headingMatch ? headingMatch[1].trim() : "";
+                  const isGenericH1 = /^(?:context|summary|problem|root causes?(?:\\s*&\\s*(?:fix|prevention))?|fix|prevention|overview)$/i.test(
+                    rawH1
+                  );
+                  const cleanH1 = rawH1 && !isGenericH1 ? rawH1 : "";
+                  const summaryLine = String(inspectedNote.summary || inspectedNote.text || "")
+                    .split("\\n")[0]
+                    .replace(/^(?:ADR|Insight|Mistake):\\s*/i, "")
+                    .trim()
+                    .slice(0, 90);
+                  const modalTitle =
+                    inspectedNote.title || cleanH1 || summaryLine || inspectedNote.recordId;
+                  const modalFiles = Array.isArray(inspectedNote.filePaths) ? inspectedNote.filePaths : [];
+                  const modalSymbols = Array.isArray(inspectedNote.symbols) ? inspectedNote.symbols : [];
+                  return h(
+                    "div",
+                    { style: { display: "flex", flexDirection: "column", gap: "0.75rem" } },
+                    h(
+                      "h2",
+                      { style: { margin: 0, fontSize: "1.15rem", fontWeight: 700, lineHeight: 1.35 } },
+                      modalTitle
+                    ),
+                    h(
                       "div",
                       {
                         style: {
-                          padding: "0.95rem 1.05rem",
+                          padding: "0.85rem 1rem",
                           borderRadius: "var(--radius)",
-                          background: "hsl(var(--background))",
-                          border: "1px solid hsl(var(--border))",
+                          background: "hsl(var(--primary) / 0.1)",
+                          border: "1px solid hsl(var(--primary) / 0.3)",
                         },
                       },
-                      renderHumanMarkdownBlocks(inspectedNote.body || inspectedNote.content, mc)
-                    )
-                  : null,
+                      h(
+                        "div",
+                        { style: { display: "inline-flex", alignItems: "center", gap: "0.35rem", fontSize: "0.75rem", fontWeight: 700, color: "hsl(var(--primary))", marginBottom: "0.25rem" } },
+                        h(LucideIcon, { name: "sparkles", size: 13, color: "#f59e0b" }),
+                        "สรุปใจความสำคัญ (Key Takeaway)"
+                      ),
+                      h(
+                        "div",
+                        { style: { fontSize: "0.86rem", lineHeight: 1.6 } },
+                        renderSafeInlineMarkdown(inspectedNote.summary || inspectedNote.text || modalTitle, mc)
+                      )
+                    ),
+                    modalBodyText
+                      ? h(
+                          "div",
+                          {
+                            style: {
+                              padding: "0.95rem 1.05rem",
+                              borderRadius: "var(--radius)",
+                              background: "hsl(var(--background))",
+                              border: "1px solid hsl(var(--border))",
+                            },
+                          },
+                          renderHumanMarkdownBlocks(modalBodyText, mc)
+                        )
+                      : null,
+                    modalFiles.length > 0 || modalSymbols.length > 0
+                      ? h(
+                          "div",
+                          {
+                            style: {
+                              display: "flex",
+                              flexDirection: "column",
+                              gap: "0.4rem",
+                              padding: "0.75rem 0.95rem",
+                              borderRadius: "var(--radius)",
+                              background: "hsl(var(--card))",
+                              border: "1px solid hsl(var(--border))",
+                            },
+                          },
+                          h(
+                            "div",
+                            { style: { fontSize: "0.75rem", fontWeight: 700, color: "hsl(var(--muted-foreground))" } },
+                            "ไฟล์และสัญลักษณ์ที่เกี่ยวข้อง (" + modalFiles.length + " ไฟล์, " + modalSymbols.length + " สัญลักษณ์)"
+                          ),
+                          h(
+                            "div",
+                            { style: { display: "flex", flexWrap: "wrap", gap: "0.28rem" } },
+                            modalFiles.map((fp) =>
+                              h(
+                                Badge,
+                                {
+                                  key: "m-fp-" + fp,
+                                  variant: "outline",
+                                  style: { cursor: "pointer" },
+                                  onClick: () => mc.openInGraph({ filePath: fp }),
+                                },
+                                h(LucideIcon, { name: "file-text", size: 11 }),
+                                fp
+                              )
+                            ),
+                            modalSymbols.map((sym) =>
+                              h(
+                                Badge,
+                                {
+                                  key: "m-sym-" + sym,
+                                  variant: "secondary",
+                                  style: { cursor: "pointer" },
+                                  onClick: () => mc.openInGraph({ symbol: sym }),
+                                },
+                                h(LucideIcon, { name: "code-2", size: 11 }),
+                                sym
+                              )
+                            )
+                          )
+                        )
+                      : null
+                  );
+                })(),
                 h(
                   "div",
                   { style: { display: "flex", justifyContent: "space-between", alignItems: "center", paddingTop: "0.35rem" } },
@@ -3353,6 +4119,7 @@ export function renderWebComponentsJs(): string {
       constructor() {
         super();
         this._root = null;
+        this._attrScheduled = false;
       }
       connectedCallback() {
         if (!this._root) {
@@ -3360,9 +4127,16 @@ export function renderWebComponentsJs(): string {
         }
         this._renderReact();
       }
-      attributeChangedCallback() {
-        if (this._root) {
-          this._renderReact();
+      attributeChangedCallback(_name, oldVal, newVal) {
+        if (oldVal === newVal) return;
+        if (this._root && !this._attrScheduled) {
+          this._attrScheduled = true;
+          queueMicrotask(() => {
+            this._attrScheduled = false;
+            if (this.isConnected && this._root) {
+              this._renderReact();
+            }
+          });
         }
       }
       disconnectedCallback() {
@@ -3456,12 +4230,12 @@ export function renderMvcIndexHtml(defaultProjectRoot: string, csrfToken = ""): 
   <pm-mission-control default-project="${escapeHtml(defaultProjectRoot)}"></pm-mission-control>
 
   <!-- Modular MVC + React + TanStack + shadcn/ui + Web Components Bundle -->
-  <script src="/mvc/vendor.js"></script>
-  <script src="/mvc/models.js"></script>
-  <script src="/mvc/controllers.js"></script>
-  <script src="/mvc/shadcn-ui.js"></script>
-  <script src="/mvc/views.js"></script>
-  <script src="/mvc/web-components.js"></script>
+  <script defer src="/mvc/vendor.js"></script>
+  <script defer src="/mvc/models.js"></script>
+  <script defer src="/mvc/controllers.js"></script>
+  <script defer src="/mvc/shadcn-ui.js"></script>
+  <script defer src="/mvc/views.js"></script>
+  <script defer src="/mvc/web-components.js"></script>
 </body>
 </html>`;
 }

@@ -43,7 +43,12 @@ export class WebUiMvcController {
     foundation: V2Foundation,
     filters: { query?: string; status?: string; kind?: string },
   ) {
-    let items = await MemoryNoteModel.listEnrichedNotes(foundation, filters.query, 100);
+    let items = await MemoryNoteModel.listEnrichedNotes(
+      foundation,
+      filters.query,
+      100,
+      projectRoot,
+    );
     if (filters.status) {
       items = items.filter((i) => i.status === filters.status);
     }
@@ -58,7 +63,16 @@ export class WebUiMvcController {
   }
 
   static async getNoteDetail(projectRoot: string, foundation: V2Foundation, noteId: string) {
-    const note = await MemoryNoteModel.getNoteById(foundation, noteId);
+    const note = await MemoryNoteModel.getNoteById(foundation, noteId, projectRoot);
+    if (!note) {
+      return {
+        ok: false,
+        error: "NOTE_NOT_FOUND",
+        message: "ไม่พบข้อมูลความจำที่ระบุ",
+        projectRoot,
+        note: null,
+      };
+    }
     return {
       ok: true,
       projectRoot,
@@ -256,8 +270,8 @@ export function renderMvcControllersJs(): string {
     };
   }
 
-  function writeDeepLinkHash(state, defaultProjectRoot) {
-    if (typeof window === "undefined" || !window.history || !window.history.replaceState) return;
+  function writeDeepLinkHash(state, defaultProjectRoot, push = false) {
+    if (typeof window === "undefined" || !window.history) return;
     const tab = VALID_TABS.has(state.tab) ? state.tab : "overview";
     const params = new URLSearchParams();
     if (state.project && state.project !== defaultProjectRoot) params.set("project", state.project);
@@ -271,9 +285,47 @@ export function renderMvcControllersJs(): string {
     const nextHash = "#" + tab + (qs ? "?" + qs : "");
     if (window.location.hash !== nextHash) {
       try {
-        window.history.replaceState(null, "", nextHash);
+        if (push && typeof window.history.pushState === "function") {
+          window.history.pushState(null, "", nextHash);
+        } else if (typeof window.history.replaceState === "function") {
+          window.history.replaceState(null, "", nextHash);
+        }
       } catch (_e) {}
     }
+  }
+
+  function useDebouncedValue(value, delayMs = 250) {
+    const [debounced, setDebounced] = useState(value);
+    useEffect(() => {
+      if (Object.is(debounced, value)) return;
+      const timer = setTimeout(() => {
+        setDebounced(value);
+      }, delayMs);
+      return () => clearTimeout(timer);
+    }, [value, delayMs]);
+    return debounced;
+  }
+
+  function invalidateProjectQueries(queryClient, projectRoot) {
+    if (!projectRoot) {
+      queryClient.invalidateQueries({ queryKey: ["pm-v2"] });
+      return;
+    }
+    queryClient.invalidateQueries({ queryKey: ["pm-v2", "overview", projectRoot] });
+    queryClient.invalidateQueries({ queryKey: ["pm-v2", "notes", projectRoot] });
+    queryClient.invalidateQueries({ queryKey: ["pm-v2", "note-detail", projectRoot] });
+    queryClient.invalidateQueries({ queryKey: ["pm-v2", "graph", projectRoot] });
+    queryClient.invalidateQueries({ queryKey: ["pm-v2", "curator-audit", projectRoot] });
+  }
+
+  function readPersistedTheme() {
+    try {
+      if (typeof localStorage !== "undefined" && localStorage && typeof localStorage.getItem === "function") {
+        const saved = localStorage.getItem("pm-v2-theme");
+        if (saved === "light" || saved === "dark") return saved;
+      }
+    } catch (_e) {}
+    return "dark";
   }
 
   const MissionControlContext = createContext(null);
@@ -301,8 +353,51 @@ export function renderMvcControllersJs(): string {
         : null
     );
     const [toastMessage, setToastMessage] = useState(null);
-    const [theme, setTheme] = useState("dark");
+    const [theme, setTheme] = useState(() => readPersistedTheme());
     const [showTechDetails, setShowTechDetails] = useState(false);
+
+    useEffect(() => {
+      if (typeof document !== "undefined" && document.documentElement) {
+        document.documentElement.className = theme;
+      }
+      try {
+        if (typeof localStorage !== "undefined" && localStorage && typeof localStorage.setItem === "function") {
+          localStorage.setItem("pm-v2-theme", theme);
+        }
+      } catch (_e) {}
+    }, [theme]);
+
+    useEffect(() => {
+      if (typeof window === "undefined" || !window.addEventListener) return;
+      const onGlobalKeyDown = (e) => {
+        if (!e || e.isComposing === true || e.keyCode === 229) return;
+        const keyStr = String(e.key || "");
+        const isCtrlK = (e.ctrlKey || e.metaKey) && keyStr.toLowerCase() === "k";
+        const activeEl = typeof document !== "undefined" ? document.activeElement : null;
+        const activeTag = activeEl && activeEl.tagName ? String(activeEl.tagName).toUpperCase() : "";
+        const isEditableTarget =
+          activeTag === "INPUT" ||
+          activeTag === "TEXTAREA" ||
+          activeTag === "SELECT" ||
+          Boolean(activeEl && activeEl.isContentEditable);
+        const isSlashShortcut =
+          !e.ctrlKey && !e.metaKey && !e.altKey && keyStr === "/" && !isEditableTarget;
+        if (isCtrlK || isSlashShortcut) {
+          if (e.preventDefault) e.preventDefault();
+          setInspectedRecordIdState(null);
+          setActiveTabState("kanban");
+          writeDeepLinkHash({ tab: "kanban", project: currentProject }, defaultProjectRoot, true);
+          setTimeout(() => {
+            if (typeof document !== "undefined" && document.getElementById) {
+              const searchEl = document.getElementById("kanban-search-input");
+              if (searchEl && typeof searchEl.focus === "function") searchEl.focus();
+            }
+          }, 20);
+        }
+      };
+      window.addEventListener("keydown", onGlobalKeyDown);
+      return () => window.removeEventListener("keydown", onGlobalKeyDown);
+    }, [currentProject, defaultProjectRoot]);
 
     useEffect(() => {
       if (typeof window === "undefined" || !window.addEventListener) return;
@@ -319,9 +414,13 @@ export function renderMvcControllersJs(): string {
             kind: parsed.kind || "all",
             ts: Date.now(),
           });
+        } else if (parsed.tab === "graph") {
+          setGraphJumpTarget(null);
         }
         if (parsed.tab === "kanban" && (parsed.q || parsed.kind)) {
           setKanbanJumpTarget({ query: parsed.q || "", kind: parsed.kind || "", ts: Date.now() });
+        } else if (parsed.tab === "kanban") {
+          setKanbanJumpTarget(null);
         }
       };
       window.addEventListener("hashchange", onHashChange);
@@ -333,7 +432,8 @@ export function renderMvcControllersJs(): string {
         setActiveTabState(nextTab);
         writeDeepLinkHash(
           { tab: nextTab, project: currentProject, note: inspectedRecordId },
-          defaultProjectRoot
+          defaultProjectRoot,
+          true
         );
       },
       [currentProject, inspectedRecordId, defaultProjectRoot]
@@ -345,7 +445,8 @@ export function renderMvcControllersJs(): string {
         setInspectedRecordIdState(cleanId);
         writeDeepLinkHash(
           { tab: activeTab, project: currentProject, note: cleanId },
-          defaultProjectRoot
+          defaultProjectRoot,
+          false
         );
       },
       [activeTab, currentProject, defaultProjectRoot]
@@ -353,7 +454,7 @@ export function renderMvcControllersJs(): string {
 
     const closeInspectModal = useCallback(() => {
       setInspectedRecordIdState(null);
-      writeDeepLinkHash({ tab: activeTab, project: currentProject, note: null }, defaultProjectRoot);
+      writeDeepLinkHash({ tab: activeTab, project: currentProject, note: null }, defaultProjectRoot, false);
     }, [activeTab, currentProject, defaultProjectRoot]);
 
     const openInGraph = useCallback(
@@ -372,7 +473,8 @@ export function renderMvcControllersJs(): string {
         setActiveTabState("graph");
         writeDeepLinkHash(
           { tab: "graph", project: currentProject, node: targetNodeId, session: sessionId, q: query, kind },
-          defaultProjectRoot
+          defaultProjectRoot,
+          true
         );
       },
       [currentProject, defaultProjectRoot]
@@ -387,20 +489,15 @@ export function renderMvcControllersJs(): string {
         setActiveTabState("kanban");
         writeDeepLinkHash(
           { tab: "kanban", project: currentProject, q: query, kind },
-          defaultProjectRoot
+          defaultProjectRoot,
+          true
         );
       },
       [currentProject, defaultProjectRoot]
     );
 
     const toggleTheme = useCallback(() => {
-      setTheme((prev) => {
-        const next = prev === "dark" ? "light" : "dark";
-        if (typeof document !== "undefined" && document.documentElement) {
-          document.documentElement.className = next;
-        }
-        return next;
-      });
+      setTheme((prev) => (prev === "dark" ? "light" : "dark"));
     }, []);
 
     const notify = useCallback((msg, tone = "info") => {
@@ -428,15 +525,16 @@ export function renderMvcControllersJs(): string {
     });
 
     const refreshAll = useCallback(() => {
-      queryClient.invalidateQueries({ queryKey: ["pm-v2"] });
+      invalidateProjectQueries(queryClient, currentProject);
+      queryClient.invalidateQueries({ queryKey: ProjectModel.queryKey() });
       notify("ซิงก์ข้อมูลคลังความจำเรียบร้อยแล้ว (Synced TanStack Query Cache)", "success");
-    }, [queryClient, notify]);
+    }, [queryClient, currentProject, notify]);
 
     const switchProject = useCallback(
       (nextProject) => {
         setCurrentProject(nextProject);
         setInspectedRecordIdState(null);
-        writeDeepLinkHash({ tab: activeTab, project: nextProject }, defaultProjectRoot);
+        writeDeepLinkHash({ tab: activeTab, project: nextProject }, defaultProjectRoot, true);
       },
       [activeTab, defaultProjectRoot]
     );
@@ -484,6 +582,7 @@ export function renderMvcControllersJs(): string {
       const [searchQuery, setSearchQuery] = useState(
         jumpTarget && jumpTarget.query ? String(jumpTarget.query) : ""
       );
+      const debouncedSearch = useDebouncedValue(searchQuery, 250);
       const [kindFilter, setKindFilter] = useState(
         jumpTarget && jumpTarget.kind ? String(jumpTarget.kind) : ""
       );
@@ -491,6 +590,7 @@ export function renderMvcControllersJs(): string {
       const [newKind, setNewKind] = useState("writeADR");
       const [newTitle, setNewTitle] = useState("");
       const [newSummary, setNewSummary] = useState("");
+      const [pendingConfirmAction, setPendingConfirmAction] = useState(null);
 
       useEffect(() => {
         if (!jumpTarget) return;
@@ -499,15 +599,20 @@ export function renderMvcControllersJs(): string {
       }, [jumpTarget && jumpTarget.ts]);
 
       const notesQuery = useQuery({
-        queryKey: MemoryNoteModel.queryKey(projectRoot, { query: searchQuery, kind: kindFilter }),
-        queryFn: () => MemoryNoteModel.fetchList(projectRoot, { query: searchQuery, kind: kindFilter }),
+        queryKey: MemoryNoteModel.queryKey(projectRoot, { query: debouncedSearch, kind: kindFilter }),
+        queryFn: ({ signal } = {}) =>
+          MemoryNoteModel.fetchList(projectRoot, {
+            query: debouncedSearch,
+            kind: kindFilter,
+            signal,
+          }),
         enabled: Boolean(projectRoot),
       });
 
       const governanceMutation = useMutation({
         mutationFn: (payload) => MemoryNoteModel.mutateGovernance({ projectRoot, ...payload }),
         onSuccess: (_data, variables) => {
-          queryClient.invalidateQueries({ queryKey: ["pm-v2"] });
+          invalidateProjectQueries(queryClient, projectRoot);
           if (notify) {
             notify("ดำเนินการ Governance (" + variables.action + ") สำเร็จ!", "success");
           }
@@ -549,9 +654,39 @@ export function renderMvcControllersJs(): string {
         );
       }, [newKind, newTitle, newSummary, governanceMutation, notify]);
 
+      const requestConfirm = useCallback((action, recordId, title = "") => {
+        setPendingConfirmAction({
+          action,
+          recordId: String(recordId || ""),
+          title: String(title || recordId || ""),
+          reason: "",
+        });
+      }, []);
+
+      const setConfirmReason = useCallback((reason) => {
+        setPendingConfirmAction((prev) => (prev ? { ...prev, reason: String(reason || "") } : null));
+      }, []);
+
+      const cancelConfirmAction = useCallback(() => {
+        setPendingConfirmAction(null);
+      }, []);
+
+      const confirmGovernanceAction = useCallback(() => {
+        if (!pendingConfirmAction) return;
+        const { action, recordId, reason } = pendingConfirmAction;
+        const cleanReason = String(reason || "").trim();
+        setPendingConfirmAction(null);
+        governanceMutation.mutate({
+          action,
+          recordId,
+          ...(cleanReason ? { reason: cleanReason } : {}),
+        });
+      }, [pendingConfirmAction, governanceMutation]);
+
       return {
         searchQuery,
         setSearchQuery,
+        debouncedSearch,
         kindFilter,
         setKindFilter,
         viewMode,
@@ -567,9 +702,13 @@ export function renderMvcControllersJs(): string {
         columns,
         governanceMutation,
         createNote,
+        pendingConfirmAction,
+        setConfirmReason,
+        cancelConfirmAction,
+        confirmGovernanceAction,
         promoteNote: (recordId) => governanceMutation.mutate({ action: "promote", recordId }),
-        expireNote: (recordId) => governanceMutation.mutate({ action: "expire", recordId }),
-        retractNote: (recordId) => governanceMutation.mutate({ action: "retract", recordId }),
+        expireNote: (recordId, title) => requestConfirm("expire", recordId, title),
+        retractNote: (recordId, title) => requestConfirm("retract", recordId, title),
         supersedeNote: (recordId, supersedingRecordId) =>
           governanceMutation.mutate({ action: "supersede", recordId, supersedingRecordId }),
       };
@@ -591,7 +730,7 @@ export function renderMvcControllersJs(): string {
       const [searchQuery, setSearchQuery] = useState(
         jumpTarget && jumpTarget.query ? String(jumpTarget.query) : ""
       );
-      const [zoom, setZoom] = useState(1); const [pan, setPan] = useState({ x: 0, y: 0 }); const dragRef = useRef(null);
+      const [zoom, setZoom] = useState(1); const [pan, setPan] = useState({ x: 0, y: 0 }); const [hoveredNodeId, setHoveredNodeId] = useState(null); const dragRef = useRef(null); const wasDraggingRef = useRef(false); const lastClickRef = useRef({ id: null, ts: 0 });
 
       useEffect(() => {
         if (!jumpTarget) return;
@@ -775,23 +914,41 @@ export function renderMvcControllersJs(): string {
           height = 560;
           const cx = width / 2;
           const cy = height / 2;
-          const outerRing = [...fileCol, ...symbolCol];
+          const sliceOrbital = (arr, cap) => {
+            if (arr.length <= cap) return arr;
+            const priority = arr
+              .filter((n) => (selectedNode && n.id === selectedNode.id) || highlightedNodeIds.has(n.id))
+              .slice(0, cap);
+            const rest = arr
+              .filter((n) => !((selectedNode && n.id === selectedNode.id) || highlightedNodeIds.has(n.id)))
+              .slice(0, Math.max(0, cap - priority.length));
+            const keep = new Set([...priority, ...rest].map((n) => n.id));
+            return arr.filter((n) => keep.has(n.id)).slice(0, cap);
+          };
+          const sOrb = sliceOrbital(sessionCol, 12);
+          const nOrb = sliceOrbital(noteCol, 16);
+          const fOrb = sliceOrbital(fileCol, 14);
+          const symOrb = sliceOrbital(symbolCol, 14);
+          visibleNodes = [...sOrb, ...nOrb, ...fOrb, ...symOrb];
+          const outerRing = [...fOrb, ...symOrb];
 
-          sessionCol.forEach((n, idx) => {
-            const angle = (2 * Math.PI * idx) / Math.max(sessionCol.length, 1) - Math.PI / 2;
-            const radius = sessionCol.length <= 1 ? 0 : 90;
+          sOrb.forEach((n, idx) => {
+            const angle = (2 * Math.PI * idx) / Math.max(sOrb.length, 1) - Math.PI / 2;
+            const radius = sOrb.length <= 1 ? 0 : 90;
             positions.set(n.id, {
               x: Math.round(cx + radius * Math.cos(angle)),
               y: Math.round(cy + radius * Math.sin(angle)),
+              angle,
             });
           });
 
-          noteCol.forEach((n, idx) => {
-            const angle = (2 * Math.PI * idx) / Math.max(noteCol.length, 1) - Math.PI / 2 + 0.2;
+          nOrb.forEach((n, idx) => {
+            const angle = (2 * Math.PI * idx) / Math.max(nOrb.length, 1) - Math.PI / 2 + 0.2;
             const radius = 170;
             positions.set(n.id, {
               x: Math.round(cx + radius * Math.cos(angle)),
               y: Math.round(cy + radius * Math.sin(angle)),
+              angle,
             });
           });
 
@@ -801,6 +958,7 @@ export function renderMvcControllersJs(): string {
             positions.set(n.id, {
               x: Math.round(cx + radius * Math.cos(angle)),
               y: Math.round(cy + radius * Math.sin(angle)),
+              angle,
             });
           });
         }
@@ -817,6 +975,7 @@ export function renderMvcControllersJs(): string {
           layoutMode,
           nodes: visibleNodes,
           totalFilteredCount: filteredNodes.length,
+          hiddenNodeCount: Math.max(0, filteredNodes.length - visibleNodes.length),
           edges: filteredEdges,
           sessionNodesList,
           selectedNode,
@@ -842,7 +1001,36 @@ export function renderMvcControllersJs(): string {
               rawStats.edgeCount ?? rawEdges.length ?? 0,
           },
         };
-      }, [graphQuery.data, kindFilter, sessionFilter, selectedNodeId, layoutMode, searchQuery, zoom]);
+      }, [graphQuery.data, kindFilter, sessionFilter, selectedNodeId, layoutMode, searchQuery]);
+
+      const focusNode = (nodeId) => {
+        const tid = nodeId || (layout.selectedNode && layout.selectedNode.id);
+        const pos = tid ? layout.positions.get(tid) : null;
+        if (pos) {
+          setZoom(1.75);
+          setPan({ x: Math.round(pos.x - layout.width / 2), y: Math.round(pos.y - layout.height / 2) });
+        }
+      };
+
+      const activateNode = (node, onInspect) => {
+        if (!node || wasDraggingRef.current) {
+          wasDraggingRef.current = false;
+          return;
+        }
+        const now = Date.now();
+        const isDouble =
+          lastClickRef.current &&
+          lastClickRef.current.id === node.id &&
+          now - lastClickRef.current.ts < 400;
+        lastClickRef.current = { id: node.id, ts: isDouble ? 0 : now };
+        setSelectedNodeId(node.id);
+        if (isDouble) {
+          focusNode(node.id);
+          if (node.kind === "note" && node.recordId && typeof onInspect === "function") {
+            onInspect(node.recordId);
+          }
+        }
+      };
 
       return {
         kindFilter,
@@ -855,10 +1043,12 @@ export function renderMvcControllersJs(): string {
         setLayoutMode,
         searchQuery,
         setSearchQuery,
+        hoveredNodeId,
+        setHoveredNodeId,
         zoom,
-        pan, setPan, dragRef, zoomIn: () => setZoom((z) => Math.min(2.8, Number((z + 0.25).toFixed(2)))),
+        pan, setPan, dragRef, wasDraggingRef, activateNode, zoomIn: () => setZoom((z) => Math.min(2.8, Number((z + 0.25).toFixed(2)))),
         zoomOut: () => setZoom((z) => Math.max(0.55, Number((z - 0.25).toFixed(2)))),
-        resetZoom: () => { setZoom(1); setPan({ x: 0, y: 0 }); }, focusNode: (nodeId) => { const tid = nodeId || (layout.selectedNode && layout.selectedNode.id); const pos = tid ? layout.positions.get(tid) : null; if (pos) { setZoom(1.75); setPan({ x: Math.round(pos.x - layout.width / 2), y: Math.round(pos.y - layout.height / 2) }); } },
+        resetZoom: () => { setZoom(1); setPan({ x: 0, y: 0 }); }, focusNode,
         graphQuery,
         layout,
       };
@@ -869,6 +1059,7 @@ export function renderMvcControllersJs(): string {
     static useController(projectRoot, notify) {
       const queryClient = useQueryClient();
       const [chatInput, setChatInput] = useState("");
+      const [autoExecute, setAutoExecute] = useState(true);
       const [messages, setMessages] = useState([
         {
           id: "welcome",
@@ -887,29 +1078,40 @@ export function renderMvcControllersJs(): string {
       const autoCurateMutation = useMutation({
         mutationFn: () => CuratorModel.runAutoCurate(projectRoot),
         onSuccess: (data) => {
-          queryClient.invalidateQueries({ queryKey: ["pm-v2"] });
-          const summaryMsg =
-            "AI Auto-Curate เสร็จสิ้น! อนุมัติ Candidate " +
-            (data.promoted ? data.promoted.length : 0) +
-            " รายการ, ยุบรวมความจำซ้ำ " +
-            (data.superseded ? data.superseded.length : 0) +
-            " รายการ, หมดอายุ (Expired) " +
-            (data.expired ? data.expired.length : 0) +
-            " รายการ (Health Score: " +
-            data.beforeHealthScore +
-            " → " +
-            data.afterHealthScore +
-            "/100)";
-          const executedTools = [
-            "memory_sessionStart",
-            "memory_list",
-            "memory_findDuplicates",
-            "memory_checkStaleness",
-          ];
-          if (data.promoted && data.promoted.length > 0) executedTools.push("memory_promote");
-          if (data.superseded && data.superseded.length > 0) executedTools.push("memory_supersede");
-          if (data.expired && data.expired.length > 0) executedTools.push("memory_expire");
-          executedTools.push("memory_sessionEnd");
+          const didMutate =
+            (data.promoted && data.promoted.length > 0) ||
+            (data.superseded && data.superseded.length > 0) ||
+            (data.expired && data.expired.length > 0);
+          if (didMutate) {
+            invalidateProjectQueries(queryClient, projectRoot);
+          }
+          const summaryMsg = didMutate
+            ? "AI Auto-Curate เสร็จสิ้น! อนุมัติ Candidate " +
+              (data.promoted ? data.promoted.length : 0) +
+              " รายการ, ยุบรวมความจำซ้ำ " +
+              (data.superseded ? data.superseded.length : 0) +
+              " รายการ, หมดอายุ (Expired) " +
+              (data.expired ? data.expired.length : 0) +
+              " รายการ (Health Score: " +
+              data.beforeHealthScore +
+              " → " +
+              data.afterHealthScore +
+              "/100)"
+            : "คลังความจำสะอาดอยู่แล้ว (ไม่มีรายการรออนุมัติหรือซ้ำซ้อน) ไม่จำเป็นต้องเปิดเซสชันใหม่ (Health Score: " +
+              data.afterHealthScore +
+              "/100)";
+          const executedTools = didMutate
+            ? [
+                "memory_sessionStart",
+                "memory_list",
+                "memory_findDuplicates",
+                "memory_checkStaleness",
+                ...(data.promoted && data.promoted.length > 0 ? ["memory_promote"] : []),
+                ...(data.superseded && data.superseded.length > 0 ? ["memory_supersede"] : []),
+                ...(data.expired && data.expired.length > 0 ? ["memory_expire"] : []),
+                "memory_sessionEnd",
+              ]
+            : ["memory_list", "memory_findDuplicates", "memory_checkStaleness"];
           setMessages((prev) => [
             ...prev,
             {
@@ -921,12 +1123,28 @@ export function renderMvcControllersJs(): string {
           ]);
           if (notify) notify(summaryMsg, "success");
         },
+        onError: (err) => {
+          const errMsg = "AI Auto-Curate ล้มเหลว: " + (err && err.message ? err.message : String(err));
+          setMessages((prev) => [
+            ...prev,
+            { id: "err-" + Date.now(), role: "ai", text: errMsg, tools: [] },
+          ]);
+          if (notify) notify(errMsg, "error");
+        },
       });
 
       const chatMutation = useMutation({
-        mutationFn: (msg) => CuratorModel.sendChat(projectRoot, msg, true),
+        mutationFn: ({ msg, exec }) => CuratorModel.sendChat(projectRoot, msg, exec),
         onSuccess: (data) => {
-          queryClient.invalidateQueries({ queryKey: ["pm-v2"] });
+          if (
+            data &&
+            (data.intent === "write_adr" ||
+              data.intent === "write_insight" ||
+              data.intent === "write_mistake" ||
+              data.intent === "auto_curate")
+          ) {
+            invalidateProjectQueries(queryClient, projectRoot);
+          }
           setMessages((prev) => [
             ...prev,
             {
@@ -937,6 +1155,14 @@ export function renderMvcControllersJs(): string {
             },
           ]);
         },
+        onError: (err) => {
+          const errMsg = "ส่งคำสั่งไม่สำเร็จ: " + (err && err.message ? err.message : String(err));
+          setMessages((prev) => [
+            ...prev,
+            { id: "err-" + Date.now(), role: "ai", text: errMsg, tools: [] },
+          ]);
+          if (notify) notify(errMsg, "error");
+        },
       });
 
       const sendMessage = useCallback(
@@ -945,14 +1171,16 @@ export function renderMvcControllersJs(): string {
           if (!text) return;
           setChatInput("");
           setMessages((prev) => [...prev, { id: "u-" + Date.now(), role: "user", text, tools: [] }]);
-          chatMutation.mutate(text);
+          chatMutation.mutate({ msg: text, exec: autoExecute });
         },
-        [chatInput, chatMutation]
+        [chatInput, autoExecute, chatMutation]
       );
 
       return {
         chatInput,
         setChatInput,
+        autoExecute,
+        setAutoExecute,
         messages,
         auditQuery,
         autoCurateMutation,
@@ -963,43 +1191,169 @@ export function renderMvcControllersJs(): string {
     }
   }
 
+  function defaultValueForSchemaProp(k, p) {
+    if (!p || typeof p !== "object") return "";
+    if (p.default !== undefined) return p.default;
+    if (Array.isArray(p.enum) && p.enum.length > 0) return p.enum[0];
+    if (p.type === "number" || p.type === "integer") {
+      return k === "limit" ? 10 : k === "staleAfterDays" ? 30 : 0;
+    }
+    if (p.type === "boolean") return true;
+    if (p.type === "array") return [];
+    if (p.type === "object") return {};
+    return "";
+  }
+
+  function buildToolStarterJson(toolDef) {
+    const schema = toolDef && toolDef.inputSchema;
+    const props = schema && schema.properties;
+    if (!props || typeof props !== "object") return "{}";
+    const keys = Object.keys(props);
+    if (keys.length === 0) return "{}";
+    const requiredSet = new Set(Array.isArray(schema.required) ? schema.required : []);
+    const template = {};
+    let optionalAdded = 0;
+    for (const k of keys) {
+      const p = props[k] || {};
+      const desc = String(p.description || "");
+      const isReq = requiredSet.has(k);
+      if (!isReq) {
+        if (k === "sessionId" || k === "projectRoot" || k === "workspaceRoot" || k === "workflowId") {
+          continue;
+        }
+        if (/\\balias\\b/iu.test(desc)) {
+          continue;
+        }
+        if (optionalAdded >= 3) continue;
+        optionalAdded += 1;
+      }
+      template[k] = defaultValueForSchemaProp(k, p);
+    }
+    return Object.keys(template).length === 0 ? "{}" : JSON.stringify(template, null, 2);
+  }
+
   class McpConsoleController {
-    static useController(projectRoot, notify) {
+    static useController(projectRoot, notify, toolsMeta = []) {
       const queryClient = useQueryClient();
-      const [selectedTool, setSelectedTool] = useState("memory_v2Status");
+      const [selectedTool, setSelectedToolState] = useState("memory_v2Status");
       const [rawArgs, setRawArgs] = useState("{}");
       const [output, setOutput] = useState("// เลือก MCP Tool และกด Run เพื่อดูผลลัพธ์ JSON");
+      const [pendingDestructiveArgs, setPendingDestructiveArgs] = useState(null);
+
+      const toolByName = useMemo(() => {
+        const m = new Map();
+        (toolsMeta || []).forEach((t) => {
+          if (t && t.name) m.set(t.name, t);
+        });
+        return m;
+      }, [toolsMeta]);
+
+      const currentToolMeta = toolByName.get(selectedTool) || null;
+
+      const setSelectedTool = useCallback(
+        (nextTool) => {
+          const name = String(nextTool || "");
+          setSelectedToolState(name);
+          setPendingDestructiveArgs(null);
+          const meta = toolByName.get(name);
+          setRawArgs(buildToolStarterJson(meta));
+        },
+        [toolByName]
+      );
+
+      const resetTemplate = useCallback(() => {
+        setRawArgs(buildToolStarterJson(currentToolMeta));
+      }, [currentToolMeta]);
+
+      const insertParam = useCallback(
+        (paramKey) => {
+          if (!paramKey) return;
+          const schemaProps =
+            (currentToolMeta && currentToolMeta.inputSchema && currentToolMeta.inputSchema.properties) || {};
+          let parsed = {};
+          try {
+            const candidate = JSON.parse(rawArgs || "{}");
+            if (candidate && typeof candidate === "object" && !Array.isArray(candidate)) {
+              parsed = { ...candidate };
+            }
+          } catch (_e) {
+            parsed = {};
+          }
+          if (!(paramKey in parsed)) {
+            parsed[paramKey] = defaultValueForSchemaProp(paramKey, schemaProps[paramKey]);
+          }
+          setRawArgs(JSON.stringify(parsed, null, 2));
+        },
+        [currentToolMeta, rawArgs]
+      );
 
       const invokeMutation = useMutation({
         mutationFn: ({ tool, args }) => McpToolModel.invokeTool(projectRoot, tool, args),
-        onSuccess: (data) => {
+        onSuccess: (data, variables) => {
           setOutput(JSON.stringify(data, null, 2));
-          queryClient.invalidateQueries({ queryKey: ["pm-v2"] });
+          const meta = toolByName.get(variables && variables.tool);
+          const isReadOnly = Boolean(meta && meta.annotations && meta.annotations.readOnlyHint === true);
+          if (!isReadOnly) {
+            invalidateProjectQueries(queryClient, projectRoot);
+          }
         },
         onError: (err) => {
           setOutput(JSON.stringify({ ok: false, error: String(err.message || err) }, null, 2));
+          if (notify) {
+            notify("รันคำสั่ง MCP ไม่สำเร็จ: " + String(err && err.message ? err.message : err), "error");
+          }
         },
       });
 
-      const executeTool = useCallback(() => {
-        let parsed = {};
-        try {
-          parsed = JSON.parse(rawArgs || "{}");
-        } catch (err) {
-          if (notify) notify("JSON Arguments ไม่ถูกต้อง", "warning");
-          return;
-        }
-        invokeMutation.mutate({ tool: selectedTool, args: parsed });
-      }, [rawArgs, selectedTool, invokeMutation, notify]);
+      const executeTool = useCallback(
+        (forceConfirmed = false) => {
+          let parsed = {};
+          try {
+            parsed = JSON.parse(rawArgs || "{}");
+          } catch (_err) {
+            if (notify) notify("JSON Arguments ไม่ถูกต้อง", "warning");
+            return;
+          }
+          const isDestructive = Boolean(
+            currentToolMeta &&
+              currentToolMeta.annotations &&
+              currentToolMeta.annotations.destructiveHint === true
+          );
+          if (isDestructive && forceConfirmed !== true) {
+            setPendingDestructiveArgs(parsed);
+            return;
+          }
+          setPendingDestructiveArgs(null);
+          invokeMutation.mutate({ tool: selectedTool, args: parsed });
+        },
+        [rawArgs, selectedTool, currentToolMeta, invokeMutation, notify]
+      );
+
+      const confirmDestructiveExecution = useCallback(() => {
+        if (!pendingDestructiveArgs) return;
+        const args = pendingDestructiveArgs;
+        setPendingDestructiveArgs(null);
+        invokeMutation.mutate({ tool: selectedTool, args });
+      }, [pendingDestructiveArgs, selectedTool, invokeMutation]);
+
+      const cancelDestructiveExecution = useCallback(() => {
+        setPendingDestructiveArgs(null);
+      }, []);
 
       return {
         selectedTool,
         setSelectedTool,
+        currentToolMeta,
+        resetTemplate,
+        insertParam,
         rawArgs,
         setRawArgs,
         output,
         invokeMutation,
         executeTool,
+        pendingDestructiveArgs,
+        confirmDestructiveExecution,
+        cancelDestructiveExecution,
       };
     }
   }

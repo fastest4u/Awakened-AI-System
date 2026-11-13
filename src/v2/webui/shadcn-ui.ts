@@ -72,7 +72,7 @@ export function renderShadcnThemeCss(): string {
   }
   .pm-sidebar {
     border-right: 1px solid hsl(var(--border));
-    background-color: hsla(var(--card), 0.75);
+    background-color: hsl(var(--card) / 0.78);
     padding: 1.25rem 0.9rem;
     display: flex;
     flex-direction: column;
@@ -108,9 +108,9 @@ export function renderShadcnThemeCss(): string {
     color: hsl(var(--foreground));
   }
   .pm-nav-item-active {
-    background-color: hsla(var(--primary), 0.14);
+    background-color: hsl(var(--primary) / 0.14);
     color: hsl(var(--primary));
-    border-color: hsla(var(--primary), 0.28);
+    border-color: hsl(var(--primary) / 0.28);
     font-weight: 600;
   }
   .pm-topbar {
@@ -118,7 +118,7 @@ export function renderShadcnThemeCss(): string {
     top: 0;
     z-index: 25;
     backdrop-filter: blur(12px);
-    background-color: hsla(var(--background), 0.82);
+    background-color: hsl(var(--background) / 0.86);
     border-bottom: 1px solid hsl(var(--border));
     padding: 0.85rem 1.75rem;
     display: flex;
@@ -217,9 +217,14 @@ export function renderShadcnThemeCss(): string {
     color: hsl(var(--foreground));
   }
   .sh-btn-destructive {
-    background-color: hsla(var(--destructive), 0.16);
+    background-color: hsl(var(--destructive) / 0.16);
     color: #f87171;
-    border-color: hsla(var(--destructive), 0.35);
+    border-color: hsl(var(--destructive) / 0.35);
+  }
+  .light .sh-btn-destructive {
+    color: #dc2626;
+    background-color: hsl(var(--destructive) / 0.12);
+    border-color: hsl(var(--destructive) / 0.38);
   }
   .sh-btn-emerald {
     background-color: hsl(var(--success));
@@ -251,9 +256,9 @@ export function renderShadcnThemeCss(): string {
     font-weight: 600;
   }
   .sh-badge-default {
-    background-color: hsla(var(--primary), 0.14);
+    background-color: hsl(var(--primary) / 0.14);
     color: hsl(var(--primary));
-    border-color: hsla(var(--primary), 0.3);
+    border-color: hsl(var(--primary) / 0.3);
   }
   .sh-badge-secondary {
     background-color: hsl(var(--secondary));
@@ -265,19 +270,28 @@ export function renderShadcnThemeCss(): string {
     border-color: hsl(var(--border));
   }
   .sh-badge-success {
-    background-color: hsla(var(--success), 0.15);
+    background-color: hsl(var(--success) / 0.15);
     color: #10b981;
-    border-color: hsla(var(--success), 0.3);
+    border-color: hsl(var(--success) / 0.3);
+  }
+  .light .sh-badge-success {
+    color: #047857;
   }
   .sh-badge-warning {
-    background-color: hsla(var(--warning), 0.15);
+    background-color: hsl(var(--warning) / 0.15);
     color: #f59e0b;
-    border-color: hsla(var(--warning), 0.3);
+    border-color: hsl(var(--warning) / 0.3);
+  }
+  .light .sh-badge-warning {
+    color: #b45309;
   }
   .sh-badge-destructive {
-    background-color: hsla(var(--destructive), 0.15);
+    background-color: hsl(var(--destructive) / 0.15);
     color: #ef4444;
-    border-color: hsla(var(--destructive), 0.3);
+    border-color: hsl(var(--destructive) / 0.3);
+  }
+  .light .sh-badge-destructive {
+    color: #dc2626;
   }
 
   .sh-input, .sh-select, .sh-textarea {
@@ -293,7 +307,7 @@ export function renderShadcnThemeCss(): string {
   }
   .sh-input:focus, .sh-select:focus, .sh-textarea:focus {
     border-color: hsl(var(--ring));
-    box-shadow: 0 0 0 2px hsla(var(--ring), 0.2);
+    box-shadow: 0 0 0 2px hsl(var(--ring) / 0.22);
   }
 
   .sh-tabs-list {
@@ -344,7 +358,7 @@ export function renderShadcnThemeCss(): string {
     vertical-align: middle;
     font-weight: 600;
     color: hsl(var(--muted-foreground));
-    background-color: hsla(var(--secondary), 0.5);
+    background-color: hsl(var(--secondary) / 0.55);
     border-bottom: 1px solid hsl(var(--border));
     user-select: none;
   }
@@ -354,7 +368,7 @@ export function renderShadcnThemeCss(): string {
     border-bottom: 1px solid hsl(var(--border));
   }
   .sh-tr:hover {
-    background-color: hsla(var(--muted), 0.35);
+    background-color: hsl(var(--muted) / 0.45);
   }
 
   .sh-alert {
@@ -363,8 +377,12 @@ export function renderShadcnThemeCss(): string {
     border-radius: calc(var(--radius) - 2px);
     border: 1px solid hsl(var(--border));
     padding: 0.75rem 0.95rem;
-    background-color: hsla(var(--secondary), 0.35);
+    background-color: hsl(var(--secondary) / 0.4);
     margin-bottom: 0.55rem;
+  }
+  .sh-alert-destructive {
+    border-color: hsl(var(--destructive) / 0.45);
+    background-color: hsl(var(--destructive) / 0.1);
   }
   .sh-alert-title {
     margin: 0 0 0.2rem;
@@ -412,20 +430,36 @@ export function renderShadcnThemeCss(): string {
     box-shadow: 0 20px 45px rgba(0, 0, 0, 0.5);
   }
 
+  .pm-toast-floating {
+    position: fixed;
+    bottom: 1.25rem;
+    right: 1.25rem;
+    z-index: 60;
+    max-width: 440px;
+    width: calc(100vw - 2.5rem);
+    box-shadow: 0 12px 32px rgba(0, 0, 0, 0.28);
+  }
+
   .pm-grid-4 {
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 210px), 1fr));
     gap: 0.9rem;
   }
   .pm-grid-3 {
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(310px, 1fr));
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 280px), 1fr));
     gap: 1rem;
   }
   .pm-grid-2 {
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(420px, 1fr));
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 380px), 1fr));
     gap: 1rem;
+  }
+  .pm-quick-entry-grid {
+    display: grid;
+    grid-template-columns: 165px 1fr 1.6fr auto;
+    gap: 0.6rem;
+    align-items: center;
   }
   .pm-kanban-grid {
     display: grid;
@@ -439,6 +473,7 @@ export function renderShadcnThemeCss(): string {
     .pm-shell { grid-template-columns: 1fr; }
     .pm-sidebar { display: none; }
     .pm-kanban-grid { grid-template-columns: 1fr; }
+    .pm-quick-entry-grid { grid-template-columns: 1fr; }
     .pm-topbar { padding: 0.7rem 1rem; }
     .pm-content { padding: 1rem 1rem 2rem; }
     .pm-mobile-nav {
@@ -448,7 +483,7 @@ export function renderShadcnThemeCss(): string {
       overflow-x: auto;
       padding: 0.5rem 1rem;
       border-bottom: 1px solid hsl(var(--border));
-      background-color: hsla(var(--card), 0.92);
+      background-color: hsl(var(--card) / 0.92);
       backdrop-filter: blur(10px);
     }
   }
@@ -461,7 +496,7 @@ export function renderShadcnUiJs(): string {
 // Components: Button, Card, Badge, Tabs, Input, Textarea, Select, Table, Dialog, Alert, Separator, Progress
 // ============================================================================
 (function (global) {
-  const { h } = global.React;
+  const { h, useEffect } = global.React;
 
   function cn(...classes) {
     return classes.filter(Boolean).join(" ");
@@ -577,6 +612,34 @@ export function renderShadcnUiJs(): string {
   }
 
   function Dialog({ open = false, onOpenChange, children }) {
+    useEffect(() => {
+      if (!open) return;
+      const prevOverflow =
+        typeof document !== "undefined" && document.body && document.body.style
+          ? document.body.style.overflow || ""
+          : "";
+      if (typeof document !== "undefined" && document.body && document.body.style) {
+        document.body.style.overflow = "hidden";
+      }
+      const onKeyDown = (e) => {
+        if (!e || e.isComposing === true || e.keyCode === 229) return;
+        if (e.key === "Escape" && typeof onOpenChange === "function") {
+          onOpenChange(false);
+        }
+      };
+      if (typeof document !== "undefined" && document.addEventListener) {
+        document.addEventListener("keydown", onKeyDown);
+      }
+      return () => {
+        if (typeof document !== "undefined" && document.removeEventListener) {
+          document.removeEventListener("keydown", onKeyDown);
+        }
+        if (typeof document !== "undefined" && document.body && document.body.style) {
+          document.body.style.overflow = prevOverflow;
+        }
+      };
+    }, [open, onOpenChange]);
+
     if (!open) return null;
     return h(
       "div",
@@ -586,7 +649,15 @@ export function renderShadcnUiJs(): string {
           if (e.target === e.currentTarget && onOpenChange) onOpenChange(false);
         },
       },
-      h("div", { className: "sh-dialog-content" }, ...(children || []))
+      h(
+        "div",
+        {
+          className: "sh-dialog-content",
+          role: "dialog",
+          "aria-modal": "true",
+        },
+        ...(children || [])
+      )
     );
   }
 
@@ -598,6 +669,10 @@ export function renderShadcnUiJs(): string {
   }
 
   const LUCIDE_ICON_NODES = {
+    copy: [
+      ["rect", { width: "14", height: "14", x: "8", y: "8", rx: "2", ry: "2" }],
+      ["path", { d: "M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2" }],
+    ],
     "layout-dashboard": [
       ["rect", { width: "7", height: "9", x: "3", y: "3", rx: "1" }],
       ["rect", { width: "7", height: "5", x: "14", y: "3", rx: "1" }],

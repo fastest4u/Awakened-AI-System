@@ -388,6 +388,28 @@ function hasSafeWorkspaceSegments(candidate: string): boolean {
   return true;
 }
 
+const CANONICAL_ROOT_CACHE_TTL_MS = 5_000;
+const CANONICAL_ROOT_CACHE_MAX = 64;
+const canonicalProjectRootCache = new Map<string, { readonly ts: number; readonly canonicalRoot: string }>();
+
+function getMemoizedCanonicalRoot(projectRoot: string): string | null {
+  const resolvedRoot = resolve(projectRoot);
+  const now = Date.now();
+  const cached = canonicalProjectRootCache.get(resolvedRoot);
+  if (cached && now - cached.ts <= CANONICAL_ROOT_CACHE_TTL_MS) {
+    return cached.canonicalRoot;
+  }
+  const rootStat = lstatSync(resolvedRoot);
+  if (!rootStat.isDirectory()) return null;
+  const canonicalRoot = realpathSync.native(resolvedRoot);
+  if (canonicalProjectRootCache.size >= CANONICAL_ROOT_CACHE_MAX && !canonicalProjectRootCache.has(resolvedRoot)) {
+    const oldest = canonicalProjectRootCache.keys().next().value;
+    if (oldest !== undefined) canonicalProjectRootCache.delete(oldest);
+  }
+  canonicalProjectRootCache.set(resolvedRoot, { ts: now, canonicalRoot });
+  return canonicalRoot;
+}
+
 export function resolveContainedWorkspaceFile(
   projectRoot: string,
   rawRelPath: string,
@@ -398,10 +420,8 @@ export function resolveContainedWorkspaceFile(
   if (!hasSafeWorkspaceSegments(candidate)) return null;
 
   try {
-    const resolvedRoot = resolve(projectRoot);
-    const rootStat = lstatSync(resolvedRoot);
-    if (!rootStat.isDirectory()) return null;
-    const canonicalRoot = realpathSync.native(resolvedRoot);
+    const canonicalRoot = getMemoizedCanonicalRoot(projectRoot);
+    if (!canonicalRoot) return null;
 
     const segments = candidate.split("/");
     let cursor = canonicalRoot;
@@ -450,7 +470,8 @@ export function isAcceptablePath(candidate: string, projectRoot?: string): boole
 
   if (projectRoot) {
     try {
-      const canonicalRoot = realpathSync.native(resolve(projectRoot));
+      const canonicalRoot = getMemoizedCanonicalRoot(projectRoot);
+      if (!canonicalRoot) return false;
       let cursor = canonicalRoot;
       for (const segment of candidate.split("/")) {
         cursor = join(cursor, segment);

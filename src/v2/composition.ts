@@ -55,6 +55,7 @@ export type FreshStartStatus = FreshStartIdentity & Readonly<{
 /** Governed V2 content adapters enter through this typed composition boundary. */
 export interface V2ContentAdapters {
   listTools?(): Promise<readonly McpToolDefinition[]>;
+  getGlobalPosition?(): string;
   invoke(name: string, argumentsValue: unknown): Promise<unknown>;
 }
 
@@ -688,6 +689,13 @@ export async function createV2Foundation(
       return foundation.status();
     },
     content: Object.freeze({
+      getGlobalPosition(): string {
+        const { state } = inspectActiveStateAndRelease();
+        if (state.mode === "prepared" || state.mode === "disabled") {
+          return "0";
+        }
+        return getRouter(state).getGlobalPosition();
+      },
       async listTools(): Promise<readonly McpToolDefinition[]> {
         const { state, release } = inspectActiveStateAndRelease();
         if (state.mode === "prepared" || !isProductionReleaseManifest(release)) {

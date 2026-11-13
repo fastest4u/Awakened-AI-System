@@ -6,10 +6,21 @@ export function renderVendorRuntimeJs(): string {
 // ============================================================================
 (function (global) {
   const SVG_TAGS = new Set(["svg", "g", "line", "circle", "text", "path", "rect", "defs", "marker", "linearGradient", "stop", "polyline", "polygon", "title"]);
+  const PANEL_CUSTOM_TAGS = new Set([
+    "pm-mission-control",
+    "pm-overview-panel",
+    "pm-kanban-board",
+    "pm-knowledge-graph",
+    "pm-curator-studio",
+    "pm-mcp-console",
+    "pm-session-activity-map",
+  ]);
   const Fragment = Symbol("React.Fragment");
 
   const sharedComponentHooks = new Map();
   const activeRoots = new Set();
+  const contextTrackerStack = [];
+  const hookKeyTrackerStack = [];
   let mountCounter = 0;
   let currentRoot = null;
   let currentComponentKey = "root";
@@ -20,7 +31,9 @@ export function renderVendorRuntimeJs(): string {
     const pushChild = (c) => {
       if (Array.isArray(c)) {
         c.forEach(pushChild);
-      } else if (c !== null && c !== undefined && c !== false && c !== true) {
+      } else if (c === null || c === undefined || c === false || c === true) {
+        flatChildren.push(null);
+      } else {
         flatChildren.push(typeof c === "object" ? c : String(c));
       }
     };
@@ -35,15 +48,21 @@ export function renderVendorRuntimeJs(): string {
     const ctx = {
       _currentValue: defaultValue,
       Provider: function ContextProvider(props) {
-        ctx._currentValue = props.value;
         return { type: Fragment, props: { children: props.children || [] } };
       },
     };
+    ctx.Provider._contextRef = ctx;
     return ctx;
   }
 
   function useContext(ctx) {
-    return ctx._currentValue;
+    const val = ctx._currentValue;
+    for (let i = 0; i < contextTrackerStack.length; i++) {
+      if (!contextTrackerStack[i].has(ctx)) {
+        contextTrackerStack[i].set(ctx, val);
+      }
+    }
+    return val;
   }
 
   function getHookSlot() {
@@ -62,6 +81,12 @@ export function renderVendorRuntimeJs(): string {
       sharedComponentHooks.set(key, hooks);
     }
     currentRoot.ownedHookKeys.add(key);
+    if (currentRoot.visitedHookKeys) {
+      currentRoot.visitedHookKeys.add(key);
+    }
+    for (let i = 0; i < hookKeyTrackerStack.length; i++) {
+      hookKeyTrackerStack[i].add(key);
+    }
     const idx = hookCursor++;
     return { hooks, idx };
   }
@@ -69,6 +94,7 @@ export function renderVendorRuntimeJs(): string {
   function useState(initialValue) {
     const { hooks, idx } = getHookSlot();
     const rootRef = currentRoot;
+    const ownerCompKey = currentComponentKey || "root";
     if (!(idx in hooks)) {
       hooks[idx] = typeof initialValue === "function" ? initialValue() : initialValue;
     }
@@ -80,6 +106,9 @@ export function renderVendorRuntimeJs(): string {
       const next = typeof updater === "function" ? updater(prev) : updater;
       if (!Object.is(prev, next)) {
         hooks[idx] = next;
+        if (rootRef.dirtyComponents) {
+          rootRef.dirtyComponents.add(ownerCompKey);
+        }
         rootRef.scheduleRender();
       }
     };
@@ -137,135 +166,190 @@ export function renderVendorRuntimeJs(): string {
     }
   }
 
-  function renderVNodeToDom(vnode, isSvg = false, path = "0") {
+  function shallowEqualProps(a, b) {
+    if (Object.is(a, b)) return true;
+    if (!a || !b || typeof a !== "object" || typeof b !== "object") return false;
+    const keysA = Object.keys(a);
+    const keysB = Object.keys(b);
+    if (keysA.length !== keysB.length) return false;
+    for (let i = 0; i < keysA.length; i++) {
+      const k = keysA[i];
+      if (!Object.prototype.hasOwnProperty.call(b, k)) return false;
+      if (k === "children") {
+        const ca = a.children;
+        const cb = b.children;
+        if (Array.isArray(ca) && Array.isArray(cb)) {
+          if (ca.length !== cb.length) return false;
+          for (let j = 0; j < ca.length; j++) {
+            if (!Object.is(ca[j], cb[j])) return false;
+          }
+          continue;
+        }
+      }
+      if (!Object.is(a[k], b[k])) return false;
+    }
+    return true;
+  }
+
+  function isSubtreeDirty(dirtySet, compKey) {
+    if (!dirtySet || dirtySet.has("*")) return true;
+    for (const dk of dirtySet) {
+      if (dk === compKey || dk.startsWith(compKey + ".") || dk.startsWith(compKey + ":")) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function contextsUnchanged(contextMap) {
+    if (!contextMap || contextMap.size === 0) return true;
+    for (const [ctxObj, prevVal] of contextMap.entries()) {
+      if (!Object.is(ctxObj._currentValue, prevVal)) return false;
+    }
+    return true;
+  }
+
+  // ==========================================================================
+  // In-Place VDOM Evaluation & Reconciliation (Preserves DOM Identity & Thai IME)
+  // ==========================================================================
+  function evaluateToDescriptors(vnode, isSvg, path, out) {
     if (vnode === null || vnode === undefined || typeof vnode === "boolean") {
-      return document.createTextNode("");
+      return;
     }
     if (typeof vnode === "string" || typeof vnode === "number") {
-      return document.createTextNode(String(vnode));
+      out.push({ kind: "text", text: String(vnode), slot: path });
+      return;
     }
     if (Array.isArray(vnode)) {
-      const frag = document.createDocumentFragment();
-      vnode.forEach((child, i) => frag.appendChild(renderVNodeToDom(child, isSvg, path + "." + i)));
-      return frag;
+      for (let i = 0; i < vnode.length; i++) {
+        evaluateToDescriptors(vnode[i], isSvg, path + "." + i, out);
+      }
+      return;
     }
     if (vnode.type === Fragment) {
-      const frag = document.createDocumentFragment();
-      (vnode.props.children || []).forEach((child, i) => frag.appendChild(renderVNodeToDom(child, isSvg, path + ".f" + i)));
-      return frag;
+      const ch = (vnode.props && vnode.props.children) || [];
+      for (let i = 0; i < ch.length; i++) {
+        evaluateToDescriptors(ch[i], isSvg, path + ".f" + i, out);
+      }
+      return;
+    }
+    if (typeof vnode.type === "function" && vnode.type._contextRef) {
+      const ctx = vnode.type._contextRef;
+      const prevVal = ctx._currentValue;
+      const nextProps = vnode.props || {};
+      ctx._currentValue = nextProps.value;
+      try {
+        const ch = nextProps.children || [];
+        for (let i = 0; i < ch.length; i++) {
+          evaluateToDescriptors(ch[i], isSvg, path + ".p" + i, out);
+        }
+      } finally {
+        ctx._currentValue = prevVal;
+      }
+      return;
     }
     if (typeof vnode.type === "function") {
-      const prevCompKey = currentComponentKey;
-      const prevCursor = hookCursor;
       const compName = vnode.type.displayName || vnode.type.name || "Component";
       const explicitKey = vnode.props && vnode.props.key != null ? String(vnode.props.key) : "";
-      currentComponentKey = path + ":" + compName + ":" + explicitKey;
+      const compKey = path + ":" + compName + (explicitKey ? "#" + explicitKey : "");
+      const nextProps = vnode.props || {};
+      const cache = currentRoot && currentRoot.compCache;
+      const dirtySnap = currentRoot && currentRoot.activeDirtySnapshot;
+      if (cache) {
+        const cached = cache.get(compKey);
+        if (
+          cached &&
+          cached.type === vnode.type &&
+          !isSubtreeDirty(dirtySnap, compKey) &&
+          shallowEqualProps(cached.props, nextProps) &&
+          contextsUnchanged(cached.contexts)
+        ) {
+          for (let i = 0; i < cached.descriptors.length; i++) {
+            out.push(cached.descriptors[i]);
+          }
+          if (cached.hookKeys) {
+            for (const hk of cached.hookKeys) {
+              if (currentRoot && currentRoot.visitedHookKeys) {
+                currentRoot.visitedHookKeys.add(hk);
+              }
+              for (let m = 0; m < hookKeyTrackerStack.length; m++) {
+                hookKeyTrackerStack[m].add(hk);
+              }
+            }
+          }
+          for (let k = 0; k < contextTrackerStack.length; k++) {
+            for (const [ctxObj, val] of cached.contexts.entries()) {
+              if (!contextTrackerStack[k].has(ctxObj)) {
+                contextTrackerStack[k].set(ctxObj, val);
+              }
+            }
+          }
+          return;
+        }
+      }
+
+      const prevCompKey = currentComponentKey;
+      const prevCursor = hookCursor;
+      const ctxFrame = new Map();
+      const hkFrame = new Set();
+      contextTrackerStack.push(ctxFrame);
+      hookKeyTrackerStack.push(hkFrame);
+      currentComponentKey = compKey;
       hookCursor = 0;
+      const compDescriptors = [];
       let subTree;
       try {
-        subTree = vnode.type(vnode.props || {});
+        subTree = vnode.type(nextProps);
+        evaluateToDescriptors(subTree, isSvg, compKey, compDescriptors);
       } finally {
+        hookKeyTrackerStack.pop();
+        contextTrackerStack.pop();
         currentComponentKey = prevCompKey;
         hookCursor = prevCursor;
       }
-      return renderVNodeToDom(subTree, isSvg, path + ":" + compName);
+      if (cache) {
+        cache.set(compKey, {
+          type: vnode.type,
+          props: nextProps,
+          contexts: ctxFrame,
+          hookKeys: hkFrame,
+          descriptors: compDescriptors,
+        });
+      }
+      for (let i = 0; i < compDescriptors.length; i++) {
+        out.push(compDescriptors[i]);
+      }
+      return;
     }
 
     const tag = String(vnode.type);
     const svgMode = isSvg || SVG_TAGS.has(tag);
     const isCustomEl = !svgMode && tag.includes("-");
-    let reusedCustomEl = null;
-    if (isCustomEl && currentRoot && currentRoot.reusableCustomElements) {
-      const bucket = currentRoot.reusableCustomElements.get(tag.toLowerCase());
-      if (bucket && bucket.length > 0) {
-        reusedCustomEl = bucket.shift();
-      }
-    }
-    const el =
-      reusedCustomEl ||
-      (svgMode
-        ? document.createElementNS("http://www.w3.org/2000/svg", tag)
-        : document.createElement(tag));
-
     const props = vnode.props || {};
-    const nextAttrNames = isCustomEl ? new Set(["data-pm-mount-id"]) : null;
-    for (const [key, val] of Object.entries(props)) {
-      if (key === "children" || key === "key" || val === undefined || val === null || val === false) {
-        continue;
-      }
-      if (key === "ref" && typeof val === "object") {
-        val.current = el;
-        continue;
-      }
-      if (key === "className" || key === "class") {
-        if (nextAttrNames) nextAttrNames.add("class");
-        if (svgMode) {
-          el.setAttribute("class", String(val));
-        } else {
-          el.className = String(val);
-        }
-        continue;
-      }
-      if (key === "style" && typeof val === "object") {
-        if (nextAttrNames) nextAttrNames.add("style");
-        Object.assign(el.style, val);
-        continue;
-      }
-      if (key.startsWith("on") && typeof val === "function") {
-        if (!reusedCustomEl) {
-          const evt = key.slice(2).toLowerCase();
-          const domEvent = evt === "change" && (tag === "input" || tag === "textarea") ? "input" : evt;
-          el.addEventListener(domEvent, val);
-        }
-        continue;
-      }
-      if (key === "value" && (tag === "input" || tag === "textarea" || tag === "select")) {
-        el.value = String(val);
-        el.setAttribute("value", String(val));
-        continue;
-      }
-      if (key === "checked" && tag === "input") {
-        el.checked = Boolean(val);
-        continue;
-      }
-      if (key === "disabled") {
-        if (val) {
-          if (nextAttrNames) nextAttrNames.add("disabled");
-          el.setAttribute("disabled", "disabled");
-        }
-        continue;
-      }
-      if (nextAttrNames) nextAttrNames.add(key);
-      const nextStr = String(val);
-      if (!reusedCustomEl || el.getAttribute(key) !== nextStr) {
-        el.setAttribute(key, nextStr);
+    const explicitKey = props.key != null ? String(props.key) : "";
+    const childSpecs = [];
+    const rawChildren = props.children || [];
+    const hasRealChildren = rawChildren.some((c) => c !== null && c !== undefined && c !== false && c !== true);
+    if (!isCustomEl || hasRealChildren) {
+      for (let i = 0; i < rawChildren.length; i++) {
+        evaluateToDescriptors(rawChildren[i], svgMode, path + "." + i, childSpecs);
       }
     }
-    if (reusedCustomEl && nextAttrNames && el.getAttributeNames) {
-      for (const attrName of el.getAttributeNames()) {
-        if (!nextAttrNames.has(attrName)) {
-          el.removeAttribute(attrName);
-        }
-      }
-      if (el._root && typeof el._root.scheduleRender === "function") {
-        el._root.scheduleRender();
-      }
-      return el;
-    }
-
-    (props.children || []).forEach((child, i) => {
-      el.appendChild(renderVNodeToDom(child, svgMode, path + "." + i));
+    out.push({
+      kind: "element",
+      tag,
+      tagLower: tag.toLowerCase(),
+      svgMode,
+      isCustomEl,
+      key: explicitKey,
+      slot: explicitKey ? "#" + explicitKey : path,
+      props,
+      children: childSpecs,
     });
-
-    if (tag === "select" && props.value !== undefined) {
-      el.value = String(props.value);
-    }
-
-    return el;
   }
 
-  function collectOwnedCustomElements(rootContainer, outMap) {
-    if (!rootContainer || !rootContainer.childNodes) return;
+  function collectOwnedCustomElements(node, outMap) {
+    if (!node || !node.childNodes) return;
     const walk = (parent) => {
       const children = parent.childNodes;
       if (!children) return;
@@ -279,13 +363,377 @@ export function renderVendorRuntimeJs(): string {
             list = [];
             outMap.set(tagLower, list);
           }
-          list.push(child);
+          if (!list.includes(child)) {
+            list.push(child);
+          }
         } else {
           walk(child);
         }
       }
     };
-    walk(rootContainer);
+    if (node.nodeType === 1 && node.tagName && String(node.tagName).includes("-")) {
+      const tl = String(node.tagName).toLowerCase();
+      let list = outMap.get(tl);
+      if (!list) {
+        list = [];
+        outMap.set(tl, list);
+      }
+      if (!list.includes(node)) {
+        list.push(node);
+      }
+      return;
+    }
+    walk(node);
+  }
+
+  function wireDomEvent(el, domEvent, fn, isTextControl) {
+    if (!el._pmHandlers) el._pmHandlers = {};
+    if (!el._pmBoundEvents) el._pmBoundEvents = new Set();
+    if (isTextControl && !el._pmImeWired) {
+      el._pmImeWired = true;
+      el._isComposing = false;
+      el.addEventListener("compositionstart", () => {
+        el._isComposing = true;
+      });
+      el.addEventListener("compositionend", (ev) => {
+        if (el._isComposing) {
+          el._isComposing = false;
+          const activeInputFn = el._pmHandlers && el._pmHandlers["input"];
+          if (typeof activeInputFn === "function") {
+            activeInputFn(ev);
+          }
+        }
+      });
+    }
+    el._pmHandlers[domEvent] = fn;
+    if (!el._pmBoundEvents.has(domEvent)) {
+      el._pmBoundEvents.add(domEvent);
+      el.addEventListener(domEvent, (ev) => {
+        if (domEvent === "input" && el._isComposing) {
+          return;
+        }
+        if (
+          domEvent === "keydown" &&
+          (el._isComposing || (ev && (ev.isComposing === true || ev.keyCode === 229)))
+        ) {
+          return;
+        }
+        const handler = el._pmHandlers && el._pmHandlers[domEvent];
+        if (typeof handler === "function") {
+          handler(ev);
+        }
+      });
+    }
+  }
+
+  function applyElementProps(el, spec, isNew) {
+    const { tagLower, svgMode, isCustomEl, props } = spec;
+    const prevProps = el._pmProps || {};
+    const isTextControl = tagLower === "input" || tagLower === "textarea";
+    let customElAttrChanged = false;
+
+    // 1. Clean up removed props/handlers/styles from previous render
+    for (const oldKey of Object.keys(prevProps)) {
+      if (oldKey === "children" || oldKey === "key" || oldKey === "ref") continue;
+      const nextVal = props[oldKey];
+      const wasRemoved = nextVal === undefined || nextVal === null || nextVal === false;
+      if (oldKey.startsWith("on") && typeof prevProps[oldKey] === "function") {
+        if (typeof nextVal !== "function") {
+          const evt = oldKey.slice(2).toLowerCase();
+          const domEvent = evt === "change" && isTextControl ? "input" : evt;
+          if (el._pmHandlers) el._pmHandlers[domEvent] = null;
+        }
+        continue;
+      }
+      if (!wasRemoved) continue;
+      if (oldKey === "className" || oldKey === "class") {
+        if (svgMode) el.removeAttribute("class");
+        else el.className = "";
+      } else if (oldKey === "style" && prevProps.style && typeof prevProps.style === "object") {
+        for (const sKey of Object.keys(prevProps.style)) {
+          el.style[sKey] = "";
+        }
+      } else if (oldKey === "disabled") {
+        el.disabled = false;
+        el.removeAttribute("disabled");
+      } else if (oldKey === "checked" && tagLower === "input") {
+        el.checked = false;
+      } else if (oldKey === "value") {
+        if (!el._isComposing) el.value = "";
+      } else if (oldKey !== "data-pm-mount-id") {
+        el.removeAttribute(oldKey);
+        customElAttrChanged = true;
+      }
+    }
+
+    if (
+      prevProps.style &&
+      typeof prevProps.style === "object" &&
+      props.style &&
+      typeof props.style === "object"
+    ) {
+      for (const sKey of Object.keys(prevProps.style)) {
+        if (!(sKey in props.style)) {
+          el.style[sKey] = "";
+        }
+      }
+    }
+
+    // 2. Apply current props
+    const nextAttrNames = isCustomEl ? new Set(["data-pm-mount-id"]) : null;
+    for (const [key, val] of Object.entries(props)) {
+      if (key === "children" || key === "key" || val === undefined || val === null || val === false) {
+        continue;
+      }
+      if (key === "ref") {
+        if (typeof val === "object") val.current = el;
+        else if (typeof val === "function") val(el);
+        continue;
+      }
+      if (key === "className" || key === "class") {
+        if (nextAttrNames) nextAttrNames.add("class");
+        const nextCls = String(val);
+        if (svgMode) {
+          if (el.getAttribute("class") !== nextCls) el.setAttribute("class", nextCls);
+        } else if (el.className !== nextCls) {
+          el.className = nextCls;
+        }
+        continue;
+      }
+      if (key === "style" && typeof val === "object") {
+        if (nextAttrNames) nextAttrNames.add("style");
+        for (const [sKey, sVal] of Object.entries(val)) {
+          const nextStyleVal = sVal == null ? "" : String(sVal);
+          if (el.style[sKey] !== nextStyleVal) {
+            el.style[sKey] = nextStyleVal;
+          }
+        }
+        continue;
+      }
+      if (key.startsWith("on") && typeof val === "function") {
+        const evt = key.slice(2).toLowerCase();
+        const domEvent = evt === "change" && isTextControl ? "input" : evt;
+        wireDomEvent(el, domEvent, val, isTextControl);
+        continue;
+      }
+      if (key === "value" && (isTextControl || tagLower === "select")) {
+        const nextVal = String(val);
+        if (!el._isComposing && el.value !== nextVal) {
+          el.value = nextVal;
+        }
+        if (isNew && tagLower !== "select") {
+          el.setAttribute("value", nextVal);
+        }
+        continue;
+      }
+      if (key === "checked" && tagLower === "input") {
+        const nextChecked = Boolean(val);
+        if (el.checked !== nextChecked) el.checked = nextChecked;
+        continue;
+      }
+      if (key === "disabled") {
+        if (val) {
+          if (nextAttrNames) nextAttrNames.add("disabled");
+          el.disabled = true;
+          if (el.getAttribute("disabled") !== "disabled") {
+            el.setAttribute("disabled", "disabled");
+          }
+        }
+        continue;
+      }
+      if (nextAttrNames) nextAttrNames.add(key);
+      const nextStr = String(val);
+      if (el.getAttribute(key) !== nextStr) {
+        el.setAttribute(key, nextStr);
+        customElAttrChanged = true;
+      }
+    }
+
+    if (!isNew && isCustomEl && nextAttrNames && el.getAttributeNames) {
+      for (const attrName of el.getAttributeNames()) {
+        if (!nextAttrNames.has(attrName)) {
+          el.removeAttribute(attrName);
+          customElAttrChanged = true;
+        }
+      }
+      if (
+        (customElAttrChanged || PANEL_CUSTOM_TAGS.has(tagLower)) &&
+        el._root &&
+        typeof el._root.scheduleRender === "function"
+      ) {
+        el._root.scheduleRender();
+      }
+    }
+
+    el._pmProps = props;
+    el._pmKey = spec.key || "";
+    el._pmSlot = spec.slot || "";
+  }
+
+  function createDomFromSpec(spec) {
+    if (spec.kind === "text") {
+      const tn = document.createTextNode(spec.text);
+      tn._pmSlot = spec.slot || "";
+      return tn;
+    }
+    let reusedCustomEl = null;
+    if (spec.isCustomEl && currentRoot && currentRoot.reusableCustomElements) {
+      const bucket = currentRoot.reusableCustomElements.get(spec.tagLower);
+      if (bucket && bucket.length > 0) {
+        reusedCustomEl = bucket.shift();
+      }
+    }
+    const isNew = !reusedCustomEl;
+    const el =
+      reusedCustomEl ||
+      (spec.svgMode
+        ? document.createElementNS("http://www.w3.org/2000/svg", spec.tag)
+        : document.createElement(spec.tag));
+
+    applyElementProps(el, spec, isNew);
+
+    if (!spec.isCustomEl || spec.children.length > 0) {
+      if (isNew && (!el.childNodes || el.childNodes.length === 0)) {
+        for (let i = 0; i < spec.children.length; i++) {
+          el.appendChild(createDomFromSpec(spec.children[i]));
+        }
+      } else {
+        patchChildren(el, spec.children);
+      }
+    }
+
+    if (spec.tagLower === "select" && spec.props.value != null) {
+      const selVal = String(spec.props.value);
+      if (el.value !== selVal) el.value = selVal;
+    }
+    return el;
+  }
+
+  function canPatchInPlace(domNode, spec) {
+    if (!domNode || !spec) return false;
+    if (spec.kind === "text") {
+      if (domNode.nodeType !== 3) return false;
+      if (domNode._pmSlot && spec.slot && domNode._pmSlot !== spec.slot) return false;
+      return true;
+    }
+    if (domNode.nodeType !== 1 || !domNode.tagName) return false;
+    if (String(domNode.tagName).toLowerCase() !== spec.tagLower) return false;
+    const domKey = domNode._pmKey || "";
+    const specKey = spec.key || "";
+    if (domKey || specKey) {
+      return domKey === specKey;
+    }
+    if (domNode._pmSlot && spec.slot) {
+      return domNode._pmSlot === spec.slot;
+    }
+    return true;
+  }
+
+  function patchExistingDomNode(domNode, spec) {
+    if (spec.kind === "text") {
+      if (domNode.textContent !== spec.text) {
+        domNode.textContent = spec.text;
+      }
+      domNode._pmSlot = spec.slot || "";
+      return domNode;
+    }
+    applyElementProps(domNode, spec, false);
+    if (!spec.isCustomEl || spec.children.length > 0) {
+      patchChildren(domNode, spec.children);
+    }
+    if (spec.tagLower === "select" && spec.props.value != null) {
+      const selVal = String(spec.props.value);
+      if (domNode.value !== selVal) domNode.value = selVal;
+    }
+    return domNode;
+  }
+
+  function patchChildren(parentDom, nextSpecs) {
+    const liveList = parentDom.childNodes ? Array.from(parentDom.childNodes) : [];
+    const commonLen = Math.min(liveList.length, nextSpecs.length);
+    let idx = 0;
+    while (idx < commonLen && canPatchInPlace(liveList[idx], nextSpecs[idx])) {
+      patchExistingDomNode(liveList[idx], nextSpecs[idx]);
+      idx += 1;
+    }
+
+    if (idx === liveList.length && idx === nextSpecs.length) {
+      return;
+    }
+
+    let oldEnd = liveList.length - 1;
+    let newEnd = nextSpecs.length - 1;
+    const canInsertBefore = typeof parentDom.insertBefore === "function";
+    if (canInsertBefore) {
+      while (oldEnd >= idx && newEnd >= idx && canPatchInPlace(liveList[oldEnd], nextSpecs[newEnd])) {
+        patchExistingDomNode(liveList[oldEnd], nextSpecs[newEnd]);
+        oldEnd -= 1;
+        newEnd -= 1;
+      }
+    }
+
+    if (oldEnd < idx && newEnd < idx) {
+      return;
+    }
+
+    const suffixAnchor = canInsertBefore && oldEnd + 1 < liveList.length ? liveList[oldEnd + 1] : null;
+    const insertBeforeAnchor = (node) => {
+      if (suffixAnchor) {
+        parentDom.insertBefore(node, suffixAnchor);
+      } else {
+        parentDom.appendChild(node);
+      }
+    };
+
+    const rescueMap = currentRoot && currentRoot.reusableCustomElements;
+
+    if (oldEnd < idx) {
+      for (let j = idx; j <= newEnd; j++) {
+        insertBeforeAnchor(createDomFromSpec(nextSpecs[j]));
+      }
+      return;
+    }
+
+    if (newEnd < idx) {
+      for (let j = oldEnd; j >= idx; j--) {
+        if (rescueMap) collectOwnedCustomElements(liveList[j], rescueMap);
+        parentDom.removeChild(liveList[j]);
+      }
+      return;
+    }
+
+    // Reconcile divergent middle slice while reusing keyed elements and Custom Elements
+    const keyedPool = new Map();
+    for (let j = idx; j <= oldEnd; j++) {
+      const rem = liveList[j];
+      if (rem && rem.nodeType === 1 && rem._pmKey && rem.tagName) {
+        keyedPool.set(String(rem.tagName).toLowerCase() + "::" + rem._pmKey, rem);
+      } else if (rescueMap) {
+        collectOwnedCustomElements(rem, rescueMap);
+      }
+      parentDom.removeChild(rem);
+    }
+
+    for (let j = idx; j <= newEnd; j++) {
+      const spec = nextSpecs[j];
+      if (spec.kind === "element" && spec.key) {
+        const poolKey = spec.tagLower + "::" + spec.key;
+        const matched = keyedPool.get(poolKey);
+        if (matched) {
+          keyedPool.delete(poolKey);
+          patchExistingDomNode(matched, spec);
+          insertBeforeAnchor(matched);
+          continue;
+        }
+      }
+      insertBeforeAnchor(createDomFromSpec(spec));
+    }
+
+    if (rescueMap) {
+      for (const leftover of keyedPool.values()) {
+        collectOwnedCustomElements(leftover, rescueMap);
+      }
+    }
   }
 
   function cleanupHooksByPrefix(rootInst, prefix) {
@@ -323,6 +771,10 @@ export function renderVendorRuntimeJs(): string {
       rootTag: container && container.tagName ? container.tagName : "ROOT",
       hooks: [],
       ownedHookKeys: new Set(),
+      visitedHookKeys: null,
+      dirtyComponents: new Set(["*"]),
+      activeDirtySnapshot: null,
+      compCache: new Map(),
       reusableCustomElements: null,
       lastProjScope: null,
       unmounted: false,
@@ -350,33 +802,20 @@ export function renderVendorRuntimeJs(): string {
             : "";
         if (this.lastProjScope !== null && this.lastProjScope !== nextProjScope) {
           cleanupHooksByPrefix(this, rootId + "::" + this.lastProjScope + "::");
+          this.compCache.clear();
+          this.dirtyComponents.add("*");
         }
         this.lastProjScope = nextProjScope;
 
-        const activeEl = document.activeElement;
-        const focusId = activeEl && activeEl.id ? activeEl.id : null;
-        const selStart = activeEl && typeof activeEl.selectionStart === "number" ? activeEl.selectionStart : null;
-        const selEnd = activeEl && typeof activeEl.selectionEnd === "number" ? activeEl.selectionEnd : null;
+        const dirtySnap = new Set(this.dirtyComponents);
+        this.dirtyComponents.clear();
 
-        const savedScroll = new Map();
-        if (this.container) {
-          if (this.container.scrollTop || this.container.scrollLeft) {
-            savedScroll.set("__root__", [this.container.scrollTop || 0, this.container.scrollLeft || 0]);
-          }
-          if (this.container.querySelectorAll) {
-            const subEls = this.container.querySelectorAll("[id]");
-            for (let i = 0; i < subEls.length; i++) {
-              const node = subEls[i];
-              if (node.id && (node.scrollTop || node.scrollLeft)) {
-                savedScroll.set(node.id, [node.scrollTop || 0, node.scrollLeft || 0]);
-              }
-            }
-          }
-        }
+        // Preserve root container scrollTop/scrollLeft as safety fallback alongside in-place patching
+        const rootScrollTop = this.container ? this.container.scrollTop || 0 : 0;
+        const rootScrollLeft = this.container ? this.container.scrollLeft || 0 : 0;
 
         const reusableMap = new Map();
-        collectOwnedCustomElements(this.container, reusableMap);
-
+        const visitedSet = new Set();
         const prevRoot = currentRoot;
         const prevCompKey = currentComponentKey;
         const prevCursor = hookCursor;
@@ -385,44 +824,48 @@ export function renderVendorRuntimeJs(): string {
         hookCursor = 0;
         this.pendingEffects = [];
         this.reusableCustomElements = reusableMap;
+        this.activeDirtySnapshot = dirtySnap;
+        this.visitedHookKeys = visitedSet;
 
-        let domNode;
+        const nextSpecs = [];
         try {
-          domNode = renderVNodeToDom(this.element, false, "0");
+          evaluateToDescriptors(this.element, false, "0", nextSpecs);
+          patchChildren(this.container, nextSpecs);
         } finally {
+          this.visitedHookKeys = null;
+          this.activeDirtySnapshot = null;
           this.reusableCustomElements = null;
           currentRoot = prevRoot;
           currentComponentKey = prevCompKey;
           hookCursor = prevCursor;
         }
 
-        this.container.innerHTML = "";
-        this.container.appendChild(domNode);
-
-        if (savedScroll.has("__root__")) {
-          const [st, sl] = savedScroll.get("__root__");
-          this.container.scrollTop = st;
-          this.container.scrollLeft = sl;
-        }
-        for (const [elId, coords] of savedScroll.entries()) {
-          if (elId === "__root__") continue;
-          const targetEl = document.getElementById(elId);
-          if (targetEl) {
-            targetEl.scrollTop = coords[0];
-            targetEl.scrollLeft = coords[1];
-          }
-        }
-
-        if (focusId) {
-          const restored = document.getElementById(focusId);
-          if (restored && typeof restored.focus === "function") {
-            restored.focus();
-            if (selStart !== null && typeof restored.setSelectionRange === "function") {
-              try {
-                restored.setSelectionRange(selStart, selEnd);
-              } catch (_e) {}
+        // Clean up hooks and useEffect subscriptions for child components that unmounted in this render
+        const scopePrefix = rootId + "::" + nextProjScope + "::";
+        for (const key of [...this.ownedHookKeys]) {
+          if (key.startsWith(scopePrefix) && !visitedSet.has(key)) {
+            const hooks = sharedComponentHooks.get(key);
+            if (hooks) {
+              hooks.forEach((h) => {
+                if (h && typeof h.cleanup === "function") {
+                  try {
+                    h.cleanup();
+                  } catch (_e) {}
+                  h.cleanup = null;
+                  h.deps = null;
+                }
+              });
+              sharedComponentHooks.delete(key);
             }
+            this.ownedHookKeys.delete(key);
+            const compKey = key.slice(scopePrefix.length);
+            this.compCache.delete(compKey);
           }
+        }
+
+        if (this.container && rootScrollTop && !this.container.scrollTop) {
+          this.container.scrollTop = rootScrollTop;
+          this.container.scrollLeft = rootScrollLeft;
         }
 
         const effects = [...this.pendingEffects];
@@ -433,11 +876,14 @@ export function renderVendorRuntimeJs(): string {
         this.unmounted = false;
         activeRoots.add(this);
         this.element = element;
+        this.dirtyComponents.add("*");
         this.flushRender();
       },
       unmount() {
         this.unmounted = true;
         activeRoots.delete(this);
+        this.compCache.clear();
+        this.dirtyComponents.clear();
         for (const key of this.ownedHookKeys) {
           const hooks = sharedComponentHooks.get(key);
           if (hooks) {
@@ -462,36 +908,102 @@ export function renderVendorRuntimeJs(): string {
   }
 
   // ==========================================================================
-  // TanStack Query (@tanstack/react-query compatible implementation)
+  // TanStack Query (@tanstack/react-query compatible with Key-Scoped PubSub & LRU)
   // ==========================================================================
+  const DEFAULT_STALE_TIME_MS = 15000;
+  const MAX_QUERY_CACHE_ENTRIES = 100;
+
   class QueryClient {
     constructor() {
       this.cache = new Map();
+      this.keyListeners = new Map();
       this.listeners = new Set();
     }
     hashKey(queryKey) {
       return JSON.stringify(Array.isArray(queryKey) ? queryKey : [queryKey]);
     }
+    evictInactiveIfNeeded() {
+      if (this.cache.size <= MAX_QUERY_CACHE_ENTRIES) return;
+      for (const [k, entry] of this.cache.entries()) {
+        if (this.cache.size <= MAX_QUERY_CACHE_ENTRIES) break;
+        if ((entry.observerCount || 0) <= 0 && !entry.isFetching) {
+          this.cache.delete(k);
+        }
+      }
+    }
     getEntry(queryKey) {
       const k = this.hashKey(queryKey);
-      if (!this.cache.has(k)) {
-        this.cache.set(k, {
-          queryKey,
-          data: undefined,
-          error: null,
-          status: "pending",
-          isFetching: false,
-          promise: null,
-          updatedAt: 0,
-        });
+      let entry = this.cache.get(k);
+      if (entry) {
+        this.cache.delete(k);
+        this.cache.set(k, entry);
+        return entry;
       }
-      return this.cache.get(k);
+      entry = {
+        keyHash: k,
+        queryKey,
+        data: undefined,
+        error: null,
+        status: "pending",
+        isFetching: false,
+        promise: null,
+        abortController: null,
+        fetchSeq: 0,
+        invalidatedAtSeq: 0,
+        observerCount: 0,
+        updatedAt: 0,
+      };
+      this.cache.set(k, entry);
+      this.evictInactiveIfNeeded();
+      return entry;
     }
     subscribe(listener) {
       this.listeners.add(listener);
       return () => this.listeners.delete(listener);
     }
-    notify() {
+    subscribeKey(keyHash, listener) {
+      let set = this.keyListeners.get(keyHash);
+      if (!set) {
+        set = new Set();
+        this.keyListeners.set(keyHash, set);
+      }
+      set.add(listener);
+      const entry = this.cache.get(keyHash);
+      if (entry) entry.observerCount = (entry.observerCount || 0) + 1;
+      return () => {
+        const s = this.keyListeners.get(keyHash);
+        if (s) {
+          s.delete(listener);
+          if (s.size === 0) this.keyListeners.delete(keyHash);
+        }
+        const cur = this.cache.get(keyHash);
+        if (cur && cur.observerCount > 0) {
+          cur.observerCount -= 1;
+          if (
+            cur.observerCount === 0 &&
+            cur.isFetching &&
+            cur.abortController &&
+            typeof cur.abortController.abort === "function"
+          ) {
+            try {
+              cur.abortController.abort();
+            } catch (_e) {}
+            cur.abortController = null;
+            cur.isFetching = false;
+            cur.promise = null;
+          }
+        }
+      };
+    }
+    notify(keyHash) {
+      if (keyHash) {
+        const scoped = this.keyListeners.get(keyHash);
+        if (scoped) scoped.forEach((l) => l());
+      } else {
+        for (const scoped of this.keyListeners.values()) {
+          scoped.forEach((l) => l());
+        }
+      }
       this.listeners.forEach((l) => l());
     }
     async fetchQuery({ queryKey, queryFn, force = false }) {
@@ -499,24 +1011,63 @@ export function renderVendorRuntimeJs(): string {
       if (entry.isFetching && entry.promise && !force) {
         return entry.promise;
       }
+      if (entry.abortController && typeof entry.abortController.abort === "function") {
+        try {
+          entry.abortController.abort();
+        } catch (_e) {}
+      }
+      const seq = (entry.fetchSeq || 0) + 1;
+      entry.fetchSeq = seq;
+      const ctrl = typeof AbortController === "function" ? new AbortController() : null;
+      entry.abortController = ctrl;
       entry.isFetching = true;
-      this.notify();
+      this.notify(entry.keyHash);
+      const signal = ctrl ? ctrl.signal : undefined;
       const p = Promise.resolve()
-        .then(() => queryFn({ queryKey }))
+        .then(() => queryFn({ queryKey, signal }))
         .then((data) => {
+          if ((ctrl && ctrl.signal && ctrl.signal.aborted) || entry.abortController !== ctrl) {
+            return entry.data;
+          }
+          if ((entry.invalidatedAtSeq || 0) >= seq) {
+            entry.abortController = null;
+            entry.isFetching = false;
+            entry.promise = null;
+            entry.updatedAt = 0;
+            this.notify(entry.keyHash);
+            return data;
+          }
           entry.data = data;
           entry.error = null;
           entry.status = "success";
+          entry.abortController = null;
           entry.isFetching = false;
+          entry.promise = null;
           entry.updatedAt = Date.now();
-          this.notify();
+          this.notify(entry.keyHash);
           return data;
         })
         .catch((err) => {
+          if (
+            (ctrl && ctrl.signal && ctrl.signal.aborted) ||
+            (err && err.name === "AbortError") ||
+            entry.abortController !== ctrl
+          ) {
+            if (entry.abortController === ctrl) {
+              entry.abortController = null;
+              entry.isFetching = false;
+              entry.promise = null;
+              this.notify(entry.keyHash);
+            }
+            return entry.data;
+          }
           entry.error = err;
           entry.status = "error";
+          entry.abortController = null;
           entry.isFetching = false;
-          this.notify();
+          entry.promise = null;
+          entry.updatedAt = Date.now();
+          this.notify(entry.keyHash);
           throw err;
         });
       entry.promise = p;
@@ -524,15 +1075,33 @@ export function renderVendorRuntimeJs(): string {
     }
     invalidateQueries({ queryKey } = {}) {
       const prefix = queryKey ? (Array.isArray(queryKey) ? queryKey : [queryKey]) : [];
-      for (const entry of this.cache.values()) {
+      const matchedHashes = [];
+      for (const [k, entry] of this.cache.entries()) {
         const matches =
           prefix.length === 0 ||
           prefix.every((part, idx) => Array.isArray(entry.queryKey) && entry.queryKey[idx] === part);
         if (matches) {
           entry.updatedAt = 0;
+          entry.invalidatedAtSeq = entry.fetchSeq || 0;
+          if (entry.isFetching) {
+            if (entry.abortController && typeof entry.abortController.abort === "function") {
+              try {
+                entry.abortController.abort();
+              } catch (_e) {}
+            }
+            entry.abortController = null;
+            entry.isFetching = false;
+            entry.promise = null;
+          }
+          matchedHashes.push(k);
         }
       }
-      this.notify();
+      for (const k of matchedHashes) {
+        this.notify(k);
+      }
+      if (matchedHashes.length === 0 && prefix.length === 0) {
+        this.notify();
+      }
     }
   }
 
@@ -546,27 +1115,35 @@ export function renderVendorRuntimeJs(): string {
     return useContext(QueryClientContext);
   }
 
-  function useQuery({ queryKey, queryFn, enabled = true }) {
+  function useQuery({ queryKey, queryFn, enabled = true, staleTime = DEFAULT_STALE_TIME_MS }) {
     const client = useQueryClient();
     const [, setTick] = useState(0);
+    const queryFnRef = useRef(queryFn);
+    queryFnRef.current = queryFn;
+    const keyRef = useRef(queryKey);
+    keyRef.current = queryKey;
     const keyHash = client.hashKey(queryKey);
     const entry = client.getEntry(queryKey);
 
     useEffect(() => {
-      return client.subscribe(() => {
-        const current = client.getEntry(queryKey);
+      return client.subscribeKey(keyHash, () => {
+        const current = client.getEntry(keyRef.current);
         if (enabled && current.updatedAt === 0 && !current.isFetching) {
-          client.fetchQuery({ queryKey, queryFn }).catch(() => {});
+          client.fetchQuery({ queryKey: keyRef.current, queryFn: queryFnRef.current }).catch(() => {});
         }
         setTick((t) => t + 1);
       });
     }, [client, keyHash, enabled]);
 
     useEffect(() => {
-      if (enabled && (entry.updatedAt === 0 || entry.status === "pending") && !entry.isFetching) {
-        client.fetchQuery({ queryKey, queryFn }).catch(() => {});
+      if (!enabled || entry.isFetching) return;
+      const isNeverFetched = entry.updatedAt === 0 || entry.status === "pending";
+      const isExpiredSuccess =
+        entry.status === "success" && Date.now() - entry.updatedAt > staleTime;
+      if (isNeverFetched || isExpiredSuccess) {
+        client.fetchQuery({ queryKey: keyRef.current, queryFn: queryFnRef.current }).catch(() => {});
       }
-    }, [client, keyHash, enabled]);
+    }, [client, keyHash, enabled, staleTime]);
 
     return {
       data: entry.data,

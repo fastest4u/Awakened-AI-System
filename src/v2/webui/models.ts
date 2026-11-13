@@ -170,6 +170,22 @@ export class ProjectModel {
 }
 
 export class MemoryNoteModel {
+  static extractMarkdownBody(item: Record<string, unknown>): string {
+    if (typeof item.body === "string" && item.body.trim().length > 0) {
+      return item.body;
+    }
+    if (typeof item.content === "string") {
+      return item.content;
+    }
+    if (item.content && typeof item.content === "object" && !Array.isArray(item.content)) {
+      const nestedBody = (item.content as Record<string, unknown>).body;
+      if (typeof nestedBody === "string") {
+        return nestedBody;
+      }
+    }
+    return "";
+  }
+
   static enrichRawItems(
     items: readonly Record<string, unknown>[],
     projectRoot?: string,
@@ -177,12 +193,15 @@ export class MemoryNoteModel {
     return items.map((item) => {
       const recordId = String(item.recordId ?? item.id ?? "");
       const summary = String(item.summary ?? item.text ?? "");
-      const { title } = deriveCleanNoteTitle(item, recordId);
-      const body = typeof item.body === "string" ? item.body : "";
-      const extracted = extractNoteFilePathsAndSymbols(
-        `${title}\n${summary}\n${body}`,
-        projectRoot,
-      );
+      const body = MemoryNoteModel.extractMarkdownBody(item);
+      const { title } = deriveCleanNoteTitle({ ...item, body }, recordId);
+      const hasProjectedEntities =
+        Array.isArray(item.filePaths) &&
+        Array.isArray(item.symbols) &&
+        Array.isArray(item.wikilinks);
+      const extracted = hasProjectedEntities
+        ? { filePaths: [] as readonly string[], symbols: [] as readonly string[], wikilinks: [] as readonly string[] }
+        : extractNoteFilePathsAndSymbols(`${title}\n${summary}\n${body}`, projectRoot);
       const safeRawFilePaths = Array.isArray(item.filePaths)
         ? item.filePaths
             .filter((p): p is string => typeof p === "string")
@@ -214,6 +233,7 @@ export class MemoryNoteModel {
         recordKind: String(item.recordKind ?? item.kind ?? "insight"),
         title,
         summary,
+        body,
         status: String(item.status ?? "provisional"),
         filePaths,
         symbols,
@@ -241,8 +261,23 @@ export class MemoryNoteModel {
     return MemoryNoteModel.enrichRawItems(rawResult.items ?? [], projectRoot);
   }
 
-  static async getNoteById(foundation: V2Foundation, noteId: string): Promise<unknown> {
-    return foundation.content.invoke("memory_get", { id: noteId });
+  static async getNoteById(
+    foundation: V2Foundation,
+    noteId: string,
+    projectRoot?: string,
+  ): Promise<Record<string, unknown> | null> {
+    const raw = await foundation.content.invoke("memory_get", { id: noteId });
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+      return null;
+    }
+    const rec = raw as Record<string, unknown>;
+    if (rec.ok === false || rec.found === false) {
+      return null;
+    }
+    if ("recordId" in rec || "id" in rec) {
+      return MemoryNoteModel.enrichRawItems([rec], projectRoot)[0] ?? null;
+    }
+    return null;
   }
 }
 
@@ -292,13 +327,20 @@ export class OverviewModel {
       stale: audit.counts.staleNotes,
     };
 
+    const activeRawItems = collectedRawItems.filter(
+      (r) =>
+        !["retracted", "superseded", "expired", "erased-evidence"].includes(
+          String(r.status ?? ""),
+        ),
+    );
+
     const byKind: Record<string, number> = {
       adr: 0,
       insight: 0,
       mistake: 0,
       "session-log": 0,
     };
-    for (const n of notes) {
+    for (const n of activeRawItems) {
       const k = String(n.recordKind ?? n.kind ?? "insight").toLowerCase();
       if (k.includes("adr")) byKind.adr = (byKind.adr ?? 0) + 1;
       else if (k.includes("mistake")) byKind.mistake = (byKind.mistake ?? 0) + 1;
@@ -306,19 +348,56 @@ export class OverviewModel {
       else byKind.insight = (byKind.insight ?? 0) + 1;
     }
 
-    const totalNotes = Math.max(notes.length, 1);
     const totalVerified = audit.counts.verifiedNotes;
     const sessionCount = Array.isArray(lifecycle.sessions) ? lifecycle.sessions.length : 0;
-    const labels = ["S-5", "S-4", "S-3", "S-2", "S-1", "Current"];
-    const activitySeries = labels.map((label, idx) => {
-      const ratio = (idx + 1) / labels.length;
-      return {
-        label,
-        notes: Math.max(1, Math.round(totalNotes * ratio)),
-        verified: Math.max(0, Math.round(totalVerified * ratio)),
-        sessions: Math.max(1, Math.round(Math.max(sessionCount, 1) * ratio)),
-      };
+    const sortedChronoItems = [...activeRawItems].sort((a, b) => {
+      const ta = Date.parse(String(a.validFrom ?? "")) || 0;
+      const tb = Date.parse(String(b.validFrom ?? "")) || 0;
+      if (ta !== tb) return ta - tb;
+      return Number(a.sourceEventPosition ?? 0) - Number(b.sourceEventPosition ?? 0);
     });
+    const bucketCount =
+      sortedChronoItems.length === 0
+        ? 2
+        : Math.min(6, Math.max(2, sortedChronoItems.length));
+    const activitySeries =
+      sortedChronoItems.length === 0
+        ? [
+            {
+              label: "Start",
+              notes: 0,
+              verified: 0,
+              sessions: 0,
+            },
+            {
+              label: "Current",
+              notes: 0,
+              verified: 0,
+              sessions: sessionCount,
+            },
+          ]
+        : Array.from({ length: bucketCount }, (_, idx) => {
+            const isLast = idx === bucketCount - 1;
+            const cutoff = isLast
+              ? sortedChronoItems.length
+              : Math.max(1, Math.round(((idx + 1) / bucketCount) * sortedChronoItems.length));
+            const slice = sortedChronoItems.slice(0, cutoff);
+            const verifiedSlice = slice.filter((r) => {
+              const st = String(r.status ?? "");
+              return st === "verified" || st === "active";
+            }).length;
+            const sessionsSlice = isLast
+              ? sessionCount
+              : Math.round(((idx + 1) / bucketCount) * sessionCount);
+            const rawDate = String(slice[slice.length - 1]?.validFrom ?? "");
+            const shortDate = /^\d{4}-\d{2}-\d{2}/u.test(rawDate) ? rawDate.slice(5, 10) : "";
+            return {
+              label: isLast ? "Current" : shortDate || `S-${bucketCount - 1 - idx}`,
+              notes: slice.length,
+              verified: isLast ? totalVerified : verifiedSlice,
+              sessions: sessionsSlice,
+            };
+          });
 
     return {
       ok: true,
@@ -439,7 +518,10 @@ export function renderMvcModelsJs(): string {
       if (filters.query) params.set("query", filters.query);
       if (filters.status) params.set("status", filters.status);
       if (filters.kind) params.set("kind", filters.kind);
-      return apiJson("/api/notes?" + params.toString());
+      return apiJson(
+        "/api/notes?" + params.toString(),
+        filters.signal ? { signal: filters.signal } : undefined,
+      );
     }
     static async fetchById(projectRoot, recordId) {
       return apiJson(
