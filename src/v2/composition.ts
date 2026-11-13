@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, realpathSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { FreshStartInitializer } from "../orchestrator/fresh-start/fresh-start-initializer.js";
@@ -360,13 +360,41 @@ export async function createV2Foundation(
   let routerActiveGeneration: bigint | undefined;
   const routedFoundations = new Map<string, Promise<V2Foundation>>();
 
-  const resolveRoutedFoundation = async (rawTargetProjectRoot: string): Promise<V2Foundation | null> => {
+  const READ_ONLY_ROUTED_TOOLS = new Set<string>([
+    "memory_v2Status",
+    "memory_get",
+    "memory_list",
+    "memory_search",
+    "memory_recent",
+    "memory_contextPack",
+    "memory_selfCheck",
+    "memory_followUpRadar",
+    "memory_awaken",
+    "memory_lifecycleStatus",
+    "memory_verifyVault",
+    "memory_verifyNote",
+    "memory_verifySourceTruth",
+    "memory_findDuplicates",
+    "memory_checkStaleness",
+  ]);
+
+  const resolveRoutedFoundation = async (
+    rawTargetProjectRoot: string,
+    allowAutoBootstrap = true,
+  ): Promise<V2Foundation | null> => {
     const trimmed = rawTargetProjectRoot.trim();
     if (!trimmed) return null;
     if (!isAbsolute(trimmed)) {
       throw new FreshStartError("FRESH_START_INPUT_INVALID");
     }
     const resolvedTarget = resolve(trimmed);
+    const resolvedHome = resolve(paths.projectRoot);
+    if (
+      resolvedTarget === resolvedHome ||
+      (process.platform === "win32" && resolvedTarget.toLowerCase() === resolvedHome.toLowerCase())
+    ) {
+      return null;
+    }
     if (
       freshStartPathContains(paths.v1ArchiveRoot, resolvedTarget) ||
       freshStartPathContains(resolvedTarget, paths.v1ArchiveRoot) ||
@@ -374,19 +402,61 @@ export async function createV2Foundation(
     ) {
       throw new FreshStartError("FRESH_START_PATH_OVERLAP");
     }
-    mkdirSync(resolvedTarget, { recursive: true });
+    if (!existsSync(resolvedTarget)) {
+      throw new FreshStartError("FRESH_START_INPUT_INVALID");
+    }
+    let targetStat;
+    try {
+      targetStat = lstatSync(resolvedTarget);
+    } catch {
+      throw new FreshStartError("FRESH_START_INPUT_INVALID");
+    }
+    if (!targetStat.isDirectory() && !targetStat.isSymbolicLink()) {
+      throw new FreshStartError("FRESH_START_INPUT_INVALID");
+    }
     const canonicalTarget = realpathSync.native(resolvedTarget);
+    let canonicalStat;
+    try {
+      canonicalStat = statSync(canonicalTarget);
+    } catch {
+      throw new FreshStartError("FRESH_START_INPUT_INVALID");
+    }
+    if (!canonicalStat.isDirectory()) {
+      throw new FreshStartError("FRESH_START_INPUT_INVALID");
+    }
+    if (
+      canonicalTarget === paths.projectRoot ||
+      (process.platform === "win32" &&
+        canonicalTarget.toLowerCase() === paths.projectRoot.toLowerCase())
+    ) {
+      return null;
+    }
     if (
       freshStartPathContains(paths.v1ArchiveRoot, canonicalTarget) ||
       freshStartPathContains(paths.v2VaultRoot, canonicalTarget)
     ) {
       throw new FreshStartError("FRESH_START_PATH_OVERLAP");
     }
-    if (canonicalTarget === paths.projectRoot) {
-      return null;
+    if (
+      !allowAutoBootstrap
+      && !existsSync(join(canonicalTarget, "memory-v2", ".memory-mcp", "project-identity.json"))
+    ) {
+      throw new FreshStartError("FRESH_START_INPUT_INVALID");
     }
     let pending = routedFoundations.get(canonicalTarget);
-    if (!pending) {
+    if (pending) {
+      // Refresh LRU insertion order
+      routedFoundations.delete(canonicalTarget);
+      routedFoundations.set(canonicalTarget, pending);
+    } else {
+      if (routedFoundations.size >= 16) {
+        const oldestKey = routedFoundations.keys().next().value;
+        if (oldestKey !== undefined) {
+          const evicted = routedFoundations.get(oldestKey);
+          routedFoundations.delete(oldestKey);
+          void evicted?.then((f) => f.close()).catch(() => undefined);
+        }
+      }
       pending = (async () => {
         const targetConfig = await ensureProjectV2StoreReady({
           projectRoot: canonicalTarget,
@@ -541,7 +611,10 @@ export async function createV2Foundation(
                 ? argObj.workspaceRoot
                 : "";
           if (rawProjectRoot.trim().length > 0) {
-            const routed = await resolveRoutedFoundation(rawProjectRoot);
+            const routed = await resolveRoutedFoundation(
+              rawProjectRoot,
+              !READ_ONLY_ROUTED_TOOLS.has(name),
+            );
             if (routed) {
               const { projectRoot: _p, workspaceRoot: _w, ...forwardedArgs } = argObj;
               return routed.content.invoke(name, forwardedArgs);

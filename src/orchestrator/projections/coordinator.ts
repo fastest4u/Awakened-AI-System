@@ -1072,10 +1072,13 @@ export class V2ProjectionBuildCoordinator {
     const filenames = readdirSync(this.#projectionDirectory).sort();
     const filenamesPresent = new Set(filenames);
     assertStrictRetirementEvidence(filenamesPresent);
+    const needsFullRescan =
+      this.#faultInjector !== undefined || records.some((r) => r.state !== "retired");
     for (const record of resolvedRecords) {
       if (record.state !== "retired" || !filenamesPresent.has(record.retiredFilename)) {
         throw new Error("PROJECTION_PUBLICATION_RECOVERY_REQUIRED");
       }
+      if (!needsFullRescan) continue;
       let retired: StableProjectionGenerationIdentity | null;
       try {
         retired = filesystemStableProjectionDirectoryOperations.captureRetiredGeneration(

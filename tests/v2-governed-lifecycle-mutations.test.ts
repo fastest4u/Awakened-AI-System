@@ -31,6 +31,7 @@ import {
 } from "../src/orchestrator/retrieval/database-core.js";
 import { canonicalJson } from "../src/orchestrator/serialization/canonical-json.js";
 import { NodeSqliteDriver } from "../src/orchestrator/storage/node-sqlite-driver.js";
+import { BranchScopeRepository } from "../src/orchestrator/storage/branch-scope.repository.js";
 import {
   GovernedLifecycleError,
   GovernedLifecycleService,
@@ -759,6 +760,93 @@ test("governed_lifecycle_forget_evidence_scrubs_projections_and_shreds_custody_e
     }
   } finally {
     custody?.close();
+    await fixture.cleanup();
+  }
+});
+
+test("governed_lifecycle_cross_branch_promotion_publishes_and_verifies_projection_without_integrity_failure", async () => {
+  const fixture = await makeGovernedNoteDomainFixture();
+  try {
+    const featureNote = fixture.service().createV2(
+      fixture.prepareCreateV2(
+        fixture.commandV2({
+          recordKind: "insight",
+          summary: "Feature-branch note later promoted from main branch",
+          content: { format: "markdown", body: "# Cross-Branch Note\n\nCreated on feature branch.\n" },
+        }),
+      ),
+      fixture.rootContext,
+    ).response;
+
+    const mainBranchRef = "refs/heads/release/cross-branch-target";
+    const mainHeadCommit = "c".repeat(40);
+    const mainBranchScopeId = new BranchScopeRepository().resolveOrCreate(
+      fixture.connection,
+      fixture.rootContext.binding.projectId,
+      {
+        branchRef: mainBranchRef,
+        headCommit: mainHeadCommit,
+        detached: false,
+      },
+      "2026-10-19T12:40:00.000Z",
+    );
+    const mainWorkspace = {
+      kind: "git" as const,
+      worktreeRoot: fixture.retained.root,
+      gitDir: join(fixture.retained.root, ".git"),
+      gitCommonDir: join(fixture.retained.root, ".git"),
+      branchRef: mainBranchRef,
+      headCommit: mainHeadCommit,
+      detached: false,
+      workspaceId: fixture.rootContext.binding.workspaceId,
+    };
+    const mainContext = {
+      ...fixture.rootContext,
+      workspace: mainWorkspace,
+      branchScopeId: mainBranchScopeId,
+      binding: {
+        ...fixture.rootContext.binding,
+        workspace: mainWorkspace,
+      },
+    };
+
+    const governanceOnMain = new GovernedLifecycleService({
+      connection: fixture.connection,
+      context: mainContext,
+    });
+    const promoteReceipt = governanceOnMain.promote({
+      commandId: "61000000-0000-4000-8000-000000000001",
+      idempotencyKey: "cross-branch-promote-1",
+      sessionId: null,
+      recordId: featureNote.recordId,
+      targetStatus: "verified",
+      verificationMethod: "test-verified",
+      verificationAnchor: "tests/v2-governed-lifecycle-mutations.test.ts",
+      occurredAt: "2026-10-19T12:41:00.000Z",
+    });
+    assert.equal(promoteReceipt.targetStatus, "verified");
+
+    const projectionDir = join(fixture.retained.root, "projections-cross-branch");
+    const { coordinator, integrity } = buildCoordinator(fixture, projectionDir);
+    const mainProjectionBinding: ProjectBinding = Object.freeze({
+      projectId: mainContext.binding.projectId,
+      vaultId: mainContext.binding.vaultId,
+      storeId: mainContext.binding.storeId,
+      workspaceId: mainContext.binding.workspaceId,
+      branchScopeId: mainBranchScopeId,
+      branchRef: mainBranchRef,
+      sessionId: null,
+    });
+
+    const published = await coordinator.ensurePublishedV3(
+      mainProjectionBinding,
+      promoteReceipt.globalPosition,
+      5_000,
+    );
+    assert.equal(published.manifest.schemaVersion, 3);
+    const verifyReport = await integrity.verify(mainProjectionBinding, published.manifest);
+    assert.equal(verifyReport.status, "passed");
+  } finally {
     await fixture.cleanup();
   }
 });

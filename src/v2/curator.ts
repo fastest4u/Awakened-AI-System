@@ -93,16 +93,36 @@ export interface CuratorChatResponse {
   readonly data: unknown;
 }
 
+function deriveCleanNoteTitle(rawTitle: unknown, summary: string, body: string, fallbackId: string): string {
+  const genericPrefixes = new Set(["adr", "insight", "mistake", "session-log", "session log", "note"]);
+  if (typeof rawTitle === "string" && rawTitle.trim().length > 0) {
+    const trimmed = rawTitle.trim();
+    if (!genericPrefixes.has(trimmed.toLowerCase())) {
+      return trimmed;
+    }
+  }
+  const headingMatch = body.match(/^\s*#\s+(.+?)\s*$/mu);
+  if (headingMatch?.[1]) {
+    return headingMatch[1].trim();
+  }
+  const colonIdx = summary.indexOf(": ");
+  if (colonIdx > 0) {
+    const prefix = summary.slice(0, colonIdx).trim();
+    if (!genericPrefixes.has(prefix.toLowerCase())) {
+      return prefix;
+    }
+    const afterPrefix = summary.slice(colonIdx + 2).trim();
+    const secondColon = afterPrefix.indexOf(": ");
+    return secondColon > 0 ? `${prefix}: ${afterPrefix.slice(0, secondColon).trim()}` : summary;
+  }
+  return summary || fallbackId;
+}
+
 function normalizeNoteItem(raw: Record<string, unknown>): CuratorNoteSummary {
   const recordId = String(raw.recordId ?? raw.id ?? "");
   const summary = String(raw.summary ?? raw.text ?? "");
-  const colonIdx = summary.indexOf(": ");
-  const title =
-    typeof raw.title === "string" && raw.title.trim().length > 0
-      ? raw.title.trim()
-      : colonIdx > 0
-        ? summary.slice(0, colonIdx)
-        : summary || recordId;
+  const body = typeof raw.body === "string" ? raw.body : "";
+  const title = deriveCleanNoteTitle(raw.title, summary, body, recordId);
   const kind = String(raw.recordKind ?? raw.kind ?? "insight");
   const filePaths = Array.isArray(raw.filePaths)
     ? raw.filePaths.filter((p): p is string => typeof p === "string")
@@ -131,12 +151,37 @@ export class V2MemoryCuratorAgent {
     this.#foundation = foundation;
   }
 
-  async auditVault(options?: { readonly limit?: number }): Promise<CuratorAuditReport> {
-    const limit = options?.limit ?? 200;
+  async auditVault(options?: { readonly limit?: number; readonly pageSize?: number }): Promise<CuratorAuditReport> {
+    const maxItems = Math.max(1, options?.limit ?? 1_000);
+    const pageSize = Math.max(1, Math.min(200, options?.pageSize ?? Math.min(200, maxItems)));
     const status = await this.#foundation.status();
-    const listRaw = (await this.#foundation.content.invoke("memory_list", {
-      limit,
-    })) as { items?: Array<Record<string, unknown>> };
+    const collectedRawItems: Array<Record<string, unknown>> = [];
+    const seenIds = new Set<string>();
+    let cursor: string | null = null;
+    for (let page = 0; page < 50 && collectedRawItems.length < maxItems; page += 1) {
+      const remaining = maxItems - collectedRawItems.length;
+      const listRaw = (await this.#foundation.content.invoke("memory_list", {
+        limit: Math.min(pageSize, remaining),
+        ...(cursor ? { cursor } : {}),
+      })) as {
+        items?: Array<Record<string, unknown>>;
+        hasMore?: boolean;
+        nextCursor?: string | null;
+      };
+      const pageItems = listRaw.items ?? [];
+      let addedInPage = 0;
+      for (const item of pageItems) {
+        const id = String(item.recordId ?? item.id ?? "");
+        if (!id || seenIds.has(id)) continue;
+        seenIds.add(id);
+        collectedRawItems.push(item);
+        addedInPage += 1;
+      }
+      if (!listRaw.hasMore || !listRaw.nextCursor || addedInPage === 0) {
+        break;
+      }
+      cursor = listRaw.nextCursor;
+    }
     const dupRaw = (await this.#foundation.content.invoke("memory_findDuplicates", {})) as {
       duplicateGroups?: Array<{ contentHash: string; recordIds: string[] }>;
     };
@@ -144,7 +189,7 @@ export class V2MemoryCuratorAgent {
       staleItems?: Array<Record<string, unknown>>;
     };
 
-    const notes = (listRaw.items ?? []).map(normalizeNoteItem);
+    const notes = collectedRawItems.map(normalizeNoteItem);
     const notesById = new Map<string, CuratorNoteSummary>(notes.map((n) => [n.recordId, n]));
 
     const activeNotes = notes.filter(
@@ -352,10 +397,33 @@ export class V2MemoryCuratorAgent {
     }> = [];
     const expired: Array<{ readonly recordId: string }> = [];
 
+    const promotedSet = new Set<string>();
+    const notesById = new Map<string, CuratorNoteSummary>(
+      auditBefore.candidateQueue.map((c) => [c.recordId, c]),
+    );
+
     try {
       if (resolveDuplicates) {
         for (const group of auditBefore.duplicateGroups) {
           const keeperId = group.keeperRecordId;
+          const keeperCandidate = notesById.get(keeperId);
+          if (keeperCandidate && !promotedSet.has(keeperId)) {
+            await this.#foundation.content.invoke("memory_promote", {
+              sessionId,
+              recordId: keeperId,
+              targetStatus: "verified",
+              verificationMethod: "user-confirmed",
+              reason: "Auto-promoted duplicate group keeper before superseding duplicates",
+            });
+            promotedSet.add(keeperId);
+            promoted.push(
+              Object.freeze({
+                recordId: keeperId,
+                title: keeperCandidate.title,
+                status: "verified",
+              }),
+            );
+          }
           for (const dupId of group.duplicateRecordIds) {
             if (dupId === keeperId || supersededSet.has(dupId)) continue;
             const reason = `Auto-superseded duplicate of ${keeperId} by AI Memory Curator`;
@@ -379,7 +447,7 @@ export class V2MemoryCuratorAgent {
 
       if (promoteCandidates) {
         for (const candidate of auditBefore.candidateQueue) {
-          if (supersededSet.has(candidate.recordId)) continue;
+          if (supersededSet.has(candidate.recordId) || promotedSet.has(candidate.recordId)) continue;
           await this.#foundation.content.invoke("memory_promote", {
             sessionId,
             recordId: candidate.recordId,
@@ -387,6 +455,7 @@ export class V2MemoryCuratorAgent {
             verificationMethod: "user-confirmed",
             reason: "Auto-promoted verified candidate by AI Memory Curator",
           });
+          promotedSet.add(candidate.recordId);
           promoted.push(
             Object.freeze({
               recordId: candidate.recordId,
@@ -419,6 +488,7 @@ export class V2MemoryCuratorAgent {
       await this.#foundation.content.invoke("memory_sessionEnd", {
         sessionId,
         summary: `AI Memory Curator completed: promoted ${promoted.length}, superseded ${superseded.length}, expired ${expired.length}.`,
+        finalize: true,
       });
     }
 
@@ -514,12 +584,28 @@ export class V2MemoryCuratorAgent {
         rawMessage,
       )
     ) {
+      if (request.autoExecute === false) {
+        executedTools.push("memory_list", "memory_findDuplicates", "memory_checkStaleness");
+        const previewAudit = await this.auditVault();
+        return Object.freeze({
+          ok: true,
+          intent: "audit",
+          reply:
+            `[Dry-Run Preview] พบรายการรอจัดการ: รออนุมัติ ${previewAudit.counts.unpromotedCandidates} รายการ, ` +
+            `ซ้ำ ${previewAudit.counts.duplicateGroups} กลุ่ม, ล้าสมัย ${previewAudit.counts.staleNotes} รายการ ` +
+            `(autoExecute=false จึงยังไม่แก้ไขคลังความจำ)`,
+          executedTools: Object.freeze(executedTools),
+          data: previewAudit,
+        });
+      }
       executedTools.push(
         "memory_sessionStart",
         "memory_list",
         "memory_findDuplicates",
+        "memory_checkStaleness",
         "memory_promote",
         "memory_supersede",
+        "memory_expire",
         "memory_sessionEnd",
       );
       const receipt = await this.autoCurate({
@@ -534,6 +620,7 @@ export class V2MemoryCuratorAgent {
           `AI Curator จัดการความจำเสร็จสมบูรณ์! ` +
           `อนุมัติ (Promoted): ${receipt.promoted.length} รายการ, ` +
           `รวมความจำซ้ำ (Superseded): ${receipt.superseded.length} รายการ, ` +
+          `หมดอายุ (Expired): ${receipt.expired.length} รายการ, ` +
           `คะแนนสุขภาพความจำ: ${receipt.beforeHealthScore} → ${receipt.afterHealthScore}/100`,
         executedTools: Object.freeze(executedTools),
         data: receipt,

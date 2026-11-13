@@ -18,12 +18,14 @@ export class WebUiMvcController {
     extraProjectRoots: readonly string[],
     knownProjects: Set<string>,
     getFoundation: (root: string) => Promise<V2Foundation>,
+    isFoundationCached?: (root: string) => boolean,
   ) {
     const projects = await ProjectModel.listDiscoveredProjects(
       defaultProjectRoot,
       extraProjectRoots,
       knownProjects,
       getFoundation,
+      isFoundationCached,
     );
     return {
       ok: true,
@@ -189,7 +191,7 @@ export function renderMvcControllersJs(): string {
 // Controllers: MissionControlController, KanbanController, KnowledgeGraphController, CuratorController, McpConsoleController
 // ============================================================================
 (function (global) {
-  const { useState, useMemo, useCallback, createContext, useContext } = global.React;
+  const { useState, useEffect, useMemo, useCallback, useRef, createContext, useContext } = global.React;
   const { useQuery, useMutation, useQueryClient } = global.TanStackQuery;
   const {
     ProjectModel,
@@ -200,16 +202,195 @@ export function renderMvcControllersJs(): string {
     McpToolModel,
   } = global.PM_MVC_MODELS;
 
+  const VALID_TABS = new Set(["overview", "kanban", "graph", "curator", "mcp"]);
+
+  function parseDeepLinkHash(defaultProjectRoot) {
+    if (typeof window === "undefined" || !window.location) {
+      return {
+        tab: "overview",
+        project: defaultProjectRoot || "",
+        note: null,
+        node: null,
+        session: null,
+        q: "",
+        kind: "",
+        status: "",
+      };
+    }
+    const rawHash = String(window.location.hash || "").replace(/^#/, "");
+    if (!rawHash) {
+      return {
+        tab: "overview",
+        project: defaultProjectRoot || "",
+        note: null,
+        node: null,
+        session: null,
+        q: "",
+        kind: "",
+        status: "",
+      };
+    }
+    const qIdx = rawHash.indexOf("?");
+    let rawTab = "";
+    let params;
+    if (qIdx >= 0) {
+      rawTab = rawHash.slice(0, qIdx).trim().toLowerCase();
+      params = new URLSearchParams(rawHash.slice(qIdx + 1));
+    } else if (rawHash.includes("=")) {
+      params = new URLSearchParams(rawHash);
+      rawTab = String(params.get("view") || params.get("tab") || "").trim().toLowerCase();
+    } else {
+      rawTab = rawHash.trim().toLowerCase();
+      params = new URLSearchParams("");
+    }
+    const tab = VALID_TABS.has(rawTab) ? rawTab : "overview";
+    return {
+      tab,
+      project: params.get("project") || defaultProjectRoot || "",
+      note: params.get("note") || null,
+      node: params.get("node") || null,
+      session: params.get("session") || null,
+      q: params.get("q") || "",
+      kind: params.get("kind") || params.get("type") || "",
+      status: params.get("status") || "",
+    };
+  }
+
+  function writeDeepLinkHash(state, defaultProjectRoot) {
+    if (typeof window === "undefined" || !window.history || !window.history.replaceState) return;
+    const tab = VALID_TABS.has(state.tab) ? state.tab : "overview";
+    const params = new URLSearchParams();
+    if (state.project && state.project !== defaultProjectRoot) params.set("project", state.project);
+    if (state.note) params.set("note", state.note);
+    if (state.node) params.set("node", state.node);
+    if (state.session && state.session !== "all") params.set("session", state.session);
+    if (state.q) params.set("q", state.q);
+    if (state.kind && state.kind !== "all") params.set("kind", state.kind);
+    if (state.status && state.status !== "all") params.set("status", state.status);
+    const qs = params.toString();
+    const nextHash = "#" + tab + (qs ? "?" + qs : "");
+    if (window.location.hash !== nextHash) {
+      try {
+        window.history.replaceState(null, "", nextHash);
+      } catch (_e) {}
+    }
+  }
+
   const MissionControlContext = createContext(null);
 
   function useMissionControlController(defaultProjectRoot) {
     const queryClient = useQueryClient();
-    const [currentProject, setCurrentProject] = useState(defaultProjectRoot || "");
-    const [activeTab, setActiveTab] = useState("overview");
-    const [inspectedRecordId, setInspectedRecordId] = useState(null);
+    const initialRoute = useMemo(() => parseDeepLinkHash(defaultProjectRoot), [defaultProjectRoot]);
+    const [currentProject, setCurrentProject] = useState(initialRoute.project || defaultProjectRoot || "");
+    const [activeTab, setActiveTabState] = useState(initialRoute.tab || "overview");
+    const [inspectedRecordId, setInspectedRecordIdState] = useState(initialRoute.note || null);
+    const [graphJumpTarget, setGraphJumpTarget] = useState(
+      initialRoute.node || initialRoute.session || initialRoute.q || initialRoute.kind
+        ? {
+            nodeId: initialRoute.node,
+            sessionId: initialRoute.session || "all",
+            query: initialRoute.q || "",
+            kind: initialRoute.kind || "all",
+            ts: 1,
+          }
+        : null
+    );
+    const [kanbanJumpTarget, setKanbanJumpTarget] = useState(
+      initialRoute.tab === "kanban" && (initialRoute.q || initialRoute.kind)
+        ? { query: initialRoute.q || "", kind: initialRoute.kind || "", ts: 1 }
+        : null
+    );
     const [toastMessage, setToastMessage] = useState(null);
     const [theme, setTheme] = useState("dark");
     const [showTechDetails, setShowTechDetails] = useState(false);
+
+    useEffect(() => {
+      if (typeof window === "undefined" || !window.addEventListener) return;
+      const onHashChange = () => {
+        const parsed = parseDeepLinkHash(defaultProjectRoot);
+        setActiveTabState(parsed.tab);
+        if (parsed.project) setCurrentProject(parsed.project);
+        setInspectedRecordIdState(parsed.note);
+        if (parsed.node || parsed.session || (parsed.tab === "graph" && (parsed.q || parsed.kind))) {
+          setGraphJumpTarget({
+            nodeId: parsed.node,
+            sessionId: parsed.session || "all",
+            query: parsed.q || "",
+            kind: parsed.kind || "all",
+            ts: Date.now(),
+          });
+        }
+        if (parsed.tab === "kanban" && (parsed.q || parsed.kind)) {
+          setKanbanJumpTarget({ query: parsed.q || "", kind: parsed.kind || "", ts: Date.now() });
+        }
+      };
+      window.addEventListener("hashchange", onHashChange);
+      return () => window.removeEventListener("hashchange", onHashChange);
+    }, [defaultProjectRoot]);
+
+    const setActiveTab = useCallback(
+      (nextTab) => {
+        setActiveTabState(nextTab);
+        writeDeepLinkHash(
+          { tab: nextTab, project: currentProject, note: inspectedRecordId },
+          defaultProjectRoot
+        );
+      },
+      [currentProject, inspectedRecordId, defaultProjectRoot]
+    );
+
+    const inspectNote = useCallback(
+      (recordId) => {
+        const cleanId = recordId ? String(recordId) : null;
+        setInspectedRecordIdState(cleanId);
+        writeDeepLinkHash(
+          { tab: activeTab, project: currentProject, note: cleanId },
+          defaultProjectRoot
+        );
+      },
+      [activeTab, currentProject, defaultProjectRoot]
+    );
+
+    const closeInspectModal = useCallback(() => {
+      setInspectedRecordIdState(null);
+      writeDeepLinkHash({ tab: activeTab, project: currentProject, note: null }, defaultProjectRoot);
+    }, [activeTab, currentProject, defaultProjectRoot]);
+
+    const openInGraph = useCallback(
+      (opts = {}) => {
+        const targetNodeId =
+          opts.nodeId ||
+          (opts.recordId ? "note:" + opts.recordId : null) ||
+          (opts.sessionId ? "session:" + opts.sessionId : null) ||
+          (opts.filePath ? "file:" + opts.filePath : null) ||
+          (opts.symbol ? "symbol:" + opts.symbol : null);
+        const query = opts.query || "";
+        const sessionId = opts.filterSessionId || "all";
+        setInspectedRecordIdState(null);
+        setGraphJumpTarget({ nodeId: targetNodeId, sessionId, query, ts: Date.now() });
+        setActiveTabState("graph");
+        writeDeepLinkHash(
+          { tab: "graph", project: currentProject, node: targetNodeId, session: sessionId, q: query },
+          defaultProjectRoot
+        );
+      },
+      [currentProject, defaultProjectRoot]
+    );
+
+    const openInKanban = useCallback(
+      (opts = {}) => {
+        const query = String(opts.query || "").trim();
+        const kind = String(opts.kind || "").trim();
+        setInspectedRecordIdState(null);
+        setKanbanJumpTarget({ query, kind, ts: Date.now() });
+        setActiveTabState("kanban");
+        writeDeepLinkHash(
+          { tab: "kanban", project: currentProject, q: query },
+          defaultProjectRoot
+        );
+      },
+      [currentProject, defaultProjectRoot]
+    );
 
     const toggleTheme = useCallback(() => {
       setTheme((prev) => {
@@ -250,10 +431,14 @@ export function renderMvcControllersJs(): string {
       notify("ซิงก์ข้อมูลคลังความจำเรียบร้อยแล้ว (Synced TanStack Query Cache)", "success");
     }, [queryClient, notify]);
 
-    const switchProject = useCallback((nextProject) => {
-      setCurrentProject(nextProject);
-      setInspectedRecordId(null);
-    }, []);
+    const switchProject = useCallback(
+      (nextProject) => {
+        setCurrentProject(nextProject);
+        setInspectedRecordIdState(null);
+        writeDeepLinkHash({ tab: activeTab, project: nextProject }, defaultProjectRoot);
+      },
+      [activeTab, defaultProjectRoot]
+    );
 
     return {
       currentProject,
@@ -261,8 +446,12 @@ export function renderMvcControllersJs(): string {
       activeTab,
       setActiveTab,
       inspectedRecordId,
-      inspectNote: setInspectedRecordId,
-      closeInspectModal: () => setInspectedRecordId(null),
+      inspectNote,
+      closeInspectModal,
+      graphJumpTarget,
+      kanbanJumpTarget,
+      openInGraph,
+      openInKanban,
       noteDetailQuery,
       projectsQuery,
       overviewQuery,
@@ -289,14 +478,24 @@ export function renderMvcControllersJs(): string {
   }
 
   class KanbanController {
-    static useController(projectRoot, notify) {
+    static useController(projectRoot, notify, jumpTarget) {
       const queryClient = useQueryClient();
-      const [searchQuery, setSearchQuery] = useState("");
-      const [kindFilter, setKindFilter] = useState("");
+      const [searchQuery, setSearchQuery] = useState(
+        jumpTarget && jumpTarget.query ? String(jumpTarget.query) : ""
+      );
+      const [kindFilter, setKindFilter] = useState(
+        jumpTarget && jumpTarget.kind ? String(jumpTarget.kind) : ""
+      );
       const [viewMode, setViewMode] = useState("kanban"); // "kanban" | "table"
       const [newKind, setNewKind] = useState("writeADR");
       const [newTitle, setNewTitle] = useState("");
       const [newSummary, setNewSummary] = useState("");
+
+      useEffect(() => {
+        if (!jumpTarget) return;
+        if (typeof jumpTarget.query === "string") setSearchQuery(jumpTarget.query);
+        if (typeof jumpTarget.kind === "string") setKindFilter(jumpTarget.kind);
+      }, [jumpTarget && jumpTarget.ts]);
 
       const notesQuery = useQuery({
         queryKey: MemoryNoteModel.queryKey(projectRoot, { query: searchQuery, kind: kindFilter }),
@@ -377,13 +576,30 @@ export function renderMvcControllersJs(): string {
   }
 
   class KnowledgeGraphController {
-    static useController(projectRoot) {
-      const [kindFilter, setKindFilter] = useState("all");
-      const [sessionFilter, setSessionFilter] = useState("all");
-      const [selectedNodeId, setSelectedNodeId] = useState(null);
+    static useController(projectRoot, jumpTarget) {
+      const [kindFilter, setKindFilter] = useState(
+        jumpTarget && jumpTarget.kind ? String(jumpTarget.kind) : "all"
+      );
+      const [sessionFilter, setSessionFilter] = useState(
+        jumpTarget && jumpTarget.sessionId ? String(jumpTarget.sessionId) : "all"
+      );
+      const [selectedNodeId, setSelectedNodeId] = useState(
+        jumpTarget && jumpTarget.nodeId ? String(jumpTarget.nodeId) : null
+      );
       const [layoutMode, setLayoutMode] = useState("flow"); // "flow" | "orbital"
-      const [searchQuery, setSearchQuery] = useState("");
-      const [zoom, setZoom] = useState(1);
+      const [searchQuery, setSearchQuery] = useState(
+        jumpTarget && jumpTarget.query ? String(jumpTarget.query) : ""
+      );
+      const [zoom, setZoom] = useState(1); const [pan, setPan] = useState({ x: 0, y: 0 }); const dragRef = useRef(null);
+
+      useEffect(() => {
+        if (!jumpTarget) return;
+        setKindFilter(jumpTarget.kind ? String(jumpTarget.kind) : "all");
+        if (jumpTarget.nodeId) setSelectedNodeId(String(jumpTarget.nodeId));
+        if (jumpTarget.sessionId) setSessionFilter(String(jumpTarget.sessionId));
+        if (typeof jumpTarget.query === "string") setSearchQuery(jumpTarget.query);
+      }, [jumpTarget && jumpTarget.ts]);
+
       const graphQuery = useQuery({
         queryKey: KnowledgeGraphModel.queryKey(projectRoot),
         queryFn: () => KnowledgeGraphModel.fetch(projectRoot),
@@ -391,7 +607,7 @@ export function renderMvcControllersJs(): string {
       });
 
       const layout = useMemo(() => {
-        const data = graphQuery.data || { nodes: [], edges: [], stats: {} };
+        const data = graphQuery.data || { nodes: [], edges: [], stats: {}, causalTriads: [] };
         const rawNodes = data.nodes || [];
         const rawEdges = data.edges || [];
         const nodeById = new Map(rawNodes.map((n) => [n.id, n]));
@@ -487,7 +703,7 @@ export function renderMvcControllersJs(): string {
                 highlightedNodeIds.add("session:" + noteNode.sessionId);
               }
               for (const e of rawEdges) {
-                if (e.target === nid) highlightedNodeIds.add(e.source);
+                if (e.target === nid) highlightedNodeIds.add(e.source); if (e.source === nid && ((selectedNode.kind === "file" && e.relation === "mentions-symbol") || (selectedNode.kind === "symbol" && e.relation === "touches-file"))) highlightedNodeIds.add(e.target);
               }
             }
           }
@@ -514,10 +730,10 @@ export function renderMvcControllersJs(): string {
             return aHi - bHi;
           });
 
-        const sessionCol = sortHighlightedFirst(filteredNodes.filter((n) => n.kind === "session"));
-        const noteCol = sortHighlightedFirst(filteredNodes.filter((n) => n.kind === "note"));
-        const fileCol = sortHighlightedFirst(filteredNodes.filter((n) => n.kind === "file"));
-        const symbolCol = sortHighlightedFirst(filteredNodes.filter((n) => n.kind === "symbol"));
+        const sessionCol = filteredNodes.filter((n) => n.kind === "session");
+        const noteCol = filteredNodes.filter((n) => n.kind === "note");
+        const fileCol = filteredNodes.filter((n) => n.kind === "file");
+        const symbolCol = filteredNodes.filter((n) => n.kind === "symbol");
 
         const width = 960;
         let height = 540;
@@ -525,11 +741,11 @@ export function renderMvcControllersJs(): string {
         let visibleNodes = filteredNodes;
 
         if (layoutMode === "flow") {
-          const maxPerCol = 11;
-          const sVis = sessionCol.slice(0, maxPerCol);
-          const nVis = noteCol.slice(0, maxPerCol);
-          const fVis = fileCol.slice(0, maxPerCol);
-          const symVis = symbolCol.slice(0, maxPerCol);
+          const maxPerCol = 14; const sliceCol = (arr) => { if (arr.length <= maxPerCol) return arr; const hi = arr.filter((n) => highlightedNodeIds.has(n.id)).slice(0, maxPerCol); const rest = arr.filter((n) => !highlightedNodeIds.has(n.id)).slice(0, Math.max(0, maxPerCol - hi.length)); const keep = new Set([...hi, ...rest].map((n) => n.id)); return arr.filter((n) => keep.has(n.id)).slice(0, maxPerCol); };
+          const sVis = sliceCol(sessionCol);
+          const nVis = sliceCol(noteCol);
+          const fVis = sliceCol(fileCol);
+          const symVis = sliceCol(symbolCol);
           visibleNodes = [...sVis, ...nVis, ...fVis, ...symVis];
           const maxRows = Math.max(sVis.length, nVis.length, fVis.length, symVis.length, 1);
           height = Math.max(500, maxRows * 44 + 76);
@@ -562,7 +778,7 @@ export function renderMvcControllersJs(): string {
 
           sessionCol.forEach((n, idx) => {
             const angle = (2 * Math.PI * idx) / Math.max(sessionCol.length, 1) - Math.PI / 2;
-            const radius = Math.round((sessionCol.length <= 1 ? 0 : 90) * zoom);
+            const radius = sessionCol.length <= 1 ? 0 : 90;
             positions.set(n.id, {
               x: Math.round(cx + radius * Math.cos(angle)),
               y: Math.round(cy + radius * Math.sin(angle)),
@@ -571,7 +787,7 @@ export function renderMvcControllersJs(): string {
 
           noteCol.forEach((n, idx) => {
             const angle = (2 * Math.PI * idx) / Math.max(noteCol.length, 1) - Math.PI / 2 + 0.2;
-            const radius = Math.round(170 * zoom);
+            const radius = 170;
             positions.set(n.id, {
               x: Math.round(cx + radius * Math.cos(angle)),
               y: Math.round(cy + radius * Math.sin(angle)),
@@ -580,7 +796,7 @@ export function renderMvcControllersJs(): string {
 
           outerRing.forEach((n, idx) => {
             const angle = (2 * Math.PI * idx) / Math.max(outerRing.length, 1) - Math.PI / 2;
-            const radius = Math.round((n.kind === "file" ? 242 : 215) * zoom);
+            const radius = n.kind === "file" ? 242 : 215;
             positions.set(n.id, {
               x: Math.round(cx + radius * Math.cos(angle)),
               y: Math.round(cy + radius * Math.sin(angle)),
@@ -611,6 +827,7 @@ export function renderMvcControllersJs(): string {
             relatedSymbols,
           },
           positions,
+          causalTriads: data.causalTriads || [],
           stats: {
             sessionNodes:
               rawStats.sessionNodes ?? sessionNodesList.length ?? 0,
@@ -638,9 +855,9 @@ export function renderMvcControllersJs(): string {
         searchQuery,
         setSearchQuery,
         zoom,
-        zoomIn: () => setZoom((z) => Math.min(1.6, Number((z + 0.15).toFixed(2)))),
-        zoomOut: () => setZoom((z) => Math.max(0.6, Number((z - 0.15).toFixed(2)))),
-        resetZoom: () => setZoom(1),
+        pan, setPan, dragRef, zoomIn: () => setZoom((z) => Math.min(2.8, Number((z + 0.25).toFixed(2)))),
+        zoomOut: () => setZoom((z) => Math.max(0.55, Number((z - 0.25).toFixed(2)))),
+        resetZoom: () => { setZoom(1); setPan({ x: 0, y: 0 }); }, focusNode: (nodeId) => { const tid = nodeId || (layout.selectedNode && layout.selectedNode.id); const pos = tid ? layout.positions.get(tid) : null; if (pos) { setZoom(1.75); setPan({ x: Math.round(pos.x - layout.width / 2), y: Math.round(pos.y - layout.height / 2) }); } },
         graphQuery,
         layout,
       };
@@ -675,6 +892,8 @@ export function renderMvcControllersJs(): string {
             (data.promoted ? data.promoted.length : 0) +
             " รายการ, ยุบรวมความจำซ้ำ " +
             (data.superseded ? data.superseded.length : 0) +
+            " รายการ, หมดอายุ (Expired) " +
+            (data.expired ? data.expired.length : 0) +
             " รายการ (Health Score: " +
             data.beforeHealthScore +
             " → " +
@@ -686,7 +905,14 @@ export function renderMvcControllersJs(): string {
               id: "ac-" + Date.now(),
               role: "ai",
               text: summaryMsg,
-              tools: ["memory_sessionStart", "memory_promote", "memory_supersede", "memory_sessionEnd"],
+              tools: [
+                "memory_sessionStart",
+                "memory_promote",
+                "memory_supersede",
+                "memory_checkStaleness",
+                "memory_expire",
+                "memory_sessionEnd",
+              ],
             },
           ]);
           if (notify) notify(summaryMsg, "success");
@@ -780,6 +1006,8 @@ export function renderMvcControllersJs(): string {
     KnowledgeGraphController,
     CuratorController,
     McpConsoleController,
+    parseDeepLinkHash,
+    writeDeepLinkHash,
   };
 })(window);
 `;

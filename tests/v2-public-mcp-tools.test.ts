@@ -938,3 +938,180 @@ test("read-only-recovery mode, coordinator V3 reconciliation journal, and govern
     fixture.cleanup();
   }
 });
+
+test("MCP stdio server exposes resource templates, note/session/graph resources, ?projectRoot= routing, and session-handoff prompt with read-only purity", async () => {
+  const fixture = await createStoreFixture({ productionProfile: true, promoteMode: "active" });
+  try {
+    await withMcpClient(fixture, async (client) => {
+      const started = parseToolJson(
+        await client.callTool({
+          name: "memory_sessionStart",
+          arguments: {
+            agentName: "mcp-resource-tester",
+            taskSummary: "Seed note for MCP resource template verification",
+            includeContext: false,
+          },
+        }),
+      );
+      const sessionId = String(started.sessionId);
+      const created = parseToolJson(
+        await client.callTool({
+          name: "memory_writeADR",
+          arguments: {
+            sessionId,
+            title: "Resource Template Exposure Policy",
+            summary: "Expose governed notes and sessions via MCP URI templates.",
+            autoVerify: true,
+          },
+        }),
+      );
+      const recordId = String(created.recordId);
+
+      // Snapshot event count BEFORE resource & prompt reads
+      const roBefore = new DatabaseSync(fixture.eventsPath, { readOnly: true });
+      const eventsBefore = Number(
+        (roBefore.prepare("SELECT COUNT(*) AS cnt FROM events").get() as { cnt: number | bigint }).cnt,
+      );
+      roBefore.close();
+
+      const templates = await client.listResourceTemplates();
+      const templateUris = templates.resourceTemplates.map((t) => t.uriTemplate);
+      assert.ok(templateUris.includes("memory://notes/{recordId}"), "Missing memory://notes/{recordId} template");
+      assert.ok(templateUris.includes("memory://sessions/{sessionId}"), "Missing memory://sessions/{sessionId} template");
+
+      const resources = await client.listResources();
+      const resourceUris = resources.resources.map((r) => r.uri);
+      assert.ok(resourceUris.includes("memory://current/adrs"));
+      assert.ok(resourceUris.includes("memory://current/mistakes"));
+      assert.ok(resourceUris.includes("memory://graph"));
+
+      const readText = (res: Awaited<ReturnType<Client["readResource"]>>): string => {
+        const first = res.contents[0];
+        return first && "text" in first ? first.text : "";
+      };
+
+      const noteRes = await client.readResource({ uri: `memory://notes/${recordId}` });
+      assert.ok(readText(noteRes).includes("Resource Template Exposure Policy"));
+
+      const sessionRes = await client.readResource({ uri: `memory://sessions/${sessionId}` });
+      assert.ok(readText(sessionRes).includes(sessionId));
+
+      const graphRes = await client.readResource({
+        uri: `memory://graph?projectRoot=${encodeURIComponent(fixture.projectRoot)}`,
+      });
+      const graphPayload = JSON.parse(readText(graphRes) || "{}") as {
+        nodes?: Array<{ id: string }>;
+      };
+      assert.ok(graphPayload.nodes?.some((n) => n.id === `note:${recordId}`));
+
+      const radarStaticRes = await client.readResource({ uri: "memory://current/radar" });
+      assert.ok(readText(radarStaticRes).length > 2);
+
+      const unencodedRoot = fixture.projectRoot.replace(/\\/gu, "/");
+      const projStatusRes = await client.readResource({
+        uri: `memory://projects/${unencodedRoot}/status`,
+      });
+      assert.equal((JSON.parse(readText(projStatusRes)) as { ok?: boolean }).ok, true);
+
+      const projRadarRes = await client.readResource({
+        uri: `memory://projects/${unencodedRoot}/radar`,
+      });
+      assert.ok(readText(projRadarRes).length > 2);
+
+      const unregDir = mkdtempSync(join(tmpdir(), "pm-v2-unreg-res-"));
+      try {
+        await assert.rejects(
+          () =>
+            client.readResource({
+              uri: `memory://graph?projectRoot=${encodeURIComponent(unregDir)}`,
+            }),
+        );
+        assert.equal(
+          existsSync(join(unregDir, "memory-v2")),
+          false,
+          "Read-only resource lookup must not auto-bootstrap an uninitialized projectRoot",
+        );
+      } finally {
+        rmSync(unregDir, { recursive: true, force: true });
+      }
+
+      const prompts = await client.listPrompts();
+      assert.ok(prompts.prompts.some((p) => p.name === "session-handoff"));
+      const handoff = await client.getPrompt({
+        name: "session-handoff",
+        arguments: { sessionId },
+      });
+      assert.ok(handoff.messages.length >= 1);
+
+      const roAfter = new DatabaseSync(fixture.eventsPath, { readOnly: true });
+      const eventsAfter = Number(
+        (roAfter.prepare("SELECT COUNT(*) AS cnt FROM events").get() as { cnt: number | bigint }).cnt,
+      );
+      roAfter.close();
+      assert.equal(eventsAfter, eventsBefore, "Reading MCP resources and prompts must append 0 events");
+
+      // Verify finalizing an already-'ending' session & forgetEvidence MEMORY_RULES.md refresh
+      mkdirSync(join(fixture.projectRoot, ".antigravity"), { recursive: true });
+      const rulesAdr = parseToolJson(
+        await client.callTool({
+          name: "memory_writeADR",
+          arguments: {
+            sessionId,
+            title: "Clean Rules Sync Title",
+            summary: "Ensure MEMORY_RULES.md never duplicates titles and refreshes on forgetEvidence.",
+            body: "# Clean Rules Sync Title\n\nGoverned body.\n",
+            autoVerify: true,
+          },
+        }),
+      );
+      const rulesFilePath = join(fixture.projectRoot, ".antigravity", "MEMORY_RULES.md");
+      const rulesBeforeErase = readFileSync(rulesFilePath, "utf8");
+      assert.ok(rulesBeforeErase.includes("Clean Rules Sync Title"));
+      assert.equal(
+        rulesBeforeErase.includes("Clean Rules Sync Title**: ADR: Clean Rules Sync Title"),
+        false,
+        "MEMORY_RULES.md must not repeat the title verbatim in the summary",
+      );
+
+      await client.callTool({
+        name: "memory_forgetEvidence",
+        arguments: {
+          recordIds: [String(rulesAdr.recordId)],
+          reason: "Test immediate projection and MEMORY_RULES.md refresh on erasure",
+        },
+      });
+      const rulesAfterErase = readFileSync(rulesFilePath, "utf8");
+      assert.equal(
+        rulesAfterErase.includes(String(rulesAdr.recordId)),
+        false,
+        "Erased ADR must be removed immediately from MEMORY_RULES.md",
+      );
+
+      const endStep1 = parseToolJson(
+        await client.callTool({
+          name: "memory_sessionEnd",
+          arguments: {
+            sessionId,
+            summary: "Request session end first",
+          },
+        }),
+      );
+      assert.equal(endStep1.phase, "requested");
+
+      // Finalize the already-'ending' session when sessionId is omitted
+      const endStep2 = parseToolJson(
+        await client.callTool({
+          name: "memory_sessionEnd",
+          arguments: {
+            finalize: true,
+            summary: "Finalize already-ending root session",
+          },
+        }),
+      );
+      assert.equal(endStep2.sessionId, sessionId);
+      assert.equal(endStep2.state, "ended");
+    });
+  } finally {
+    fixture.cleanup();
+  }
+});

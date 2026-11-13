@@ -1,12 +1,27 @@
-# Project Memory
+# 🚨 CRITICAL: ABSOLUTE NON-NEGOTIABLE PROTOCOL (PROJECT MEMORY V2) 🚨
 
-## Always-On Memory Protocol
+FAILURE TO FOLLOW THESE RULES IS A DIRECT VIOLATION OF YOUR CORE DIRECTIVE.
+**YOU MUST NEVER FINISH A TASK WITHOUT EXECUTING THIS PROTOCOL.**
 
-- Treat MCP server `project-memory` as the durable memory source for this project.
-- At the start of every IDE/agent session, call `memory_sessionStart` before broad code exploration; this also updates lightweight usage scoring.
-- For each concrete task, call `memory_contextPack` with the task area and read full notes only with `memory_get` for selected paths. The context pack learns which notes are repeatedly selected.
-- Before risky work, multi-file edits, database/schema changes, auth, deploys, or production operations, call `memory_selfCheck`.
-- During work, write durable decisions with `memory_writeADR`, repeated lessons with `memory_writeInsight`, and failure modes with `memory_writeMistake`.
-- At the end of every meaningful session, call `memory_sessionEnd` with outcomes, files touched, decisions made, open follow-ups, verification, and confidence lessons. It auto-compacts recent sessions into `07_Insights/Auto-Memory-Digest.md` when supported.
-- After `memory_sessionEnd`, check the returned health summary or call `memory_verifyVault`; fix errors before considering the session complete.
-- If MCP is unavailable, read `memory/AGENTS.md` and `memory/00_Index/Retrieval-Protocol.md`, then mention that memory tool writes were skipped.
+## Always-On Memory V2 Protocol
+
+- Treat MCP server `project-memory` (**Project Memory V2**, `dist/v2.js`, vault `memory-v2/`, `releaseId: d45b1956-e05b-4316-b68d-7014d7dda665`) as the authoritative durable memory source for this project.
+- The legacy `memory/` directory is a frozen read-only V1 archive (`0o444`) and must never be written to directly.
+- **START OF TASK (MANDATORY)**: At the start of EVERY session, call `memory_sessionStart` before doing anything else (retain `sessionId`, `leaseId`, `leaseToken`, `fencingToken`).
+- **CONTEXT GATHERING**: For each task, call `memory_contextPack` with the task area. Read full notes using `memory_get` and browse/query via `memory_search`, `memory_list`, `memory_recent`, and `memory_followUpRadar`.
+- **PRE-FLIGHT CHECK**: Before risky work, multi-file edits, or deployments, YOU MUST call `memory_selfCheck`.
+- **DURING WORK**: Write decisions using `memory_writeADR`, lessons using `memory_writeInsight`, failures using `memory_writeMistake`, and checkpoints/evidence using `memory_checkpoint` / `memory_recordEvidenceBatch`. Use `memory_promote`, `memory_supersede`, `memory_retract`, `memory_expire`, and `memory_forgetEvidence` for governed lifecycle transitions.
+- **END OF TASK (MANDATORY)**: At the end of EVERY meaningful session or task, YOU MUST call `memory_sessionEnd` with `finalize: true` (or `complete: true`) so the root session transitions cleanly to `'ended'` and releases its lease. Do not end your turn, say goodbye, or consider the task complete until this tool is successfully called.
+- **VERIFICATION**: After `memory_sessionEnd`, check the returned health summary or call `memory_verifyVault` / `memory_v2Status`.
+
+## project-memory V2 Tool Usage Policy (Full-Auto)
+
+- **AUTO — invoke proactively, do NOT ask**: All 34 V2 tools — `memory_v2Status`, `memory_sessionStart`, `memory_contextPack`, `memory_selfCheck`, `memory_get`, `memory_list`, `memory_search`, `memory_recent`, `memory_followUpRadar`, `memory_awaken`, `memory_lifecycleStatus`, `memory_verifyVault`, `memory_verifyNote`, `memory_verifySourceTruth`, `memory_checkStaleness`, `memory_findDuplicates`, `memory_writeSessionLog`, `memory_writeADR`, `memory_writeInsight`, `memory_writeMistake`, `memory_checkpoint`, `memory_recoverSession`, `memory_sessionFork`, `memory_recordChildResult`, `memory_completeChildSession`, `memory_amendSessionEnd`, `memory_cancelSessionEnd`, `memory_recordEvidenceBatch`, `memory_promote`, `memory_supersede`, `memory_retract`, `memory_expire`, `memory_forgetEvidence`, `memory_sessionEnd`.
+- **OPERATOR CLI (`node dist/v2-admin.js`)**: Store administration, backups (`backup`), restores (`restore`), projection rebuilds (`rebuild-projections`), build sync (`sync-build`), WebUI (`webui`), and archive verification (`verify-v1-archive`) run through `node dist/v2-admin.js`.
+
+## Context7 Documentation Lookup
+
+1. Always start with `resolve-library-id` using the library name and the user's question, unless the user provides an exact library ID in `/org/project` format.
+2. Pick the best match by exact name match, description relevance, code snippet count, source reputation, and benchmark score.
+3. Call `get-library-docs` with the selected library ID and topic.
+4. Answer using the fetched docs.

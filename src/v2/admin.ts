@@ -11,6 +11,7 @@ import {
   readSync,
   readdirSync,
   realpathSync,
+  rmSync,
   statSync,
   writeFileSync,
 } from "node:fs";
@@ -43,7 +44,8 @@ import {
   createSignedOperatorApprovalEnvelope,
   freshStartRequestDigest,
 } from "../orchestrator/fresh-start/operator-approval.js";
-import type { BranchScopeId } from "../orchestrator/identity/contracts.js";
+import type { BranchScopeId, ProjectId } from "../orchestrator/identity/contracts.js";
+import { BranchScopeRepository } from "../orchestrator/storage/branch-scope.repository.js";
 import {
   GitWorkspaceResolver,
   SpawnSyncGitCommandRunner,
@@ -856,15 +858,28 @@ export async function runV2Admin(argv: readonly string[]): Promise<unknown> {
         )
         .get({ $projectId: info.projectId }) as { pos?: bigint | number } | undefined;
       terminalPosition = BigInt(posRow?.pos ?? 0);
-      const branchRow = connection
-        .prepare(
-          `SELECT branch_scope_id
-           FROM branch_scopes
-           WHERE project_id = $projectId AND retired_at IS NULL
-           ORDER BY created_at ASC LIMIT 1`,
-        )
-        .get({ $projectId: info.projectId }) as { branch_scope_id?: string } | undefined;
-      branchScopeId = (branchRow?.branch_scope_id ?? null) as BranchScopeId | null;
+      if (workspace.kind === "git") {
+        branchScopeId = new BranchScopeRepository().inspect(
+          connection,
+          info.projectId as ProjectId,
+          {
+            branchRef: workspace.branchRef,
+            headCommit: workspace.headCommit,
+            detached: workspace.detached,
+          },
+        );
+        if (!branchScopeId) {
+          const fallbackRow = connection
+            .prepare(
+              `SELECT branch_scope_id
+               FROM branch_scopes
+               WHERE project_id = $projectId AND retired_at IS NULL
+               ORDER BY created_at DESC LIMIT 1`,
+            )
+            .get({ $projectId: info.projectId }) as { branch_scope_id?: string } | undefined;
+          branchScopeId = (fallbackRow?.branch_scope_id ?? null) as BranchScopeId | null;
+        }
+      }
     } finally {
       connection.close();
     }
@@ -879,6 +894,26 @@ export async function runV2Admin(argv: readonly string[]): Promise<unknown> {
       sessionId: null,
     });
     const projectionDirectory = join(info.storeRoot, "projections");
+    if (existsSync(join(projectionDirectory, "projection-manifest.json"))) {
+      try {
+        const existingManifest = JSON.parse(
+          readFileSync(join(projectionDirectory, "projection-manifest.json"), "utf8"),
+        ) as {
+          workspaceId?: string;
+          branchScopeId?: string | null;
+          branchRef?: string | null;
+        };
+        if (
+          existingManifest.workspaceId !== projectionBinding.workspaceId ||
+          (existingManifest.branchScopeId ?? null) !== projectionBinding.branchScopeId ||
+          (existingManifest.branchRef ?? null) !== projectionBinding.branchRef
+        ) {
+          rmSync(projectionDirectory, { recursive: true, force: true });
+        }
+      } catch {
+        rmSync(projectionDirectory, { recursive: true, force: true });
+      }
+    }
     mkdirSync(projectionDirectory, { recursive: true });
     const eventReader = new SqliteProjectionEventReader({
       driver,
@@ -967,6 +1002,7 @@ export async function runV2Admin(argv: readonly string[]): Promise<unknown> {
       MEMORY_V2_VAULT_PATH: explicit.v2VaultRoot,
       MEMORY_V1_ARCHIVE_PATH: explicit.v1ArchiveRoot,
       MEMORY_V2_RELEASE_ID: explicit.releaseId,
+      MEMORY_V2_AUTO_SYNC_BUILD: "1",
     });
     loadV2LaunchConfig(env);
 
@@ -987,6 +1023,7 @@ export async function runV2Admin(argv: readonly string[]): Promise<unknown> {
           `MEMORY_V2_VAULT_PATH = ${JSON.stringify(env.MEMORY_V2_VAULT_PATH)}`,
           `MEMORY_V1_ARCHIVE_PATH = ${JSON.stringify(env.MEMORY_V1_ARCHIVE_PATH)}`,
           `MEMORY_V2_RELEASE_ID = ${JSON.stringify(env.MEMORY_V2_RELEASE_ID)}`,
+          `MEMORY_V2_AUTO_SYNC_BUILD = ${JSON.stringify(env.MEMORY_V2_AUTO_SYNC_BUILD)}`,
           "",
         ].join("\n"),
       }),
@@ -1018,6 +1055,44 @@ export async function runV2Admin(argv: readonly string[]): Promise<unknown> {
               command: "node",
               args: [v2EntryPath],
               env,
+              autoApprove: [
+                "memory_search",
+                "memory_get",
+                "memory_list",
+                "memory_recent",
+                "memory_contextPack",
+                "memory_followUpRadar",
+                "memory_writeSessionLog",
+                "memory_writeInsight",
+                "memory_writeMistake",
+                "memory_writeADR",
+                "memory_sessionStart",
+                "memory_sessionEnd",
+                "memory_lifecycleStatus",
+                "memory_selfCheck",
+                "memory_awaken",
+                "memory_verifyVault",
+                "memory_verifyNote",
+                "memory_verifySourceTruth",
+                "memory_findDuplicates",
+                "memory_checkStaleness",
+                "memory_v2Status",
+                "memory_checkpoint",
+                "memory_recoverSession",
+                "memory_sessionFork",
+                "memory_recordChildResult",
+                "memory_completeChildSession",
+                "memory_amendSessionEnd",
+                "memory_cancelSessionEnd",
+                "memory_recordEvidenceBatch",
+                "memory_promote",
+                "memory_supersede",
+                "memory_retract",
+                "memory_expire",
+                "memory_forgetEvidence",
+              ],
+              disabledTools: [],
+              disabled: false,
             },
           },
         }),
@@ -1085,12 +1160,73 @@ export async function runV2Admin(argv: readonly string[]): Promise<unknown> {
             },
           },
         }),
+        secondaryJson: Object.freeze({
+          enableAllProjectMcpServers: true,
+          enabledMcpjsonServers: Object.freeze(["project-memory"]),
+        }),
       }),
     });
 
     for (const client of Object.values(clients)) {
       loadV2LaunchConfig(client.env);
     }
+
+    const v2RuleBody = [
+      "# 🚨 CRITICAL: ABSOLUTE NON-NEGOTIABLE PROTOCOL (PROJECT MEMORY V2) 🚨",
+      "",
+      "FAILURE TO FOLLOW THESE RULES IS A DIRECT VIOLATION OF YOUR CORE DIRECTIVE.",
+      "**YOU MUST NEVER FINISH A TASK WITHOUT EXECUTING THIS PROTOCOL.**",
+      "",
+      "## Always-On Memory V2 Protocol",
+      "",
+      `- Treat MCP server \`project-memory\` (**Project Memory V2**, \`dist/v2.js\`, vault \`memory-v2/\`, \`releaseId: ${explicit.releaseId}\`) as the authoritative durable memory source for this project.`,
+      "- The legacy `memory/` directory is a frozen read-only V1 archive (`0o444`) and must never be written to directly.",
+      "- **START OF TASK (MANDATORY)**: At the start of EVERY session, call `memory_sessionStart` before doing anything else (retain `sessionId`, `leaseId`, `leaseToken`, `fencingToken`).",
+      "- **CONTEXT GATHERING**: For each task, call `memory_contextPack` with the task area. Read full notes using `memory_get` and browse/query via `memory_search`, `memory_list`, `memory_recent`, and `memory_followUpRadar`.",
+      "- **PRE-FLIGHT CHECK**: Before risky work, multi-file edits, or deployments, YOU MUST call `memory_selfCheck`.",
+      "- **DURING WORK**: Write decisions using `memory_writeADR`, lessons using `memory_writeInsight`, failures using `memory_writeMistake`, and checkpoints/evidence using `memory_checkpoint` / `memory_recordEvidenceBatch`. Use `memory_promote`, `memory_supersede`, `memory_retract`, `memory_expire`, and `memory_forgetEvidence` for governed lifecycle transitions.",
+      "- **END OF TASK (MANDATORY)**: At the end of EVERY meaningful session or task, YOU MUST call `memory_sessionEnd` with `finalize: true` (or `complete: true`) so the root session transitions cleanly to `'ended'` and releases its lease. Do not end your turn, say goodbye, or consider the task complete until this tool is successfully called.",
+      "- **VERIFICATION**: After `memory_sessionEnd`, check the returned health summary or call `memory_verifyVault` / `memory_v2Status`.",
+      "",
+      "## project-memory V2 Tool Usage Policy (Full-Auto)",
+      "",
+      "- **AUTO — invoke proactively, do NOT ask**: All 34 V2 tools — `memory_v2Status`, `memory_sessionStart`, `memory_contextPack`, `memory_selfCheck`, `memory_get`, `memory_list`, `memory_search`, `memory_recent`, `memory_followUpRadar`, `memory_awaken`, `memory_lifecycleStatus`, `memory_verifyVault`, `memory_verifyNote`, `memory_verifySourceTruth`, `memory_checkStaleness`, `memory_findDuplicates`, `memory_writeSessionLog`, `memory_writeADR`, `memory_writeInsight`, `memory_writeMistake`, `memory_checkpoint`, `memory_recoverSession`, `memory_sessionFork`, `memory_recordChildResult`, `memory_completeChildSession`, `memory_amendSessionEnd`, `memory_cancelSessionEnd`, `memory_recordEvidenceBatch`, `memory_promote`, `memory_supersede`, `memory_retract`, `memory_expire`, `memory_forgetEvidence`, `memory_sessionEnd`.",
+      "- **OPERATOR CLI (`node dist/v2-admin.js`)**: Store administration, backups (`backup`), restores (`restore`), projection rebuilds (`rebuild-projections`), build sync (`sync-build`), WebUI (`webui`), and archive verification (`verify-v1-archive`) run through `node dist/v2-admin.js`.",
+      "",
+      "## Context7 Documentation Lookup",
+      "",
+      "1. Always start with `resolve-library-id` using the library name and the user's question, unless the user provides an exact library ID in `/org/project` format.",
+      "2. Pick the best match by exact name match, description relevance, code snippet count, source reputation, and benchmark score.",
+      "3. Call `get-library-docs` with the selected library ID and topic.",
+      "4. Answer using the fetched docs.",
+      "",
+    ].join("\n");
+
+    const cursorMdcContent = [
+      "---",
+      "description: Always-On Project Memory V2 Protocol and Governed Lifecycle Rules",
+      'globs: "**/*"',
+      "alwaysApply: true",
+      "---",
+      "",
+      v2RuleBody,
+    ].join("\n");
+
+    const sanitizedExampleMcp = {
+      mcpServers: {
+        "project-memory": {
+          command: "node",
+          args: ["<ENGINE_ROOT>/dist/v2.js"],
+          env: {
+            MEMORY_PROJECT_ROOT: "<PROJECT_ROOT>",
+            MEMORY_V2_VAULT_PATH: "<PROJECT_ROOT>/memory-v2",
+            MEMORY_V1_ARCHIVE_PATH: "<PROJECT_ROOT>/memory",
+            MEMORY_V2_RELEASE_ID: "<RELEASE_UUID>",
+            MEMORY_V2_AUTO_SYNC_BUILD: "1",
+          },
+        },
+      },
+    };
 
     const writtenFiles: string[] = [];
     if (values["--output-dir"]) {
@@ -1104,26 +1240,82 @@ export async function runV2Admin(argv: readonly string[]): Promise<unknown> {
         writeFileSync(target, content, "utf8");
         writtenFiles.push(relPath);
       };
+
+      const buildClaudeLocalSettings = (): Record<string, unknown> => {
+        const target = join(outputDir, ".claude", "settings.local.json");
+        const merged: Record<string, unknown> = {};
+        if (existsSync(target)) {
+          try {
+            const parsed = JSON.parse(readFileSync(target, "utf8")) as unknown;
+            if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+              for (const [key, val] of Object.entries(parsed as Record<string, unknown>)) {
+                if (key === "mcpServers") continue;
+                if (
+                  key === "permissions" &&
+                  val &&
+                  typeof val === "object" &&
+                  !Array.isArray(val)
+                ) {
+                  const perms = { ...(val as Record<string, unknown>) };
+                  if (Array.isArray(perms.allow)) {
+                    perms.allow = perms.allow.filter(
+                      (entry) => entry !== "mcp__project-memory__memory_status",
+                    );
+                  }
+                  merged.permissions = perms;
+                  continue;
+                }
+                merged[key] = val;
+              }
+            }
+          } catch {
+            // Replace malformed settings file cleanly with canonical V2 enablement
+          }
+        }
+        const existingServers = Array.isArray(merged.enabledMcpjsonServers)
+          ? merged.enabledMcpjsonServers.filter(
+              (item): item is string => typeof item === "string" && item.length > 0,
+            )
+          : [];
+        merged.enableAllProjectMcpServers = true;
+        merged.enabledMcpjsonServers = Array.from(new Set([...existingServers, "project-memory"]));
+        return merged;
+      };
+
       writeTarget(clients.codex.configPath, clients.codex.toml);
       writeTarget(clients.opencode.configPath, `${JSON.stringify(clients.opencode.json, null, 2)}\n`);
       writeTarget(
         clients.antigravity.configPath,
         `${JSON.stringify(clients.antigravity.json, null, 2)}\n`,
       );
+      writeTarget(
+        ".antigravity/mcp.example.json",
+        `${JSON.stringify(sanitizedExampleMcp, null, 2)}\n`,
+      );
       writeTarget(clients.cursor.configPath, `${JSON.stringify(clients.cursor.json, null, 2)}\n`);
+      writeTarget(".cursor/rules/project-memory.mdc", cursorMdcContent);
       writeTarget(clients.zed.configPath, `${JSON.stringify(clients.zed.json, null, 2)}\n`);
       writeTarget(
         clients.windsurf.configPath,
         `${JSON.stringify(clients.windsurf.json, null, 2)}\n`,
       );
       writeTarget(
+        ".windsurf/mcp_config.example.json",
+        `${JSON.stringify(sanitizedExampleMcp, null, 2)}\n`,
+      );
+      writeTarget(".windsurf/rules/project-memory.md", v2RuleBody);
+      writeTarget(
         clients.claudeCode.configPath,
         `${JSON.stringify(clients.claudeCode.json, null, 2)}\n`,
       );
       writeTarget(
         clients.claudeCode.secondaryConfigPath,
-        `${JSON.stringify(clients.claudeCode.json, null, 2)}\n`,
+        `${JSON.stringify(buildClaudeLocalSettings(), null, 2)}\n`,
       );
+      writeTarget("CLAUDE.md", v2RuleBody);
+      writeTarget(".rules", v2RuleBody);
+      writeTarget(".windsurfrules", v2RuleBody);
+      writeTarget(".github/copilot-instructions.md", v2RuleBody);
     }
 
     return Object.freeze({
@@ -1157,8 +1349,17 @@ export async function runV2Admin(argv: readonly string[]): Promise<unknown> {
       entryUrl,
     });
     process.stderr.write(`Project Memory V2 WebUI listening at ${handle.url}\n`);
-    await new Promise<void>(() => {
-      // Keep server process alive until terminated
+    await new Promise<void>((resolveStop) => {
+      let stopping = false;
+      const onSignal = () => {
+        if (stopping) return;
+        stopping = true;
+        process.off("SIGINT", onSignal);
+        process.off("SIGTERM", onSignal);
+        void handle.close().finally(() => resolveStop());
+      };
+      process.once("SIGINT", onSignal);
+      process.once("SIGTERM", onSignal);
     });
     return { ok: true, url: handle.url };
   }

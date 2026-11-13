@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
 import {
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -8,12 +9,13 @@ import {
   rmSync,
   writeFileSync,
 } from "node:fs";
+import { request as httpRequest } from "node:http";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import { pathToFileURL } from "node:url";
-import { Script } from "node:vm";
+import { Script, runInNewContext } from "node:vm";
 import type { FreshStartRelease } from "../src/orchestrator/fresh-start/contracts.js";
 import { FreshStartInitializer } from "../src/orchestrator/fresh-start/fresh-start-initializer.js";
 import { canonicalJson } from "../src/orchestrator/serialization/canonical-json.js";
@@ -211,12 +213,62 @@ test("Task 1.2, 1.3 & 1.4: V2MemoryCuratorAgent audits, autoCurates, and chats i
     });
     assert.equal(auditRes.intent, "audit");
 
+    // Preview mode (autoExecute: false) must NOT mutate candidate/duplicate notes
+    const unverifiedDupA = (await fixture.foundation.content.invoke("memory_writeInsight", {
+      title: "Insight: Cache Query Plans Per Schema Hash",
+      summary: "Cache compiled SQLite statements keyed by schemaIdentityHash.",
+    })) as { recordId: string };
+    const unverifiedDupB = (await fixture.foundation.content.invoke("memory_writeInsight", {
+      title: "Insight: Cache Query Plans Per Schema Hash",
+      summary: "Cache compiled SQLite statements keyed by schemaIdentityHash.",
+    })) as { recordId: string };
+
+    const previewCurate = await curator.chat({
+      message: "จัดระเบียบความจำ",
+      autoExecute: false,
+    });
+    assert.equal(previewCurate.intent, "audit");
+    assert.ok(
+      !previewCurate.executedTools.includes("memory_promote") &&
+        !previewCurate.executedTools.includes("memory_supersede"),
+      "autoExecute: false must return audit preview without executing mutations",
+    );
+    const dupABefore = (await fixture.foundation.content.invoke("memory_get", {
+      id: unverifiedDupA.recordId,
+    })) as { status: string };
+    assert.equal(dupABefore.status, "candidate");
+
+    // Verify paginated auditVault with small pageSize walks all pages cleanly
+    const pagedAudit = await curator.auditVault({ pageSize: 2 });
+    assert.ok(
+      pagedAudit.counts.totalNotes >= 4,
+      "auditVault cursor pagination must collect notes across multiple pages",
+    );
+
     const promoteRes = await curator.chat({
       message: "อนุมัติ candidate ทั้งหมด",
       autoExecute: true,
     });
     assert.equal(promoteRes.intent, "auto_curate");
     assert.ok(promoteRes.executedTools.includes("memory_promote"));
+
+    // Keeper of unverified duplicate pair must be promoted to verified, duplicate superseded, and curator session finalized (0 'ending' sessions from curator)
+    const lifecycleAfterCurator = (await fixture.foundation.content.invoke(
+      "memory_lifecycleStatus",
+      {},
+    )) as {
+      sessions: Array<{ sessionId: string; semanticState: string; currentTask: string }>;
+    };
+    const stuckCuratorSessions = lifecycleAfterCurator.sessions.filter(
+      (s) =>
+        s.currentTask.includes("AI Memory Curator") && s.semanticState === "ending",
+    );
+    assert.equal(
+      stuckCuratorSessions.length,
+      0,
+      "V2MemoryCuratorAgent.autoCurate must finalize its session to 'ended' without leaving 'ending' sessions",
+    );
+    assert.ok(unverifiedDupB.recordId);
   } finally {
     await fixture.cleanup();
   }
@@ -527,6 +579,407 @@ test("Task 2: V2 WebUI Server, Knowledge Graph, Multi-Project Switcher, Governan
     assert.equal(concNotes.ok, true);
   } finally {
     await serverHandle.close();
+    await fixture.cleanup();
+  }
+});
+
+test("Task 2.2: buildMemoryKnowledgeGraph emits wikilinks, supersedes, causal-triad & completed child forked-from edges without orphan-session or false defines-symbol pollution", async () => {
+  const graph = buildMemoryKnowledgeGraph(
+    [
+      {
+        recordId: "adr-old",
+        recordKind: "adr",
+        title: "Legacy Rate Limiter",
+        summary: "Old limiter policy",
+        body: "# Legacy Rate Limiter\n\nDeprecated.",
+        status: "verified",
+        sessionId: "sess-root",
+      },
+      {
+        recordId: "adr-new",
+        recordKind: "adr",
+        title: "Token Bucket Rate Limiter",
+        summary: "Replaces [[Legacy Rate Limiter]] using `TokenBucketLimiter` across src/a.ts and src/b.ts.",
+        body: "# Token Bucket Rate Limiter\n\nSupersedes [[Legacy Rate Limiter]] and avoids self-link [[Token Bucket Rate Limiter]].",
+        status: "verified",
+        sessionId: "sess-root",
+        supersedesRecordId: "adr-old",
+      },
+      {
+        recordId: "mistake-1",
+        recordKind: "mistake",
+        title: "Burst Overflow Bug",
+        summary: "Triggered when `TokenBucketLimiter` burst window lacked clamping.",
+        body: "# Burst Overflow Bug\n\nFixed by [[Token Bucket Rate Limiter]].",
+        status: "verified",
+        sessionId: null, // Orphan / imported note — must NOT bind to sessions[0]!
+      },
+    ],
+    [
+      {
+        sessionId: "sess-root",
+        kind: "root",
+        parentSessionId: null,
+        semanticState: "ended",
+        noteCount: 2,
+        noteIds: ["adr-old", "adr-new"],
+      },
+      {
+        sessionId: "sess-child-done",
+        kind: "child",
+        parentSessionId: "sess-root",
+        semanticState: "completed",
+        noteCount: 0,
+        noteIds: [],
+      },
+    ],
+  );
+
+  // 1. Completed child session with 0 notes still retains its forked-from lineage edge
+  assert.ok(
+    graph.edges.some(
+      (e) =>
+        e.source === "session:sess-root" &&
+        e.target === "session:sess-child-done" &&
+        (e.relation as string) === "forked-from",
+    ),
+    "Completed child session must keep forked-from edge",
+  );
+
+  // 2. Orphan note (sessionId: null) must NOT be falsely linked to sessions[0]
+  assert.ok(
+    !graph.edges.some(
+      (e) => e.target === "note:mistake-1" && e.relation === "created-in-session",
+    ),
+    "Sessionless note must not be falsely assigned to sessions[0]",
+  );
+
+  // 3. Multi-file note without disk confirmation must NOT fabricate defines-symbol onto filePaths[0]
+  assert.ok(
+    !graph.edges.some(
+      (e) =>
+        e.source === "file:src/a.ts" &&
+        e.target === "symbol:TokenBucketLimiter" &&
+        e.relation === "defines-symbol",
+    ),
+    "Multi-file note must not guess filePaths[0] defines symbol",
+  );
+
+  // 4. [[wikilinks]] emit links-to-note edges (and exclude self-links)
+  assert.ok(
+    graph.edges.some(
+      (e) =>
+        e.source === "note:adr-new" &&
+        e.target === "note:adr-old" &&
+        (e.relation as string) === "links-to-note",
+    ),
+    "Expected links-to-note edge resolved from [[Legacy Rate Limiter]]",
+  );
+  assert.ok(
+    !graph.edges.some(
+      (e) =>
+        e.source === "note:adr-new" &&
+        e.target === "note:adr-new" &&
+        (e.relation as string) === "links-to-note",
+    ),
+    "Self wikilinks must not create self-loop edges",
+  );
+
+  // 5. Supersession & causal-triad edges exist
+  assert.ok(
+    graph.edges.some(
+      (e) =>
+        e.source === "note:adr-new" &&
+        e.target === "note:adr-old" &&
+        (e.relation as string) === "supersedes",
+    ),
+    "Expected supersedes edge from adr-new -> adr-old",
+  );
+  assert.ok(
+    graph.edges.some(
+      (e) =>
+        e.source === "note:mistake-1" &&
+        e.target === "note:adr-new" &&
+        (e.relation as string) === "causal-triad",
+    ),
+    "Expected causal-triad edge linking mistake-1 -> adr-new via shared TokenBucketLimiter",
+  );
+});
+
+test("Task 3: WebUI security hardening, CSRF/Host/Origin/GET-registration guards, VM-valid MVC bundles, deep-linking, responsive nav, and safe Markdown", async () => {
+  const fixture = await createActiveStoreFixture("pm-v2-webui-sec-");
+  const unregisteredPath = join(tmpdir(), `pm-v2-unregistered-${randomUUID()}`);
+  const serverHandle = await startV2WebUiServer({
+    defaultProjectRoot: fixture.projectRoot,
+    port: 0,
+    host: "127.0.0.1",
+    foundations: new Map([[fixture.projectRoot, fixture.foundation]]),
+  });
+
+  try {
+    const baseUrl = serverHandle.url;
+
+    // 1. Security headers + CSRF meta token on GET /
+    const rootRes = await fetch(`${baseUrl}/`);
+    assert.equal(rootRes.status, 200);
+    const csp = rootRes.headers.get("content-security-policy") ?? "";
+    assert.ok(csp.includes("default-src 'self'"), `Expected CSP header, got: ${csp}`);
+    assert.equal(rootRes.headers.get("x-frame-options"), "DENY");
+    assert.equal(rootRes.headers.get("x-content-type-options"), "nosniff");
+    const html = await rootRes.text();
+    const csrfMatch = /<meta\s+name="pm-csrf-token"\s+content="([^"]+)"/u.exec(html);
+    assert.ok(csrfMatch?.[1], "Expected <meta name=\"pm-csrf-token\"> in index HTML");
+    const csrfToken = csrfMatch[1]!;
+
+    // 2. Host header DNS-rebinding defense (403 on evil Host)
+    const evilHostStatus = await new Promise<number>((resolveStatus, rejectStatus) => {
+      const req = httpRequest(
+        {
+          host: "127.0.0.1",
+          port: serverHandle.port,
+          path: "/api/projects",
+          method: "GET",
+          headers: { Host: "evil.example.com" },
+        },
+        (res) => {
+          res.resume();
+          resolveStatus(res.statusCode ?? 0);
+        },
+      );
+      req.on("error", rejectStatus);
+      req.end();
+    });
+    assert.equal(evilHostStatus, 403, "Expected 403 when Host header is not loopback");
+
+    // 3. Content-Type enforcement (415 on text/plain POST)
+    const badCtRes = await fetch(`${baseUrl}/api/governance`, {
+      method: "POST",
+      headers: { "content-type": "text/plain" },
+      body: "hello",
+    });
+    assert.equal(badCtRes.status, 415);
+
+    // 4. Cross-Origin / Sec-Fetch-Site / CSRF token enforcement on browser POSTs
+    const evilOriginRes = await fetch(`${baseUrl}/api/governance`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        Origin: "https://evil.example",
+        "x-pm-csrf-token": csrfToken,
+      },
+      body: JSON.stringify({ action: "writeInsight", title: "X", summary: "Y" }),
+    });
+    assert.equal(evilOriginRes.status, 403);
+
+    const crossSiteFetchRes = await fetch(`${baseUrl}/api/governance`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "sec-fetch-site": "cross-site",
+        "x-pm-csrf-token": csrfToken,
+      },
+      body: JSON.stringify({ action: "writeInsight", title: "X", summary: "Y" }),
+    });
+    assert.equal(crossSiteFetchRes.status, 403);
+
+    const missingCsrfOnBrowserPost = await fetch(`${baseUrl}/api/governance`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        Origin: baseUrl,
+      },
+      body: JSON.stringify({ action: "writeInsight", title: "X", summary: "Y" }),
+    });
+    assert.equal(missingCsrfOnBrowserPost.status, 403);
+
+    const wrongCsrfRes = await fetch(`${baseUrl}/api/governance`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        Origin: baseUrl,
+        "x-pm-csrf-token": "invalid-token",
+      },
+      body: JSON.stringify({ action: "writeInsight", title: "X", summary: "Y" }),
+    });
+    assert.equal(wrongCsrfRes.status, 403);
+
+    const validBrowserPost = await fetch(`${baseUrl}/api/governance`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        Origin: baseUrl,
+        "x-pm-csrf-token": csrfToken,
+      },
+      body: JSON.stringify({
+        projectRoot: fixture.projectRoot,
+        action: "writeInsight",
+        title: "CSRF Verified Insight",
+        summary: "Browser POST with valid Origin + X-PM-CSRF-Token succeeds.",
+      }),
+    });
+    assert.equal(validBrowserPost.status, 200);
+
+    const ipv6Body = JSON.stringify({
+      projectRoot: fixture.projectRoot,
+      action: "writeInsight",
+      title: "IPv6 Loopback Host Header",
+      summary: "Bare [::1] Host header must not falsely fail port comparison.",
+    });
+    const ipv6Status = await new Promise<number>((resolveStatus, rejectStatus) => {
+      const req = httpRequest(
+        {
+          host: "127.0.0.1",
+          port: serverHandle.port,
+          path: "/api/governance",
+          method: "POST",
+          headers: {
+            Host: "[::1]",
+            Origin: `http://[::1]:${serverHandle.port}`,
+            "content-type": "application/json",
+            "content-length": String(Buffer.byteLength(ipv6Body)),
+            "x-pm-csrf-token": csrfToken,
+          },
+        },
+        (res) => {
+          res.resume();
+          resolveStatus(res.statusCode ?? 0);
+        },
+      );
+      req.on("error", rejectStatus);
+      req.end(ipv6Body);
+    });
+    assert.equal(ipv6Status, 200, "Bare [::1] Host header with loopback IPv6 Origin must return 200");
+
+    // 5. Proper HTTP status codes: 400 malformed JSON, 413 payload > 1MB, 400 malformed URI
+    const badJsonRes = await fetch(`${baseUrl}/api/governance`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{broken-json",
+    });
+    assert.equal(badJsonRes.status, 400);
+
+    const hugePayload = JSON.stringify({ pad: "x".repeat(1024 * 1024 + 128) });
+    const tooLargeRes = await fetch(`${baseUrl}/api/governance`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: hugePayload,
+    });
+    assert.equal(tooLargeRes.status, 413);
+
+    const badUriRes = await fetch(`${baseUrl}/api/notes/%E0%A4%A`);
+    assert.equal(badUriRes.status, 400);
+
+    // 6. GET and POST endpoints NEVER auto-create directories/SQLite stores for unregistered paths
+    const unregGetRes = await fetch(
+      `${baseUrl}/api/overview?project=${encodeURIComponent(unregisteredPath)}`,
+    );
+    assert.equal(unregGetRes.status, 403);
+    const unregPostRes = await fetch(`${baseUrl}/api/governance`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        Origin: baseUrl,
+        "x-pm-csrf-token": csrfToken,
+      },
+      body: JSON.stringify({
+        projectRoot: unregisteredPath,
+        action: "writeInsight",
+        title: "Blocked Unregistered Write",
+        summary: "Must fail with 403 UNREGISTERED_PROJECT_ROOT.",
+      }),
+    });
+    assert.equal(unregPostRes.status, 403);
+    assert.equal(
+      existsSync(unregisteredPath),
+      false,
+      "GET/POST endpoints must never create directories or SQLite stores for unregistered paths",
+    );
+
+    // 7. Compile ALL 6 frontend MVC JS bundles via vm.Script + verify UX/Deep-Linking invariants
+    const bundlePaths = [
+      "/mvc/vendor.js",
+      "/mvc/models.js",
+      "/mvc/controllers.js",
+      "/mvc/shadcn-ui.js",
+      "/mvc/views.js",
+      "/mvc/web-components.js",
+    ] as const;
+    const bundles: Record<string, string> = {};
+    for (const p of bundlePaths) {
+      const res = await fetch(`${baseUrl}${p}`);
+      assert.equal(res.status, 200, `Expected 200 for ${p}`);
+      const code = await res.text();
+      assert.doesNotThrow(
+        () => new Script(code, { filename: p }),
+        `Syntax error detected in WebUI bundle ${p}`,
+      );
+      bundles[p] = code;
+    }
+
+    assert.ok(bundles["/mvc/vendor.js"]!.includes("data-pm-mount-id"), "vendor.js must isolate hook slots per mount instance");
+    assert.ok(bundles["/mvc/vendor.js"]!.includes("scrollTop"), "vendor.js must preserve scroll positions across renders");
+    assert.ok(bundles["/mvc/models.js"]!.includes("pm-csrf-token"), "models.js must attach X-PM-CSRF-Token from meta tag");
+    assert.ok(bundles["/mvc/controllers.js"]!.includes("hashchange"), "controllers.js must sync URL hash/query deep-links");
+    assert.ok(bundles["/mvc/controllers.js"]!.includes("openInGraph"), "controllers.js must expose openInGraph cross-view navigation");
+    assert.ok(bundles["/mvc/controllers.js"]!.includes("openInKanban"), "controllers.js must expose openInKanban cross-view navigation");
+    assert.ok(bundles["/mvc/shadcn-ui.js"]!.includes("crosshair") && bundles["/mvc/shadcn-ui.js"]!.includes("map-pin"));
+    assert.ok(html.includes(".pm-mobile-nav"), "CSS must include .pm-mobile-nav responsive navigation bar");
+    assert.ok(!bundles["/mvc/views.js"]!.includes("🎯") && !bundles["/mvc/views.js"]!.includes("📍"), "views.js must replace raw 🎯/📍 emojis with Lucide icons");
+    assert.ok(bundles["/mvc/views.js"]!.includes("ctrlKey") && bundles["/mvc/views.js"]!.includes("metaKey"), "Graph SVG wheel zoom must require ctrlKey/metaKey");
+    assert.ok(bundles["/mvc/views.js"]!.includes("causalTriads"), "views.js must surface Causal Triads");
+    assert.ok(
+      bundles["/mvc/views.js"]!.includes("relatedAdrs") &&
+        bundles["/mvc/views.js"]!.includes("relatedInsights"),
+      "views.js Causal Triads must render human-readable relatedAdrs/relatedInsights titles",
+    );
+    assert.ok(bundles["/mvc/views.js"]!.includes("vscode:") && bundles["/mvc/views.js"]!.includes("[[") , "views.js must safely render allowlisted links and clickable [[wikilinks]]");
+
+    // 8. Execute parseDeepLinkHash inside a VM sandbox for both #<tab>?... and #view=<tab>&... formats
+    const vmWindow: Record<string, unknown> = {
+      location: { hash: "#kanban?note=rec-123&q=lifecycle" },
+      history: { replaceState() {} },
+      React: {
+        useState: (init: unknown) => [typeof init === "function" ? (init as () => unknown)() : init, () => {}],
+        useEffect: () => {},
+        useMemo: (fn: () => unknown) => fn(),
+        useCallback: (fn: unknown) => fn,
+        createContext: () => ({}),
+        useContext: () => null,
+        createElement: () => ({}),
+      },
+      TanStackQuery: {
+        useQuery: () => ({}),
+        useMutation: () => ({}),
+        useQueryClient: () => ({}),
+      },
+      PM_MVC_MODELS: {},
+    };
+    runInNewContext(bundles["/mvc/controllers.js"]!, { window: vmWindow, URLSearchParams });
+    const parseDeepLinkHash = (
+      vmWindow.PM_MVC_CONTROLLERS as {
+        parseDeepLinkHash?: (defaultRoot: string) => {
+          tab: string;
+          note: string | null;
+          q: string;
+          kind?: string;
+        };
+      }
+    ).parseDeepLinkHash;
+    assert.equal(typeof parseDeepLinkHash, "function");
+
+    const parsedCanonical = parseDeepLinkHash!(fixture.projectRoot);
+    assert.equal(parsedCanonical.tab, "kanban");
+    assert.equal(parsedCanonical.note, "rec-123");
+    assert.equal(parsedCanonical.q, "lifecycle");
+
+    (vmWindow.location as { hash: string }).hash = "#view=graph&q=curator&type=file";
+    const parsedKeyValue = parseDeepLinkHash!(fixture.projectRoot);
+    assert.equal(parsedKeyValue.tab, "graph");
+    assert.equal(parsedKeyValue.q, "curator");
+    assert.equal(parsedKeyValue.kind, "file");
+  } finally {
+    await serverHandle.close();
+    rmSync(unregisteredPath, { recursive: true, force: true });
     await fixture.cleanup();
   }
 });

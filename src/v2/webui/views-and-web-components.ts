@@ -457,6 +457,7 @@ export function renderMvcViewsJs(): string {
               { style: { display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(300px, 1fr))", gap: "0.85rem" } },
               sessions.slice(0, 6).map((s) => {
                 const isActive = s.semanticState === "active";
+                const isEnding = s.semanticState === "ending";
                 const noteTitles = Array.isArray(s.noteTitles) ? s.noteTitles : [];
                 const noteIds = Array.isArray(s.noteIds) ? s.noteIds : [];
                 const inProgress = Array.isArray(s.inProgressItems) ? s.inProgressItems : [];
@@ -471,7 +472,9 @@ export function renderMvcViewsJs(): string {
                       background: "hsl(var(--background))",
                       border: isActive
                         ? "1px solid rgba(16, 185, 129, 0.5)"
-                        : "1px solid hsl(var(--border))",
+                        : isEnding
+                          ? "1px solid rgba(245, 158, 11, 0.5)"
+                          : "1px solid hsl(var(--border))",
                       display: "flex",
                       flexDirection: "column",
                       gap: "0.55rem",
@@ -485,9 +488,13 @@ export function renderMvcViewsJs(): string {
                       { style: { display: "flex", alignItems: "center", gap: "0.4rem" } },
                       h(
                         Badge,
-                        { variant: isActive ? "success" : "secondary" },
-                        h(LucideIcon, { name: isActive ? "activity" : "check-circle-2", size: 11 }),
-                        isActive ? "AI กำลังทำงาน (Active)" : "เสร็จสิ้น (Ended)"
+                        { variant: isActive ? "success" : isEnding ? "warning" : "secondary" },
+                        h(LucideIcon, { name: isActive ? "activity" : isEnding ? "clock" : "check-circle-2", size: 11 }),
+                        isActive
+                          ? "AI กำลังทำงาน (Active)"
+                          : isEnding
+                            ? "กำลังปิดเซสชัน (Ending)"
+                            : "เสร็จสิ้น (Ended)"
                       ),
                       h(
                         Badge,
@@ -634,6 +641,7 @@ export function renderMvcViewsJs(): string {
     const latestCheckpoint =
       (overviewData && overviewData.lifecycle && overviewData.lifecycle.latestCheckpoint) || null;
     const statusInfo = (overviewData && overviewData.status) || {};
+    const causalTriads = (overviewData && overviewData.causalTriads) || [];
 
     const sessionColumns = useMemo(
       () => [
@@ -759,6 +767,199 @@ export function renderMvcViewsJs(): string {
       h("pm-session-activity-map", {
         "sessions-json": JSON.stringify(sessions),
       }),
+
+      // Row 2.75: IDF-Weighted Causal Triads (Mistake -> Insight / ADR)
+      causalTriads.length > 0
+        ? h(
+            Card,
+            {},
+            h(
+              CardHeader,
+              {},
+              h(
+                CardTitle,
+                {},
+                h(LucideIcon, { name: "git-branch", size: 17, color: "#ef4444" }),
+                "เส้นทางบทเรียนและทางแก้ (Causal Triads: Mistake ➔ Insight / ADR)"
+              ),
+              h(
+                CardDescription,
+                {},
+                "เชื่อมโยงข้อผิดพลาดเข้ากับบทเรียนและการตัดสินใจสถาปัตยกรรมที่แก้ไขจุดเดียวกันอัตโนมัติ (IDF-Weighted)"
+              )
+            ),
+            h(
+              CardContent,
+              {},
+              h(
+                "div",
+                { style: { display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(290px, 1fr))", gap: "0.75rem" } },
+                causalTriads.slice(0, 6).map((triad) => {
+                  const adrItems = Array.isArray(triad.relatedAdrs) && triad.relatedAdrs.length > 0
+                    ? triad.relatedAdrs
+                    : (triad.relatedAdrIds || []).map((aid) => ({ recordId: aid, title: "ADR " + String(aid).slice(0, 8), score: 0 }));
+                  const insightItems = Array.isArray(triad.relatedInsights) && triad.relatedInsights.length > 0
+                    ? triad.relatedInsights
+                    : (triad.relatedInsightIds || []).map((iid) => ({ recordId: iid, title: "Insight " + String(iid).slice(0, 8), score: 0 }));
+                  const visibleAdrs = adrItems.slice(0, 3);
+                  const visibleInsights = insightItems.slice(0, 3);
+                  const hiddenCount = Math.max(0, adrItems.length - visibleAdrs.length) + Math.max(0, insightItems.length - visibleInsights.length);
+                  const truncLabel = (txt, maxLen) => {
+                    const s = String(txt || "").trim();
+                    return s.length > maxLen ? s.slice(0, maxLen - 1) + "…" : s;
+                  };
+                  const renderContextBadge = (ctx) => {
+                    const raw = String(ctx || "");
+                    if (raw.startsWith("file:")) {
+                      const fp = raw.slice(5);
+                      const shortFile = fp.split("/").pop() || fp;
+                      return h(
+                        Badge,
+                        {
+                          key: raw,
+                          variant: "outline",
+                          title: fp + " (คลิกเพื่อดูในกราฟ)",
+                          style: { cursor: "pointer", gap: "0.25rem" },
+                          onClick: () => mc && mc.openInGraph({ filePath: fp }),
+                        },
+                        h(LucideIcon, { name: "file-text", size: 11, color: "#10b981" }),
+                        shortFile
+                      );
+                    }
+                    if (raw.startsWith("symbol:")) {
+                      const sym = raw.slice(7);
+                      return h(
+                        Badge,
+                        {
+                          key: raw,
+                          variant: "outline",
+                          title: "Symbol: " + sym + " (คลิกเพื่อดูในกราฟ)",
+                          style: { cursor: "pointer", gap: "0.25rem" },
+                          onClick: () => mc && mc.openInGraph({ symbol: sym }),
+                        },
+                        h(LucideIcon, { name: "code-2", size: 11, color: "#f59e0b" }),
+                        sym
+                      );
+                    }
+                    if (raw.startsWith("session:")) {
+                      const sid = raw.slice(8);
+                      return h(
+                        Badge,
+                        {
+                          key: raw,
+                          variant: "outline",
+                          title: "Session: " + sid + " (คลิกเพื่อดูในกราฟ)",
+                          style: { cursor: "pointer", gap: "0.25rem" },
+                          onClick: () => mc && mc.openInGraph({ sessionId: sid }),
+                        },
+                        h(LucideIcon, { name: "clock", size: 11, color: "#94a3b8" }),
+                        "เซสชัน #" + sid.slice(0, 8)
+                      );
+                    }
+                    return h(Badge, { key: raw, variant: "outline" }, raw);
+                  };
+
+                  return h(
+                    "div",
+                    {
+                      key: triad.anchorMistakeId,
+                      style: {
+                        padding: "0.85rem 1rem",
+                        borderRadius: "var(--radius)",
+                        background: "hsl(var(--background))",
+                        border: "1px solid hsla(0, 84%, 60%, 0.35)",
+                        display: "flex",
+                        flexDirection: "column",
+                        gap: "0.55rem",
+                      },
+                    },
+                    h(
+                      "div",
+                      { style: { display: "flex", justifyContent: "space-between", alignItems: "center", gap: "0.4rem" } },
+                      h(
+                        Badge,
+                        { variant: "destructive" },
+                        h(LucideIcon, { name: "alert-triangle", size: 11 }),
+                        "Mistake"
+                      ),
+                      h(
+                        "div",
+                        { style: { display: "flex", gap: "0.3rem" } },
+                        h(
+                          Button,
+                          { size: "sm", variant: "secondary", onClick: () => mc && mc.inspectNote(triad.anchorMistakeId) },
+                          "อ่าน"
+                        ),
+                        h(
+                          Button,
+                          { size: "sm", variant: "outline", onClick: () => mc && mc.openInGraph({ recordId: triad.anchorMistakeId }) },
+                          h(LucideIcon, { name: "share-2", size: 12 }),
+                          "ดูในกราฟ"
+                        )
+                      )
+                    ),
+                    h(
+                      "div",
+                      { style: { fontSize: "0.85rem", fontWeight: 700, lineHeight: 1.4 } },
+                      triad.mistakeTitle
+                    ),
+                    h(
+                      "div",
+                      { style: { display: "flex", flexDirection: "column", gap: "0.3rem" } },
+                      visibleAdrs.map((adr) =>
+                        h(
+                          Button,
+                          {
+                            key: adr.recordId,
+                            size: "sm",
+                            variant: "outline",
+                            title: "ADR: " + adr.title + " (" + String(adr.recordId).slice(0, 8) + ")",
+                            style: { justifyContent: "flex-start", textAlign: "left", height: "auto", padding: "0.28rem 0.55rem" },
+                            onClick: () => mc && mc.inspectNote(adr.recordId),
+                          },
+                          h(LucideIcon, { name: "landmark", size: 12, color: "#6366f1", style: { flexShrink: 0 } }),
+                          h("span", { style: { overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } }, truncLabel(adr.title, 48))
+                        )
+                      ),
+                      visibleInsights.map((ins) =>
+                        h(
+                          Button,
+                          {
+                            key: ins.recordId,
+                            size: "sm",
+                            variant: "outline",
+                            title: "Insight: " + ins.title + " (" + String(ins.recordId).slice(0, 8) + ")",
+                            style: { justifyContent: "flex-start", textAlign: "left", height: "auto", padding: "0.28rem 0.55rem" },
+                            onClick: () => mc && mc.inspectNote(ins.recordId),
+                          },
+                          h(LucideIcon, { name: "lightbulb", size: 12, color: "#10b981", style: { flexShrink: 0 } }),
+                          h("span", { style: { overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } }, truncLabel(ins.title, 48))
+                        )
+                      ),
+                      hiddenCount > 0
+                        ? h(
+                            "div",
+                            {
+                              style: { fontSize: "0.72rem", color: "hsl(var(--muted-foreground))", cursor: "pointer", paddingLeft: "0.2rem" },
+                              onClick: () => mc && mc.openInGraph({ recordId: triad.anchorMistakeId }),
+                            },
+                            "+ อีก " + hiddenCount + " รายการที่เชื่อมโยง (คลิกดูทั้งหมดในกราฟ)"
+                          )
+                        : null
+                    ),
+                    (triad.sharedContext || []).length > 0
+                      ? h(
+                          "div",
+                          { style: { display: "flex", flexWrap: "wrap", gap: "0.28rem", paddingTop: "0.15rem" } },
+                          (triad.sharedContext || []).slice(0, 5).map((ctx) => renderContextBadge(ctx))
+                        )
+                      : null
+                  );
+                })
+              )
+            )
+          )
+        : null,
 
       // Row 3: Governance Alerts + Sessions Table
       h(
@@ -957,7 +1158,11 @@ export function renderMvcViewsJs(): string {
   // --------------------------------------------------------------------------
   function KanbanBoardView({ projectRoot }) {
     const mc = MissionControlController.useMissionControl();
-    const ctrl = KanbanController.useController(projectRoot, mc ? mc.notify : null);
+    const ctrl = KanbanController.useController(
+      projectRoot,
+      mc ? mc.notify : null,
+      mc ? mc.kanbanJumpTarget : null
+    );
     const [tableSorting, setTableSorting] = useState([]);
 
     const tableColumns = useMemo(
@@ -1005,6 +1210,16 @@ export function renderMvcViewsJs(): string {
                   onClick: () => mc && mc.inspectNote(n.recordId),
                 },
                 "ดูรายละเอียด"
+              ),
+              h(
+                Button,
+                {
+                  variant: "outline",
+                  size: "sm",
+                  onClick: () => mc && mc.openInGraph({ recordId: n.recordId }),
+                },
+                h(LucideIcon, { name: "share-2", size: 12 }),
+                "ดูในกราฟ"
               ),
               h(
                 Button,
@@ -1057,7 +1272,12 @@ export function renderMvcViewsJs(): string {
             (n.filePaths || []).map((fp) =>
               h(
                 Badge,
-                { key: fp, variant: "outline" },
+                {
+                  key: fp,
+                  variant: "outline",
+                  style: { cursor: "pointer" },
+                  onClick: () => mc && mc.openInGraph({ filePath: fp }),
+                },
                 h(LucideIcon, { name: "file-text", size: 11 }),
                 fp
               )
@@ -1065,7 +1285,12 @@ export function renderMvcViewsJs(): string {
             (n.symbols || []).map((sym) =>
               h(
                 Badge,
-                { key: sym, variant: "secondary" },
+                {
+                  key: sym,
+                  variant: "secondary",
+                  style: { cursor: "pointer" },
+                  onClick: () => mc && mc.openInGraph({ symbol: sym }),
+                },
                 h(LucideIcon, { name: "code-2", size: 11 }),
                 sym
               )
@@ -1088,6 +1313,12 @@ export function renderMvcViewsJs(): string {
             { variant: "secondary", size: "sm", onClick: () => mc && mc.inspectNote(n.recordId) },
             h(LucideIcon, { name: "search", size: 13 }),
             "ดูข้อมูล"
+          ),
+          h(
+            Button,
+            { variant: "outline", size: "sm", onClick: () => mc && mc.openInGraph({ recordId: n.recordId }) },
+            h(LucideIcon, { name: "share-2", size: 13 }),
+            "ดูในกราฟ"
           ),
           h(
             Button,
@@ -1362,7 +1593,10 @@ export function renderMvcViewsJs(): string {
 
   function KnowledgeGraphView({ projectRoot }) {
     const mc = MissionControlController.useMissionControl();
-    const ctrl = KnowledgeGraphController.useController(projectRoot);
+    const ctrl = KnowledgeGraphController.useController(
+      projectRoot,
+      mc ? mc.graphJumpTarget : null
+    );
     const { layout } = ctrl;
     const overviewData = (mc && mc.overviewQuery && mc.overviewQuery.data) || null;
     const sessions = (overviewData && overviewData.lifecycle && overviewData.lifecycle.sessions) || [];
@@ -1515,21 +1749,14 @@ export function renderMvcViewsJs(): string {
                               "ไฟล์ (" + (layout.stats.fileNodes ?? 0) + ")",
                             ]
                           : [
-                              h(LucideIcon, { key: "i", name: "code-2", size: 13, color: "#f59e0b" }),
-                              "โค้ด (" + (layout.stats.symbolNodes ?? 0) + ")",
-                            ]
-                )
-              ),
-              ctrl.layoutMode === "orbital"
-                ? [
-                    h(Button, { key: "zo", size: "sm", variant: "outline", onClick: ctrl.zoomOut }, h(LucideIcon, { name: "minus", size: 13 })),
-                    h(Button, { key: "zr", size: "sm", variant: "outline", onClick: ctrl.resetZoom }, Math.round(ctrl.zoom * 100) + "%"),
-                    h(Button, { key: "zi", size: "sm", variant: "outline", onClick: ctrl.zoomIn }, h(LucideIcon, { name: "plus", size: 13 })),
-                  ]
-                : null
-            )
-          )
-        ),
+                               h(LucideIcon, { key: "i", name: "code-2", size: 13, color: "#f59e0b" }),
+                               "โค้ด (" + (layout.stats.symbolNodes ?? 0) + ")",
+                             ]
+                 )
+               )
+             )
+           )
+         ),
         h(
           CardContent,
           {},
@@ -1547,13 +1774,13 @@ export function renderMvcViewsJs(): string {
             // Left Pane: Interactive SVG Graph
             h(
               "div",
-              { style: { minWidth: 0 } },
+              { style: { minWidth: 0, position: "relative" } }, h("div", { id: "graph-zoom-hud", style: { position: "absolute", top: "10px", right: "10px", zIndex: 5, display: "flex", alignItems: "center", gap: "0.3rem", padding: "0.28rem 0.45rem", borderRadius: "0.55rem", background: "hsla(var(--card), 0.9)", border: "1px solid hsl(var(--border))", backdropFilter: "blur(6px)" } }, h(Button, { size: "sm", variant: "outline", onClick: ctrl.zoomOut, title: "ซูมออก" }, h(LucideIcon, { name: "minus", size: 12 })), h(Button, { size: "sm", variant: "outline", onClick: ctrl.resetZoom, title: "รีเซ็ตมุมมอง 100%" }, Math.round(ctrl.zoom * 100) + "%"), h(Button, { size: "sm", variant: "outline", onClick: ctrl.zoomIn, title: "ซูมเข้า" }, h(LucideIcon, { name: "plus", size: 12 })), h(Button, { size: "sm", variant: "default", onClick: () => ctrl.focusNode(), title: "ซูมโฟกัสจุดที่เลือก" }, h(LucideIcon, { name: "crosshair", size: 12 }), "ซูมดูจุดที่เลือก")),
               h(
                 "svg",
                 {
-                  viewBox: "0 0 " + layout.width + " " + layout.height,
+                  id: "knowledge-graph-canvas", viewBox: (() => { const vw = Math.round(layout.width / ctrl.zoom); const vh = Math.round(layout.height / ctrl.zoom); const vx = Math.round((layout.width - vw) / 2 + (ctrl.pan ? ctrl.pan.x : 0)); const vy = Math.round((layout.height - vh) / 2 + (ctrl.pan ? ctrl.pan.y : 0)); return vx + " " + vy + " " + vw + " " + vh; })(), onWheel: (ev) => { if (!ev.ctrlKey && !ev.metaKey) return; ev.preventDefault(); if (ev.deltaY < 0) ctrl.zoomIn(); else ctrl.zoomOut(); }, onMouseDown: (ev) => { if (ev.button !== 0) return; ctrl.dragRef.current = { startX: ev.clientX, startY: ev.clientY, panX: ctrl.pan ? ctrl.pan.x : 0, panY: ctrl.pan ? ctrl.pan.y : 0 }; }, onMouseMove: (ev) => { if (!ctrl.dragRef.current) return; const dx = (ev.clientX - ctrl.dragRef.current.startX) / ctrl.zoom; const dy = (ev.clientY - ctrl.dragRef.current.startY) / ctrl.zoom; ctrl.setPan({ x: Math.round(ctrl.dragRef.current.panX - dx), y: Math.round(ctrl.dragRef.current.panY - dy) }); }, onMouseUp: () => { ctrl.dragRef.current = null; }, onMouseLeave: () => { ctrl.dragRef.current = null; },
                   style: {
-                    width: "100%",
+                    cursor: "grab", userSelect: "none", width: "100%",
                     height: layout.layoutMode === "flow" ? "540px" : "520px",
                     background: "hsl(var(--background))",
                     borderRadius: "var(--radius)",
@@ -1615,7 +1842,7 @@ export function renderMvcViewsJs(): string {
                         key: "orbit-" + idx,
                         cx: layout.width / 2,
                         cy: layout.height / 2,
-                        r: Math.round(r * ctrl.zoom),
+                        r: r,
                         fill: "none",
                         stroke: "hsl(var(--border))",
                         "stroke-dasharray": "4 6",
@@ -1624,17 +1851,23 @@ export function renderMvcViewsJs(): string {
                     ),
 
                 // Edges (Smooth Cubic Bezier in Flow Mode, Quadratic Curve in Orbital Mode)
-                layout.edges.map((e, i) => {
+                [...layout.edges].sort((a, b) => ((hiSet.has(a.source) && hiSet.has(a.target)) ? 1 : 0) - ((hiSet.has(b.source) && hiSet.has(b.target)) ? 1 : 0)).map((e, i) => {
                   const s = layout.positions.get(e.source);
                   const t = layout.positions.get(e.target);
                   if (!s || !t) return null;
-                  const isHi = hiSet.has(e.source) && hiSet.has(e.target);
+                  const isHi = hiSet.has(e.source) && hiSet.has(e.target) && (layout.layoutMode === "orbital" ? (e.relation !== "defines-symbol" || Boolean(selected && (selected.kind === "file" || selected.kind === "symbol"))) : (e.relation !== "mentions-symbol" || story.relatedFiles.length === 0));
                   const strokeColor =
                     e.relation === "created-in-session" || e.relation === "forked-from"
                       ? "#38bdf8"
                       : e.relation === "touches-file"
                         ? "#10b981"
-                        : "#f59e0b";
+                        : e.relation === "supersedes"
+                          ? "#a855f7"
+                          : e.relation === "causal-triad"
+                            ? "#ef4444"
+                            : e.relation === "links-to-note"
+                              ? "#ec4899"
+                              : "#f59e0b";
 
                   if (layout.layoutMode === "flow") {
                     const sx = s.x + (s.x < t.x ? 96 : -96);
@@ -1643,7 +1876,7 @@ export function renderMvcViewsJs(): string {
                     const ty = t.y;
                     const c1x = Math.round(sx + (tx - sx) * 0.45);
                     const c2x = Math.round(sx + (tx - sx) * 0.55);
-                    return h("path", {
+                    const dFlow = "M " + sx + " " + sy + " C " + c1x + " " + sy + ", " + c2x + " " + ty + ", " + tx + " " + ty; if (isHi) { const isDirect = Boolean(selected && (e.source === selected.id || e.target === selected.id)); return h("g", { key: "edge-hi-" + i }, h("path", { d: dFlow, fill: "none", stroke: strokeColor, "stroke-width": isDirect ? "6.5" : "4.5", opacity: isDirect ? "0.24" : "0.14" }), h("path", { d: dFlow, fill: "none", stroke: strokeColor, "stroke-width": isDirect ? "3" : "2.2", opacity: "0.98" }), h("path", { d: dFlow, fill: "none", stroke: "#ffffff", "stroke-width": "1.2", "stroke-dasharray": "5 7", opacity: isDirect ? "0.7" : "0.4" })); } return h("path", {
                       key: "edge-" + i,
                       d: "M " + sx + " " + sy + " C " + c1x + " " + sy + ", " + c2x + " " + ty + ", " + tx + " " + ty,
                       fill: "none",
@@ -1654,7 +1887,7 @@ export function renderMvcViewsJs(): string {
                   }
 
                   const mx = Math.round((s.x + t.x) / 2);
-                  const my = Math.round((s.y + t.y) / 2 - 18);
+                  const my = Math.round((s.y + t.y) / 2 - 18); const dOrb = "M " + s.x + " " + s.y + " Q " + mx + " " + my + " " + t.x + " " + t.y; if (isHi) { const isDirect = Boolean(selected && (e.source === selected.id || e.target === selected.id)); return h("g", { key: "edge-orb-hi-" + i }, h("path", { d: dOrb, fill: "none", stroke: strokeColor, "stroke-width": isDirect ? "6.5" : "4.5", opacity: isDirect ? "0.26" : "0.15" }), h("path", { d: dOrb, fill: "none", stroke: strokeColor, "stroke-width": isDirect ? "3" : "2.2", opacity: "0.98" }), h("path", { d: dOrb, fill: "none", stroke: "#ffffff", "stroke-width": "1.2", "stroke-dasharray": "5 7", opacity: isDirect ? "0.72" : "0.42" })); }
                   return h("path", {
                     key: "edge-" + i,
                     d: "M " + s.x + " " + s.y + " Q " + mx + " " + my + " " + t.x + " " + t.y,
@@ -1666,7 +1899,7 @@ export function renderMvcViewsJs(): string {
                 }),
 
                 // Nodes (Readable Pill Cards in Flow Mode, Spotlight Nodes in Orbital Mode)
-                layout.nodes.map((n) => {
+                [...layout.nodes].sort((a, b) => (selected && a.id === selected.id ? 2 : hiSet.has(a.id) ? 1 : 0) - (selected && b.id === selected.id ? 2 : hiSet.has(b.id) ? 1 : 0)).map((n) => {
                   const p = layout.positions.get(n.id);
                   if (!p) return null;
                   const color =
@@ -1695,9 +1928,14 @@ export function renderMvcViewsJs(): string {
                         style: { cursor: "pointer" },
                         opacity: isHi ? "1" : "0.38",
                         onClick: () => ctrl.setSelectedNodeId(n.id),
+                        onDblClick: () => {
+                          ctrl.setSelectedNodeId(n.id);
+                          ctrl.focusNode(n.id);
+                          if (n.kind === "note" && n.recordId && mc) mc.inspectNote(n.recordId);
+                        },
                       },
                       isSelected
-                        ? h("rect", {
+                        ? h("g", { key: "sel-flow-pin" }, h("rect", { x: p.x - boxW / 2 - 4, y: p.y - boxH / 2 - 4, width: boxW + 8, height: boxH + 8, rx: 10, fill: "none", stroke: "#f43f5e", "stroke-width": "2.2", "stroke-dasharray": "4 3" }), h("rect", { x: p.x + boxW / 2 - 66, y: p.y - boxH / 2 - 11, width: 64, height: 15, rx: 7, fill: "#f43f5e" }), h("text", { x: p.x + boxW / 2 - 34, y: p.y - boxH / 2 - 1, fill: "#ffffff", "font-size": "8.8", "font-weight": "700", "text-anchor": "middle" }, "● จุดที่เลือก"), h("rect", {
                             x: p.x - boxW / 2 - 3,
                             y: p.y - boxH / 2 - 3,
                             width: boxW + 6,
@@ -1707,8 +1945,7 @@ export function renderMvcViewsJs(): string {
                             stroke: color,
                             "stroke-width": "2",
                             opacity: "0.55",
-                          })
-                        : null,
+                          })) : null,
                       h("rect", {
                         x: p.x - boxW / 2,
                         y: p.y - boxH / 2,
@@ -1746,10 +1983,15 @@ export function renderMvcViewsJs(): string {
                     {
                       key: n.id,
                       style: { cursor: "pointer" },
-                      opacity: isHi ? "1" : "0.3",
+                      opacity: isHi ? "1" : "0.48",
                       onClick: () => ctrl.setSelectedNodeId(n.id),
+                      onDblClick: () => {
+                        ctrl.setSelectedNodeId(n.id);
+                        ctrl.focusNode(n.id);
+                        if (n.kind === "note" && n.recordId && mc) mc.inspectNote(n.recordId);
+                      },
                     },
-                    h("circle", {
+                    h("circle", { cx: p.x, cy: p.y, r: 20, fill: "transparent" }), isSelected ? h("circle", { cx: p.x, cy: p.y, r: 26, fill: "none", stroke: "#f43f5e", "stroke-width": "2.2", "stroke-dasharray": "4 3" }) : null, h("circle", {
                       cx: p.x,
                       cy: p.y,
                       r: isSelected ? 20 : n.kind === "session" ? 16 : n.kind === "note" ? 14 : 10,
@@ -1764,7 +2006,7 @@ export function renderMvcViewsJs(): string {
                       stroke: isSelected ? "#fff" : "none",
                       "stroke-width": isSelected ? "2" : "0",
                     }),
-                    isHi
+                    isSelected ? h("g", { key: "orb-pin-" + n.id }, h("rect", { x: p.x - 86, y: p.y - 42, width: 172, height: 20, rx: 10, fill: "#0f172a", stroke: "#f43f5e", "stroke-width": "1.6" }), h("text", { x: p.x, y: p.y - 28, fill: "#ffffff", "font-size": "10", "font-weight": "700", "text-anchor": "middle" }, "● จุดที่เลือก: " + shortText.slice(0, 18))) : null, (isHi || ctrl.zoom >= 1.35)
                       ? h(
                           "text",
                           {
@@ -1798,13 +2040,14 @@ export function renderMvcViewsJs(): string {
                 h(
                   "span",
                   {},
-                  "เคล็ดลับ: คลิกที่กล่องใดก็ได้ในกราฟเพื่อดูเส้นทางความสัมพันธ์และอ่านสรุปภาษาคนทางขวา"
+                  "เคล็ดลับ: กด Ctrl + หมุนลูกกลิ้งเมาส์เพื่อซูม (Zoom) • คลิกค้างแล้วลากเพื่อเลื่อนดู (Pan) • กด 'ซูมดูจุดที่เลือก' หรือดับเบิลคลิกที่โหนดความจำเพื่อเปิดอ่านทันที"
                 ),
                 h(
                   "div",
-                  { style: { display: "flex", gap: "0.75rem", alignItems: "center" } },
+                  { style: { display: "flex", gap: "0.75rem", alignItems: "center", flexWrap: "wrap" } },
                   h("span", { style: { color: "#38bdf8", fontWeight: 600 } }, "● เซสชัน AI"),
                   h("span", { style: { color: "#6366f1", fontWeight: 600 } }, "● ความจำ (ADR/Insight)"),
+                  h("span", { style: { color: "#ef4444", fontWeight: 600 } }, "● ข้อผิดพลาด/Triad"),
                   h("span", { style: { color: "#10b981", fontWeight: 600 } }, "● ไฟล์โค้ด"),
                   h("span", { style: { color: "#f59e0b", fontWeight: 600 } }, "● ฟังก์ชัน/คลาส")
                 )
@@ -1972,6 +2215,16 @@ export function renderMvcViewsJs(): string {
                               "อ่านเนื้อหาฉบับเต็ม"
                             )
                           : null,
+                        h(
+                          Button,
+                          {
+                            size: "sm",
+                            variant: "secondary",
+                            onClick: () => mc && mc.openInKanban({ query: selected.label || "" }),
+                          },
+                          h(LucideIcon, { name: "kanban", size: 13 }),
+                          "เปิดในบอร์ดจัดการ"
+                        ),
                         selected.sessionId
                           ? h(
                               Button,
@@ -2459,28 +2712,183 @@ export function renderMvcViewsJs(): string {
   // --------------------------------------------------------------------------
   // 6. MissionControlShellView (Minimalist Pro Sidebar + Topbar Shell)
   // --------------------------------------------------------------------------
-  function renderHumanMarkdownBlocks(rawText) {
+  const CODE_TICK = String.fromCharCode(96);
+  const CODE_FENCE = CODE_TICK + CODE_TICK + CODE_TICK;
+
+  function isSafeMarkdownHref(rawHref) {
+    const href = String(rawHref || "").trim();
+    if (!href) return false;
+    const lower = href.toLowerCase();
+    return (
+      lower.startsWith("https://") ||
+      lower.startsWith("http://") ||
+      lower.startsWith("mailto:") ||
+      lower.startsWith("vscode:") ||
+      lower.startsWith("cursor:") ||
+      lower.startsWith("#")
+    );
+  }
+
+  function renderSafeInlineMarkdown(text, mc) {
+    const str = String(text || "");
+    if (!str.includes("[[") && !str.includes(CODE_TICK) && !str.includes("**") && !str.includes("](")) {
+      return str;
+    }
+    const tokenRe = /\\x60([^\\x60]+)\\x60|\\*\\*([^*]+)\\*\\*|\\[\\[([^\\]|]+)(?:\\|([^\\]]+))?\\]\\]|\\[([^\\]]+)\\]\\(([^)\\s]+)\\)/g;
+    const out = [];
+    let lastIndex = 0;
+    let m;
+    let partIdx = 0;
+    while ((m = tokenRe.exec(str)) !== null) {
+      if (m.index > lastIndex) {
+        out.push(str.slice(lastIndex, m.index));
+      }
+      const key = "md-in-" + partIdx++;
+      if (m[1] !== undefined) {
+        out.push(
+          h(
+            "code",
+            {
+              key,
+              style: {
+                padding: "0.08rem 0.35rem",
+                borderRadius: "0.3rem",
+                background: "hsl(var(--secondary))",
+                fontSize: "0.78rem",
+                fontFamily: "monospace",
+              },
+            },
+            m[1]
+          )
+        );
+      } else if (m[2] !== undefined) {
+        out.push(h("strong", { key }, m[2]));
+      } else if (m[3] !== undefined) {
+        const wikiTarget = String(m[3] || "").trim();
+        const wikiLabel = String(m[4] || m[3] || "").trim();
+        out.push(
+          h(
+            "button",
+            {
+              key,
+              type: "button",
+              onClick: () => {
+                if (!mc) return;
+                if (wikiTarget.startsWith("note:")) {
+                  mc.inspectNote(wikiTarget.slice(5));
+                } else {
+                  mc.openInKanban({ query: wikiTarget });
+                }
+              },
+              style: {
+                display: "inline-flex",
+                alignItems: "center",
+                gap: "0.22rem",
+                padding: "0.06rem 0.45rem",
+                margin: "0 0.12rem",
+                borderRadius: "9999px",
+                border: "1px solid hsla(var(--primary), 0.45)",
+                background: "hsla(var(--primary), 0.14)",
+                color: "hsl(var(--foreground))",
+                fontSize: "0.76rem",
+                fontWeight: 600,
+                cursor: "pointer",
+              },
+            },
+            h(LucideIcon, { name: "link-2", size: 11, color: "#ec4899" }),
+            "[[" + wikiLabel + "]]"
+          )
+        );
+      } else if (m[5] !== undefined && m[6] !== undefined) {
+        const label = m[5];
+        const href = m[6];
+        if (isSafeMarkdownHref(href)) {
+          out.push(
+            h(
+              "a",
+              {
+                key,
+                href,
+                target: href.startsWith("#") ? undefined : "_blank",
+                rel: "noopener noreferrer",
+                style: {
+                  color: "hsl(var(--primary))",
+                  textDecoration: "underline",
+                  fontWeight: 600,
+                },
+              },
+              label
+            )
+          );
+        } else {
+          out.push(h("span", { key }, label + " (" + href + ")"));
+        }
+      }
+      lastIndex = tokenRe.lastIndex;
+    }
+    if (lastIndex < str.length) {
+      out.push(str.slice(lastIndex));
+    }
+    return out.length === 1 && typeof out[0] === "string" ? out[0] : out;
+  }
+
+  function renderHumanMarkdownBlocks(rawText, mc) {
     const lines = String(rawText || "").split("\\n");
-    return lines
-      .filter((l) => l.trim().length > 0)
-      .map((line, idx) => {
-        const trimmed = line.trim();
-        if (trimmed.startsWith("# ")) {
-          return h(
+    const blocks = [];
+    for (let idx = 0; idx < lines.length; idx++) {
+      const line = lines[idx];
+      const trimmed = line.trim();
+      if (trimmed.startsWith(CODE_FENCE)) {
+        const codeLines = [];
+        idx++;
+        while (idx < lines.length && !lines[idx].trim().startsWith(CODE_FENCE)) {
+          codeLines.push(lines[idx]);
+          idx++;
+        }
+        blocks.push(
+          h(
+            "pre",
+            {
+              key: "fence-" + idx,
+              style: {
+                margin: "0.45rem 0",
+                padding: "0.65rem 0.8rem",
+                borderRadius: "calc(var(--radius) - 2px)",
+                background: "hsl(var(--secondary))",
+                border: "1px solid hsl(var(--border))",
+                fontSize: "0.76rem",
+                overflowX: "auto",
+              },
+            },
+            h("code", { style: { fontFamily: "monospace" } }, codeLines.join("\\n"))
+          )
+        );
+        continue;
+      }
+      if (!trimmed) continue;
+      if (trimmed.startsWith("# ")) {
+        blocks.push(
+          h(
             "h4",
             { key: idx, style: { margin: "0.6rem 0 0.25rem", fontSize: "0.95rem", fontWeight: 700, color: "hsl(var(--primary))" } },
-            trimmed.slice(2)
-          );
-        }
-        if (trimmed.startsWith("## ") || trimmed.startsWith("### ")) {
-          return h(
+            renderSafeInlineMarkdown(trimmed.slice(2), mc)
+          )
+        );
+        continue;
+      }
+      if (trimmed.startsWith("## ") || trimmed.startsWith("### ")) {
+        blocks.push(
+          h(
             "div",
             { key: idx, style: { margin: "0.5rem 0 0.2rem", fontSize: "0.86rem", fontWeight: 700 } },
-            trimmed.replace(/^#+\\s*/, "")
-          );
-        }
-        if (trimmed.startsWith("- ") || trimmed.startsWith("* ") || /^\\d+\\.\\s/.test(trimmed)) {
-          return h(
+            renderSafeInlineMarkdown(trimmed.replace(/^#+\\s*/, ""), mc)
+          )
+        );
+        continue;
+      }
+      if (trimmed.startsWith("- ") || trimmed.startsWith("* ") || /^\\d+\\.\\s/.test(trimmed)) {
+        blocks.push(
+          h(
             "div",
             {
               key: idx,
@@ -2495,15 +2903,20 @@ export function renderMvcViewsJs(): string {
               },
             },
             h("span", { style: { color: "#6366f1", fontWeight: 700 } }, "•"),
-            h("span", {}, trimmed.replace(/^[-*]\\s+|\\d+\\.\\s+/, ""))
-          );
-        }
-        return h(
+            h("span", {}, renderSafeInlineMarkdown(trimmed.replace(/^[-*]\\s+|^\\d+\\.\\s+/, ""), mc))
+          )
+        );
+        continue;
+      }
+      blocks.push(
+        h(
           "p",
           { key: idx, style: { margin: "0.3rem 0", fontSize: "0.84rem", lineHeight: 1.6 } },
-          trimmed
-        );
-      });
+          renderSafeInlineMarkdown(trimmed, mc)
+        )
+      );
+    }
+    return blocks;
   }
 
   function MissionControlShellView({ defaultProjectRoot }) {
@@ -2671,6 +3084,23 @@ export function renderMvcViewsJs(): string {
               )
             )
           ),
+          h(
+            "nav",
+            { className: "pm-mobile-nav", "aria-label": "Mobile Navigation" },
+            navItems.map((item) =>
+              h(
+                "button",
+                {
+                  key: "mob-" + item.id,
+                  type: "button",
+                  className: "pm-nav-item " + (mc.activeTab === item.id ? "pm-nav-item-active" : ""),
+                  onClick: () => mc.setActiveTab(item.id),
+                },
+                h(LucideIcon, { name: item.icon, size: 14 }),
+                h("span", {}, item.label)
+              )
+            )
+          ),
           mc.toastMessage
             ? h(
                 "div",
@@ -2746,7 +3176,19 @@ export function renderMvcViewsJs(): string {
                     inspectedNote.status === "verified"
                       ? "ยืนยันความถูกต้องแล้ว (Verified)"
                       : String(inspectedNote.status || "provisional")
-                  )
+                  ),
+                  inspectedNote.recordId
+                    ? h(
+                        Button,
+                        {
+                          variant: "outline",
+                          size: "sm",
+                          onClick: () => mc.openInGraph({ recordId: inspectedNote.recordId }),
+                        },
+                        h(LucideIcon, { name: "share-2", size: 12 }),
+                        "ดูความเชื่อมโยงในกราฟ"
+                      )
+                    : null
                 ),
                 h(
                   "h2",
@@ -2772,7 +3214,7 @@ export function renderMvcViewsJs(): string {
                   h(
                     "div",
                     { style: { fontSize: "0.86rem", lineHeight: 1.6 } },
-                    inspectedNote.summary || inspectedNote.text || inspectedNote.title
+                    renderSafeInlineMarkdown(inspectedNote.summary || inspectedNote.text || inspectedNote.title, mc)
                   )
                 ),
                 inspectedNote.body || inspectedNote.content
@@ -2786,7 +3228,7 @@ export function renderMvcViewsJs(): string {
                           border: "1px solid hsl(var(--border))",
                         },
                       },
-                      renderHumanMarkdownBlocks(inspectedNote.body || inspectedNote.content)
+                      renderHumanMarkdownBlocks(inspectedNote.body || inspectedNote.content, mc)
                     )
                   : null,
                 h(
@@ -2997,12 +3439,13 @@ export function renderWebComponentsJs(): string {
 `;
 }
 
-export function renderMvcIndexHtml(defaultProjectRoot: string): string {
+export function renderMvcIndexHtml(defaultProjectRoot: string, csrfToken = ""): string {
   return `<!DOCTYPE html>
 <html lang="th" class="dark">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="pm-csrf-token" content="${escapeHtml(csrfToken)}" />
   <title>Project Memory V2 — Minimalist Pro Studio, Analytics & AI Memory Curator</title>
   <style>${renderShadcnThemeCss()}</style>
 </head>

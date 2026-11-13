@@ -1,6 +1,8 @@
 # V2 fresh-start foundation operations
 
-Status: **foundation complete, production implementation incomplete**. F1 Tasks1-6 and local increment verification are complete. This foundation can prepare an empty V2 store and report redacted diagnostics. It cannot serve production memory, activate a release, import V1, reset a store, or switch clients. Public content calls return `FRESH_START_RELEASE_NOT_READY`, including when environment variables claim activation. The shipped promotion verifier always denies promotion.
+Status: **Production V2 Active (F1–F4 Complete)**. Project Memory V2 (`dist/v2.js` + `dist/v2-admin.js`) now serves all 34 public MCP tools, URI resources/templates, governed `session-handoff` prompts, automated Curator curation, WebUI Mission Control (`node dist/v2-admin.js webui`), one-command onboarding (`bootstrap-project`), build-identity synchronization (`sync-build`), projection rebuilds (`rebuild-projections`), frozen V1 archive verification (`verify-v1-archive`), and multi-IDE synchronization (`generate-client-configs`). Every governed agent session opens with `memory_sessionStart` and closes terminally via `memory_sessionEnd` with `finalize: true` (followed by `memory_verifyVault` / `memory_verifySourceTruth` / `memory_v2Status`).
+
+> **Historical Context Note**: The sections below preserve the original F1 fresh-start foundation architecture, build measurement rules, and F1 qualification records for audit continuity. Unactivated (`prepared`) stores continue to return `FRESH_START_RELEASE_NOT_READY` on content calls until explicitly promoted via `activate` or bootstrapped via `bootstrap-project`.
 
 ## Build and deployment identity
 

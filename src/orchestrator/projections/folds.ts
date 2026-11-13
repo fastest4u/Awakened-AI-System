@@ -1198,7 +1198,8 @@ class ProjectionFoldAccumulatorCore {
     }
 
     const current = this.#canonicalItems.get(event.recordId);
-    if (current === undefined) return integrity();
+    // Governed lifecycle transitions may target a project-wide record created on another branch scope.
+    if (current === undefined) return;
     if (
       current.status !== event.targetStatus
       && !GOVERNED_LIFECYCLE_STATUS_TRANSITIONS[current.status].includes(event.targetStatus)

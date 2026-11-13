@@ -1,9 +1,12 @@
-import { basename } from "node:path";
+import { existsSync, readFileSync } from "node:fs";
+import { basename, join, resolve } from "node:path";
 import type { V2Foundation } from "../composition.js";
 import { V2MemoryCuratorAgent } from "../curator.js";
+import { computeCausalTriads, type CausalTriadNoteInput } from "../entity-extractor.js";
 import { V2_PUBLIC_TOOL_DEFINITIONS } from "../public-tools.js";
 import {
   buildMemoryKnowledgeGraph,
+  deriveCleanNoteTitle,
   discoverV2Projects,
   extractNoteFilePathsAndSymbols,
   type KnowledgeGraphPayload,
@@ -94,12 +97,44 @@ export class ProjectModel {
     extraProjectRoots: readonly string[],
     knownProjects: Set<string>,
     getFoundation: (root: string) => Promise<V2Foundation>,
+    isFoundationCached?: (root: string) => boolean,
   ): Promise<Array<Record<string, unknown>>> {
+    const resolvedDefault = resolve(defaultProjectRoot);
     for (const p of discoverV2Projects(defaultProjectRoot, extraProjectRoots)) {
       knownProjects.add(p);
     }
     const projects: Array<Record<string, unknown>> = [];
     for (const root of [...knownProjects].sort((a, b) => a.localeCompare(b))) {
+      const resolvedRoot = resolve(root);
+      const shouldEagerLoad =
+        resolvedRoot === resolvedDefault
+        || !isFoundationCached
+        || isFoundationCached(resolvedRoot);
+      if (!shouldEagerLoad) {
+        try {
+          const identityFile = join(resolvedRoot, "memory-v2", ".memory-mcp", "project-identity.json");
+          if (existsSync(identityFile)) {
+            const parsed = JSON.parse(readFileSync(identityFile, "utf8")) as {
+              projectId?: string;
+              vaultId?: string;
+            };
+            projects.push({
+              projectRoot: root,
+              name: basename(root) || root,
+              initialized: true,
+              mode: "active",
+              productionReady: true,
+              projectId: parsed.projectId ?? null,
+              vaultId: parsed.vaultId ?? null,
+              releaseId: null,
+              generation: "1",
+            });
+            continue;
+          }
+        } catch {
+          // Fall through to full foundation load if identity read fails
+        }
+      }
       try {
         const foundation = await getFoundation(root);
         const st = await foundation.status();
@@ -134,6 +169,7 @@ export class MemoryNoteModel {
     foundation: V2Foundation,
     query?: string,
     limit = 100,
+    projectRoot?: string,
   ): Promise<Array<Record<string, unknown>>> {
     const rawResult =
       query && query.trim().length > 0
@@ -148,15 +184,12 @@ export class MemoryNoteModel {
     return (rawResult.items ?? []).map((item) => {
       const recordId = String(item.recordId ?? item.id ?? "");
       const summary = String(item.summary ?? item.text ?? "");
-      const colonIdx = summary.indexOf(": ");
-      const title =
-        typeof item.title === "string" && item.title.trim().length > 0
-          ? item.title.trim()
-          : colonIdx > 0
-            ? summary.slice(0, colonIdx)
-            : summary || recordId;
+      const { title } = deriveCleanNoteTitle(item, recordId);
       const body = typeof item.body === "string" ? item.body : "";
-      const extracted = extractNoteFilePathsAndSymbols(`${title}\n${summary}\n${body}`);
+      const extracted = extractNoteFilePathsAndSymbols(
+        `${title}\n${summary}\n${body}`,
+        projectRoot,
+      );
       const filePaths = [
         ...new Set([
           ...(Array.isArray(item.filePaths)
@@ -173,6 +206,14 @@ export class MemoryNoteModel {
           ...extracted.symbols,
         ]),
       ];
+      const wikilinks = [
+        ...new Set([
+          ...(Array.isArray(item.wikilinks)
+            ? item.wikilinks.filter((w): w is string => typeof w === "string")
+            : []),
+          ...extracted.wikilinks,
+        ]),
+      ];
       return {
         ...item,
         id: recordId,
@@ -184,6 +225,7 @@ export class MemoryNoteModel {
         status: String(item.status ?? "provisional"),
         filePaths,
         symbols,
+        wikilinks,
       };
     });
   }
@@ -206,8 +248,26 @@ export class OverviewModel {
         latestCheckpoint?: unknown;
       }>,
       curator.auditVault(),
-      MemoryNoteModel.listEnrichedNotes(foundation, undefined, 100),
+      MemoryNoteModel.listEnrichedNotes(foundation, undefined, 100, projectRoot),
     ]);
+
+    const triadInputs: CausalTriadNoteInput[] = notes.map((n) => ({
+      id: String(n.recordId ?? n.id ?? ""),
+      recordId: String(n.recordId ?? n.id ?? ""),
+      recordKind: String(n.recordKind ?? n.kind ?? "insight"),
+      title: String(n.title ?? ""),
+      sessionId: typeof n.sessionId === "string" ? n.sessionId : null,
+      filePaths: Array.isArray(n.filePaths)
+        ? n.filePaths.filter((p): p is string => typeof p === "string")
+        : [],
+      symbols: Array.isArray(n.symbols)
+        ? n.symbols.filter((s): s is string => typeof s === "string")
+        : [],
+    }));
+    const { causalTriads } = computeCausalTriads(
+      triadInputs.map((note) => ({ note, score: 1 })),
+      triadInputs,
+    );
 
     const byStatus: Record<string, number> = {
       verified: audit.counts.verifiedNotes,
@@ -251,6 +311,7 @@ export class OverviewModel {
       status,
       lifecycle,
       audit,
+      causalTriads,
       analytics: {
         byStatus,
         byKind,
@@ -265,11 +326,16 @@ export class KnowledgeGraphModel {
     projectRoot: string,
     foundation: V2Foundation,
   ): Promise<{ readonly ok: true; readonly projectRoot: string } & KnowledgeGraphPayload> {
-    const items = await MemoryNoteModel.listEnrichedNotes(foundation, undefined, 100);
+    const items = await MemoryNoteModel.listEnrichedNotes(foundation, undefined, 100, projectRoot);
     const lifecycle = (await foundation.content.invoke("memory_lifecycleStatus", {})) as {
       sessions?: Array<Record<string, unknown>>;
     };
-    const graph = buildMemoryKnowledgeGraph(items, lifecycle.sessions ?? []);
+    const filterMissingRepoFiles =
+      existsSync(join(projectRoot, "src")) || existsSync(join(projectRoot, "package.json"));
+    const graph = buildMemoryKnowledgeGraph(items, lifecycle.sessions ?? [], {
+      projectRoot,
+      filterMissingRepoFiles,
+    });
     return {
       ok: true,
       projectRoot,
@@ -305,8 +371,24 @@ export function renderMvcModelsJs(): string {
     curatorAudit: (projectRoot) => ["pm-v2", "curator-audit", projectRoot],
   };
 
+  function getCsrfToken() {
+    if (typeof document === "undefined" || !document.querySelector) return "";
+    const meta = document.querySelector('meta[name="pm-csrf-token"]');
+    return meta ? meta.getAttribute("content") || "" : "";
+  }
+
   async function apiJson(url, options) {
-    const res = await fetch(url, options);
+    const opts = options ? { ...options } : {};
+    const method = String(opts.method || "GET").toUpperCase();
+    const headers = { ...(opts.headers || {}) };
+    if (method !== "GET" && method !== "HEAD") {
+      const token = getCsrfToken();
+      if (token && !headers["x-pm-csrf-token"] && !headers["X-PM-CSRF-Token"]) {
+        headers["X-PM-CSRF-Token"] = token;
+      }
+    }
+    opts.headers = headers;
+    const res = await fetch(url, opts);
     const data = await res.json();
     if (!res.ok || data.ok === false) {
       throw new Error(data.message || data.error || ("HTTP " + res.status));

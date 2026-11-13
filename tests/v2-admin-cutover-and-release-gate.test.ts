@@ -371,6 +371,12 @@ test("v2-admin.js generate-client-configs outputs valid V2 client configurations
   const outputDir = join(rootDir, "generated-configs");
   mkdirSync(v1ArchiveRoot, { recursive: true });
   mkdirSync(v2VaultRoot, { recursive: true });
+  mkdirSync(join(outputDir, ".claude"), { recursive: true });
+  writeFileSync(
+    join(outputDir, ".claude", "settings.local.json"),
+    JSON.stringify({ permissions: { allow: ["Bash(git status:*)"] } }, null, 2),
+    "utf8",
+  );
   const releaseId = randomUUID();
 
   try {
@@ -411,6 +417,7 @@ test("v2-admin.js generate-client-configs outputs valid V2 client configurations
 
     assert.equal(payload.ok, true);
     assert.equal(payload.v2EntryPath, DIST_V2);
+    assert.equal(payload.env.MEMORY_V2_AUTO_SYNC_BUILD, "1");
     const validatedTopEnv = loadV2LaunchConfig(payload.env);
     assert.equal(validatedTopEnv.releaseId, releaseId);
 
@@ -427,6 +434,11 @@ test("v2-admin.js generate-client-configs outputs valid V2 client configurations
       const clientConfig = payload.clients[clientName];
       assert.ok(clientConfig, `Missing client config for ${clientName}`);
       assert.ok(clientConfig.args.includes(DIST_V2), `${clientName} args must point to dist/v2.js`);
+      assert.equal(
+        clientConfig.env.MEMORY_V2_AUTO_SYNC_BUILD,
+        "1",
+        `${clientName} env must include MEMORY_V2_AUTO_SYNC_BUILD=1`,
+      );
       const parsedEnv = loadV2LaunchConfig(clientConfig.env);
       assert.equal(parsedEnv.projectRoot, projectRoot);
       assert.equal(parsedEnv.v2VaultRoot, v2VaultRoot);
@@ -438,14 +450,41 @@ test("v2-admin.js generate-client-configs outputs valid V2 client configurations
       ".codex/config.toml",
       "opencode.json",
       ".antigravity/mcp.json",
+      ".antigravity/mcp.example.json",
       ".cursor/mcp.json",
+      ".cursor/rules/project-memory.mdc",
       ".zed/settings.json",
       ".windsurf/mcp.json",
+      ".windsurf/mcp_config.example.json",
+      ".windsurf/rules/project-memory.md",
       ".mcp.json",
       ".claude/settings.local.json",
+      "CLAUDE.md",
+      ".rules",
+      ".windsurfrules",
+      ".github/copilot-instructions.md",
     ]) {
       assert.equal(existsSync(join(outputDir, relFile)), true, `Expected written file ${relFile}`);
     }
+
+    const codexToml = readFileSync(join(outputDir, ".codex/config.toml"), "utf8");
+    assert.ok(codexToml.includes('MEMORY_V2_AUTO_SYNC_BUILD = "1"'));
+
+    const claudeLocal = JSON.parse(
+      readFileSync(join(outputDir, ".claude/settings.local.json"), "utf8"),
+    ) as Record<string, unknown>;
+    assert.equal("mcpServers" in claudeLocal, false, ".claude/settings.local.json must not contain mcpServers");
+    assert.equal(claudeLocal.enableAllProjectMcpServers, true);
+    assert.deepEqual(claudeLocal.enabledMcpjsonServers, ["project-memory"]);
+    assert.ok(
+      Array.isArray((claudeLocal.permissions as { allow?: string[] } | undefined)?.allow) &&
+        (claudeLocal.permissions as { allow: string[] }).allow.includes("Bash(git status:*)"),
+      "Existing Claude permissions must be preserved",
+    );
+
+    const claudeMd = readFileSync(join(outputDir, "CLAUDE.md"), "utf8");
+    assert.ok(claudeMd.includes("memory_v2Status") && claudeMd.includes("memory-v2/"));
+    assert.ok(!claudeMd.includes("query-docs"), "Rule files must use get-library-docs instead of query-docs");
   } finally {
     rmSync(rootDir, { recursive: true, force: true });
   }

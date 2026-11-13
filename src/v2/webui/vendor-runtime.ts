@@ -5,10 +5,14 @@ export function renderVendorRuntimeJs(): string {
 // Exports: window.React, window.ReactDOM, window.TanStackQuery, window.TanStackTable
 // ============================================================================
 (function (global) {
-  const SVG_TAGS = new Set(["svg", "g", "line", "circle", "text", "path", "rect", "defs", "marker", "linearGradient", "stop", "polyline", "polygon"]);
+  const SVG_TAGS = new Set(["svg", "g", "line", "circle", "text", "path", "rect", "defs", "marker", "linearGradient", "stop", "polyline", "polygon", "title"]);
   const Fragment = Symbol("React.Fragment");
 
+  const sharedComponentHooks = new Map();
+  const activeRoots = new Set();
+  let mountCounter = 0;
   let currentRoot = null;
+  let currentComponentKey = "root";
   let hookCursor = 0;
 
   function createElement(type, props, ...children) {
@@ -44,8 +48,21 @@ export function renderVendorRuntimeJs(): string {
 
   function getHookSlot() {
     if (!currentRoot) throw new Error("React Hook called outside render");
+    const rootId = currentRoot.mountId || currentRoot.rootTag || "ROOT";
+    const projScope =
+      currentRoot.container && currentRoot.container.getAttribute
+        ? currentRoot.container.getAttribute("project-root") ||
+          currentRoot.container.getAttribute("default-project") ||
+          ""
+        : "";
+    const key = rootId + "::" + projScope + "::" + (currentComponentKey || "root");
+    let hooks = sharedComponentHooks.get(key);
+    if (!hooks) {
+      hooks = [];
+      sharedComponentHooks.set(key, hooks);
+    }
+    currentRoot.ownedHookKeys.add(key);
     const idx = hookCursor++;
-    const hooks = currentRoot.hooks;
     return { hooks, idx };
   }
 
@@ -60,7 +77,11 @@ export function renderVendorRuntimeJs(): string {
       const next = typeof updater === "function" ? updater(prev) : updater;
       if (!Object.is(prev, next)) {
         hooks[idx] = next;
-        rootRef.scheduleRender();
+        if (rootRef.unmounted) {
+          activeRoots.forEach((r) => r.scheduleRender());
+        } else {
+          rootRef.scheduleRender();
+        }
       }
     };
     return [hooks[idx], setState];
@@ -117,7 +138,7 @@ export function renderVendorRuntimeJs(): string {
     }
   }
 
-  function renderVNodeToDom(vnode, isSvg = false) {
+  function renderVNodeToDom(vnode, isSvg = false, path = "0") {
     if (vnode === null || vnode === undefined || typeof vnode === "boolean") {
       return document.createTextNode("");
     }
@@ -126,17 +147,29 @@ export function renderVendorRuntimeJs(): string {
     }
     if (Array.isArray(vnode)) {
       const frag = document.createDocumentFragment();
-      vnode.forEach((child) => frag.appendChild(renderVNodeToDom(child, isSvg)));
+      vnode.forEach((child, i) => frag.appendChild(renderVNodeToDom(child, isSvg, path + "." + i)));
       return frag;
     }
     if (vnode.type === Fragment) {
       const frag = document.createDocumentFragment();
-      (vnode.props.children || []).forEach((child) => frag.appendChild(renderVNodeToDom(child, isSvg)));
+      (vnode.props.children || []).forEach((child, i) => frag.appendChild(renderVNodeToDom(child, isSvg, path + ".f" + i)));
       return frag;
     }
     if (typeof vnode.type === "function") {
-      const subTree = vnode.type(vnode.props || {});
-      return renderVNodeToDom(subTree, isSvg);
+      const prevCompKey = currentComponentKey;
+      const prevCursor = hookCursor;
+      const compName = vnode.type.displayName || vnode.type.name || "Component";
+      const explicitKey = vnode.props && vnode.props.key != null ? String(vnode.props.key) : "";
+      currentComponentKey = path + ":" + compName + ":" + explicitKey;
+      hookCursor = 0;
+      let subTree;
+      try {
+        subTree = vnode.type(vnode.props || {});
+      } finally {
+        currentComponentKey = prevCompKey;
+        hookCursor = prevCursor;
+      }
+      return renderVNodeToDom(subTree, isSvg, path + ":" + compName);
     }
 
     const tag = String(vnode.type);
@@ -188,8 +221,8 @@ export function renderVendorRuntimeJs(): string {
       el.setAttribute(key, String(val));
     }
 
-    (props.children || []).forEach((child) => {
-      el.appendChild(renderVNodeToDom(child, svgMode));
+    (props.children || []).forEach((child, i) => {
+      el.appendChild(renderVNodeToDom(child, svgMode, path + "." + i));
     });
 
     if (tag === "select" && props.value !== undefined) {
@@ -200,9 +233,21 @@ export function renderVendorRuntimeJs(): string {
   }
 
   function createRoot(container) {
+    if (container && container.getAttribute && !container.getAttribute("data-pm-mount-id")) {
+      mountCounter += 1;
+      container.setAttribute("data-pm-mount-id", "pm-m" + mountCounter);
+    }
+    const assignedMountId =
+      (container && container.getAttribute && container.getAttribute("data-pm-mount-id")) ||
+      "pm-m" + ++mountCounter;
+
     const rootInstance = {
       container,
+      mountId: assignedMountId,
+      rootTag: container && container.tagName ? container.tagName : "ROOT",
       hooks: [],
+      ownedHookKeys: new Set(),
+      unmounted: false,
       pendingEffects: [],
       element: null,
       scheduled: false,
@@ -221,20 +266,55 @@ export function renderVendorRuntimeJs(): string {
         const selStart = activeEl && typeof activeEl.selectionStart === "number" ? activeEl.selectionStart : null;
         const selEnd = activeEl && typeof activeEl.selectionEnd === "number" ? activeEl.selectionEnd : null;
 
+        const savedScroll = new Map();
+        if (this.container) {
+          if (this.container.scrollTop || this.container.scrollLeft) {
+            savedScroll.set("__root__", [this.container.scrollTop || 0, this.container.scrollLeft || 0]);
+          }
+          if (this.container.querySelectorAll) {
+            const subEls = this.container.querySelectorAll("[id]");
+            for (let i = 0; i < subEls.length; i++) {
+              const node = subEls[i];
+              if (node.id && (node.scrollTop || node.scrollLeft)) {
+                savedScroll.set(node.id, [node.scrollTop || 0, node.scrollLeft || 0]);
+              }
+            }
+          }
+        }
+
         const prevRoot = currentRoot;
+        const prevCompKey = currentComponentKey;
+        const prevCursor = hookCursor;
         currentRoot = this;
+        currentComponentKey = "root";
         hookCursor = 0;
         this.pendingEffects = [];
 
         let domNode;
         try {
-          domNode = renderVNodeToDom(this.element, false);
+          domNode = renderVNodeToDom(this.element, false, "0");
         } finally {
           currentRoot = prevRoot;
+          currentComponentKey = prevCompKey;
+          hookCursor = prevCursor;
         }
 
         this.container.innerHTML = "";
         this.container.appendChild(domNode);
+
+        if (savedScroll.has("__root__")) {
+          const [st, sl] = savedScroll.get("__root__");
+          this.container.scrollTop = st;
+          this.container.scrollLeft = sl;
+        }
+        for (const [elId, coords] of savedScroll.entries()) {
+          if (elId === "__root__") continue;
+          const targetEl = document.getElementById(elId);
+          if (targetEl) {
+            targetEl.scrollTop = coords[0];
+            targetEl.scrollLeft = coords[1];
+          }
+        }
 
         if (focusId) {
           const restored = document.getElementById(focusId);
@@ -253,17 +333,30 @@ export function renderVendorRuntimeJs(): string {
         effects.forEach((fn) => fn());
       },
       render(element) {
+        this.unmounted = false;
+        activeRoots.add(this);
         this.element = element;
         this.flushRender();
       },
       unmount() {
-        this.hooks.forEach((h) => {
-          if (h && typeof h.cleanup === "function") {
-            try {
-              h.cleanup();
-            } catch (_e) {}
+        this.unmounted = true;
+        activeRoots.delete(this);
+        for (const key of this.ownedHookKeys) {
+          const hooks = sharedComponentHooks.get(key);
+          if (hooks) {
+            hooks.forEach((h) => {
+              if (h && typeof h.cleanup === "function") {
+                try {
+                  h.cleanup();
+                } catch (_e) {}
+                h.cleanup = null;
+                h.deps = null;
+              }
+            });
+            sharedComponentHooks.delete(key);
           }
-        });
+        }
+        this.ownedHookKeys.clear();
         this.container.innerHTML = "";
         this.element = null;
       },

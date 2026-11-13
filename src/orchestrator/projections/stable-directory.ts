@@ -1,7 +1,19 @@
-import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { lstatSync, realpathSync } from "node:fs";
-import { isAbsolute, normalize, resolve } from "node:path";
+import {
+  closeSync,
+  fstatSync,
+  fsyncSync,
+  linkSync,
+  lstatSync,
+  openSync,
+  readdirSync,
+  readFileSync,
+  realpathSync,
+  renameSync,
+  unlinkSync,
+  writeSync,
+} from "node:fs";
+import { basename, isAbsolute, join, normalize, resolve } from "node:path";
 
 import { LifecycleError } from "../lifecycle/errors.js";
 import type {
@@ -10,838 +22,12 @@ import type {
   V2RetirementIntent,
 } from "./reconciliation-journal.js";
 
-const MUTATION_TIMEOUT_MS = 5_000;
 const MAX_STABLE_MANIFEST_BYTES = 64 * 1_024;
 const MAX_STABLE_GENERATION_BYTES = 512 * 1_024 * 1_024;
 export const PROJECTION_MANIFEST_PUBLICATION_LOCK_FILENAME =
   ".projection-manifest.publish.lock" as const;
 export const PROJECTION_RECONCILIATION_JOURNAL_FILENAME =
   "projection-reconciliation-v2.json" as const;
-const MUTATION_SCRIPT = String.raw`
-"use strict";
-const { createHash } = require("node:crypto");
-const {
-  closeSync, fstatSync, fsyncSync, lstatSync, openSync, readFileSync,
-  realpathSync, readdirSync, linkSync, renameSync, unlinkSync, writeSync,
-} = require("node:fs");
-const { basename, resolve } = require("node:path");
-const [
-  operation, expectedPath, expectedDevice, expectedInode, ...operationArguments
-] = process.argv.slice(1);
-const MAX_MANIFEST_BYTES = ${String(MAX_STABLE_MANIFEST_BYTES)};
-const MAX_GENERATION_BYTES = ${String(MAX_STABLE_GENERATION_BYTES)};
-const MANIFEST_NAME = "projection-manifest.json";
-const MANIFEST_TEMP_NAME = ".projection-manifest.json.tmp";
-const LOCK_NAME = ${JSON.stringify(PROJECTION_MANIFEST_PUBLICATION_LOCK_FILENAME)};
-const RECONCILIATION_JOURNAL_NAME = ${JSON.stringify(PROJECTION_RECONCILIATION_JOURNAL_FILENAME)};
-const RECONCILIATION_JOURNAL_TEMP_NAME = ".projection-reconciliation-v2.json.tmp";
-const TOKEN = /^[0-9a-f]{32}$/u;
-const V2_GENERATION = /^projections-[23]-([1-9][0-9]{0,9})\.sqlite$/u;
-const V2_RETIRED = /^\.projections-[23]-retired-([0-9a-f]{32})\.sqlite$/u;
-const normalized = (path) => {
-  const value = resolve(path);
-  return process.platform === "win32" ? value.toLowerCase() : value;
-};
-const invalid = () => { throw new Error("PROJECTION_PATH_INVALID"); };
-const integrity = () => { throw new Error("INTEGRITY_FAILURE"); };
-const assertDirectory = () => {
-  const directory = lstatSync(".", { bigint: true });
-  if (!directory.isDirectory() || directory.isSymbolicLink()) invalid();
-  if (
-    normalized(realpathSync.native(".")) !== normalized(expectedPath)
-    || directory.dev.toString() !== expectedDevice
-    || directory.ino.toString() !== expectedInode
-  ) invalid();
-  return directory;
-};
-const captureManifest = () => {
-  const manifestName = MANIFEST_NAME;
-  let before;
-  try {
-    before = lstatSync(manifestName, { bigint: true });
-  } catch (error) {
-    if (error && error.code === "ENOENT") {
-      const directory = assertDirectory();
-      return {
-        state: "missing",
-        directoryDevice: directory.dev.toString(),
-        directoryInode: directory.ino.toString(),
-      };
-    }
-    throw error;
-  }
-  if (
-    !before.isFile()
-    || before.isSymbolicLink()
-    || before.size < 0n
-    || before.size > BigInt(MAX_MANIFEST_BYTES)
-  ) invalid();
-  let handle;
-  try {
-    handle = openSync(manifestName, "r");
-    const opened = fstatSync(handle, { bigint: true });
-    if (
-      !opened.isFile()
-      || opened.dev !== before.dev
-      || opened.ino !== before.ino
-      || opened.size !== before.size
-    ) invalid();
-    const bytes = readFileSync(handle);
-    const openedAfter = fstatSync(handle, { bigint: true });
-    const after = lstatSync(manifestName, { bigint: true });
-    if (
-      bytes.byteLength !== Number(before.size)
-      || openedAfter.dev !== opened.dev
-      || openedAfter.ino !== opened.ino
-      || openedAfter.size !== opened.size
-      || after.dev !== before.dev
-      || after.ino !== before.ino
-      || after.size !== before.size
-      || !after.isFile()
-      || after.isSymbolicLink()
-    ) invalid();
-    const directory = assertDirectory();
-    return {
-      state: "present",
-      directoryDevice: directory.dev.toString(),
-      directoryInode: directory.ino.toString(),
-      device: opened.dev.toString(),
-      inode: opened.ino.toString(),
-      size: opened.size.toString(),
-      sha256: createHash("sha256").update(bytes).digest("hex"),
-      bytesBase64: bytes.toString("base64"),
-    };
-  } finally {
-    if (handle !== undefined) closeSync(handle);
-  }
-};
-const syncDirectory = () => {
-  let handle;
-  try {
-    handle = openSync(".", "r");
-    fsyncSync(handle);
-  } catch (error) {
-    const code = error && error.code;
-    if (
-      code !== "EINVAL" && code !== "EISDIR" && code !== "ENOTSUP"
-      && code !== "EOPNOTSUPP"
-      && !(process.platform === "win32" && (code === "EACCES" || code === "EBADF" || code === "EPERM"))
-    ) throw error;
-  } finally {
-    if (handle !== undefined) closeSync(handle);
-  }
-};
-const sidecarPresent = (name) => {
-  for (const suffix of ["-wal", "-shm"]) {
-    try {
-      lstatSync(name + suffix);
-      return true;
-    } catch (error) {
-      if (error && error.code === "ENOENT") continue;
-      integrity();
-    }
-  }
-  return false;
-};
-const captureFileIdentity = (name, maximumBytes = MAX_MANIFEST_BYTES) => {
-  const before = lstatSync(name, { bigint: true });
-  if (
-    !before.isFile()
-    || before.isSymbolicLink()
-    || before.size < 0n
-    || before.size > BigInt(maximumBytes)
-  ) invalid();
-  let handle;
-  try {
-    handle = openSync(name, "r");
-    const opened = fstatSync(handle, { bigint: true });
-    if (
-      !opened.isFile()
-      || opened.dev !== before.dev
-      || opened.ino !== before.ino
-      || opened.size !== before.size
-      || opened.ctimeNs !== before.ctimeNs
-    ) invalid();
-    const bytes = readFileSync(handle);
-    const openedAfter = fstatSync(handle, { bigint: true });
-    const after = lstatSync(name, { bigint: true });
-    if (
-      bytes.byteLength !== Number(before.size)
-      || openedAfter.dev !== opened.dev
-      || openedAfter.ino !== opened.ino
-      || openedAfter.size !== opened.size
-      || openedAfter.ctimeNs !== opened.ctimeNs
-      || after.dev !== before.dev
-      || after.ino !== before.ino
-      || after.size !== before.size
-      || after.ctimeNs !== before.ctimeNs
-      || !after.isFile()
-      || after.isSymbolicLink()
-    ) invalid();
-    assertDirectory();
-    return {
-      device: opened.dev.toString(),
-      inode: opened.ino.toString(),
-      size: opened.size.toString(),
-      ctimeNs: opened.ctimeNs.toString(),
-      sha256: createHash("sha256").update(bytes).digest("hex"),
-      bytes,
-    };
-  } finally {
-    if (handle !== undefined) closeSync(handle);
-  }
-};
-const assertToken = (token) => {
-  if (typeof token !== "string" || !TOKEN.test(token)) invalid();
-  return token;
-};
-const assertLock = (token) => {
-  const lock = captureFileIdentity(LOCK_NAME);
-  if (lock.bytes.toString("utf8") !== token) invalid();
-};
-const linkIfAbsent = (source, target) => {
-  try {
-    linkSync(source, target);
-    return true;
-  } catch (error) {
-    if (error && error.code === "EEXIST") return false;
-    throw error;
-  }
-};
-const removeRegularFile = (name) => {
-  const entry = lstatSync(name);
-  if (!entry.isFile() || entry.isSymbolicLink()) invalid();
-  unlinkSync(name);
-};
-const fileMatchesArguments = (file, offset) => (
-  file.device === operationArguments[offset]
-  && file.inode === operationArguments[offset + 1]
-  && file.size === operationArguments[offset + 2]
-  && file.sha256 === operationArguments[offset + 3]
-);
-const sameGenerationIdentity = (file, expected) => (
-  file.device === expected.device
-  && file.inode === expected.inode
-  && file.size === expected.size
-  && file.ctimeNs === expected.ctimeNs
-  && file.sha256 === expected.sha256
-);
-const sameGenerationRenameContinuity = (file, expected) => (
-  file.device === expected.device
-  && file.inode === expected.inode
-  && file.size === expected.size
-  && file.sha256 === expected.sha256
-);
-const exactKeys = (value, keys) => (
-  typeof value === "object" && value !== null && !Array.isArray(value)
-  && Reflect.ownKeys(value).length === keys.length
-  && keys.every((key) => Object.prototype.hasOwnProperty.call(value, key))
-);
-const validGeneration = (value) => (
-  Number.isSafeInteger(value) && value >= 0 && value <= 2147483647
-);
-const validRetirementGeneration = (value) => (
-  Number.isSafeInteger(value) && value >= 1 && value <= 2147483647
-);
-const exactRetirementImage = (value) => {
-  if (
-    !exactKeys(value, ["device", "inode", "size", "ctimeNs", "sha256"])
-    || typeof value.device !== "string" || !/^(?:0|[1-9][0-9]*)$/u.test(value.device)
-    || typeof value.inode !== "string" || !/^(?:0|[1-9][0-9]*)$/u.test(value.inode)
-    || typeof value.size !== "string" || !/^(?:0|[1-9][0-9]*)$/u.test(value.size)
-    || BigInt(value.size) > BigInt(MAX_GENERATION_BYTES)
-    || typeof value.ctimeNs !== "string" || !/^(?:0|[1-9][0-9]*)$/u.test(value.ctimeNs)
-    || typeof value.sha256 !== "string" || !/^[0-9a-f]{64}$/u.test(value.sha256)
-  ) invalid();
-  return {
-    device: value.device,
-    inode: value.inode,
-    size: value.size,
-    ctimeNs: value.ctimeNs,
-    sha256: value.sha256,
-  };
-};
-const exactRetirement = (value) => {
-  if (!validRetirementGeneration(value && value.generation)) invalid();
-  if (value.state === "intent") {
-    if (
-      !exactKeys(value, ["state", "generation", "finalFilename", "retiredFilename", "image"])
-      || typeof value.finalFilename !== "string"
-      || !V2_GENERATION.test(value.finalFilename)
-      || Number(V2_GENERATION.exec(value.finalFilename)[1]) !== value.generation
-      || typeof value.retiredFilename !== "string" || !V2_RETIRED.test(value.retiredFilename)
-      || value.finalFilename.split("-")[1] !== value.retiredFilename.split("-")[1]
-    ) invalid();
-    return {
-      state: "intent",
-      generation: value.generation,
-      finalFilename: value.finalFilename,
-      retiredFilename: value.retiredFilename,
-      image: exactRetirementImage(value.image),
-    };
-  }
-  if (
-    value.state !== "retired"
-    || !exactKeys(value, ["state", "generation", "retiredFilename", "image"])
-    || typeof value.retiredFilename !== "string" || !V2_RETIRED.test(value.retiredFilename)
-  ) invalid();
-  return {
-    state: "retired",
-    generation: value.generation,
-    retiredFilename: value.retiredFilename,
-    image: exactRetirementImage(value.image),
-  };
-};
-const canonicalJournalBytes = (journal) => Buffer.from(JSON.stringify(journal) + "\n", "utf8");
-const exactJournal = (bytes) => {
-  let value;
-  try { value = JSON.parse(bytes.toString("utf8")); } catch { invalid(); }
-  if (!validGeneration(value && value.highestReservedGeneration)) invalid();
-  if (exactKeys(value, ["highestReservedGeneration"])) {
-    const legacy = { highestReservedGeneration: value.highestReservedGeneration };
-    if (!canonicalJournalBytes(legacy).equals(bytes)) throw new Error("JOURNAL_FORMAT_MISMATCH");
-    return { highestReservedGeneration: legacy.highestReservedGeneration, retirements: [] };
-  }
-  if (exactKeys(value, ["highestReservedGeneration", "schemaVersion"]) && value.schemaVersion === 1) {
-    const legacy = { highestReservedGeneration: value.highestReservedGeneration, schemaVersion: 1 };
-    if (!canonicalJournalBytes(legacy).equals(bytes)) throw new Error("JOURNAL_FORMAT_MISMATCH");
-    return { highestReservedGeneration: legacy.highestReservedGeneration, retirements: [] };
-  }
-  if (
-    !exactKeys(value, ["highestReservedGeneration", "retirements"])
-    || !Array.isArray(value.retirements)
-    || value.retirements.length > 100000
-  ) invalid();
-  const generations = new Set();
-  const retiredFilenames = new Set();
-  const retirements = value.retirements.map((record) => {
-    const retirement = exactRetirement(record);
-    if (
-      retirement.generation > value.highestReservedGeneration
-      || generations.has(retirement.generation)
-      || retiredFilenames.has(retirement.retiredFilename)
-    ) invalid();
-    generations.add(retirement.generation);
-    retiredFilenames.add(retirement.retiredFilename);
-    return retirement;
-  });
-  const canonical = { highestReservedGeneration: value.highestReservedGeneration, retirements };
-  if (!canonicalJournalBytes(canonical).equals(bytes)) throw new Error("JOURNAL_FORMAT_MISMATCH");
-  return canonical;
-};
-const readJournal = () => {
-  try {
-    return exactJournal(captureFileIdentity(RECONCILIATION_JOURNAL_NAME).bytes);
-  } catch (error) {
-    if (error && error.code === "ENOENT") return { highestReservedGeneration: 0, retirements: [] };
-    throw new Error("PROJECTION_PUBLICATION_RECOVERY_REQUIRED");
-  }
-};
-const writeDurable = (name, bytes) => {
-  let handle;
-  try {
-    handle = openSync(name, "wx", 0o600);
-    let offset = 0;
-    while (offset < bytes.byteLength) {
-      const written = writeSync(handle, bytes, offset, bytes.byteLength - offset, offset);
-      if (!Number.isSafeInteger(written) || written <= 0) invalid();
-      offset += written;
-    }
-    fsyncSync(handle);
-  } finally {
-    if (handle !== undefined) closeSync(handle);
-  }
-};
-const writeJournal = (journal) => {
-  try {
-    lstatSync(RECONCILIATION_JOURNAL_TEMP_NAME);
-    invalid();
-  } catch (error) {
-    if (!error || error.code !== "ENOENT") throw error;
-  }
-  const bytes = canonicalJournalBytes(journal);
-  writeDurable(RECONCILIATION_JOURNAL_TEMP_NAME, bytes);
-  renameSync(RECONCILIATION_JOURNAL_TEMP_NAME, RECONCILIATION_JOURNAL_NAME);
-  syncDirectory();
-  const observed = readJournal();
-  if (!canonicalJournalBytes(observed).equals(bytes)) throw new Error("JOURNAL_VERIFY_MISMATCH");
-};
-const transactionNames = (attemptToken) => ({
-  previous: ".projection-manifest.previous-" + attemptToken,
-  attempted: ".projection-manifest.attempted-" + attemptToken,
-  displaced: ".projection-manifest.displaced-" + attemptToken,
-  failed: ".projection-manifest.failed-" + attemptToken,
-});
-try {
-  assertDirectory();
-  if (operation === "cleanup") {
-    const generationTemp = /^\.projections-[123]-[1-9][0-9]{0,9}(?:-[0-9a-f]{32})?\.sqlite\.tmp(?:-(?:wal|shm))?$/u;
-    for (const name of readdirSync(".")) {
-      if (name !== ".projection-manifest.json.tmp" && !generationTemp.test(name)) continue;
-      const entry = lstatSync(name);
-      if (!entry.isFile() || entry.isSymbolicLink()) invalid();
-      unlinkSync(name);
-    }
-    process.stdout.write("cleaned");
-  } else if (operation === "capture-manifest") {
-    process.stdout.write(JSON.stringify(captureManifest()));
-  } else if (operation === "assert-generation") {
-    const [filename] = operationArguments;
-    if (
-      typeof filename !== "string"
-      || basename(filename) !== filename
-      || !/^projections-[123]-[1-9][0-9]{0,9}\.sqlite$/u.test(filename)
-    ) invalid();
-    if (sidecarPresent(filename)) integrity();
-    try {
-      const entry = lstatSync(filename);
-      if (!entry.isFile() || entry.isSymbolicLink()) invalid();
-      process.stdout.write("present");
-    } catch (error) {
-      if (error && error.code === "ENOENT") process.stdout.write("missing");
-      else throw error;
-    }
-  } else if (operation === "reserve-reconciliation-journal") {
-    const [lockToken, requested] = operationArguments;
-    assertLock(assertToken(lockToken));
-    if (typeof requested !== "string" || !/^(?:0|[1-9][0-9]*)$/u.test(requested)) invalid();
-    const requestedGeneration = Number(requested);
-    if (!Number.isSafeInteger(requestedGeneration) || requestedGeneration > 2147483647) invalid();
-    const journal = readJournal();
-    const next = Math.max(journal.highestReservedGeneration, requestedGeneration);
-    writeJournal({ highestReservedGeneration: next, retirements: journal.retirements });
-    assertLock(lockToken);
-    process.stdout.write(String(next));
-  } else if (operation === "begin-reconciliation-retirement") {
-    const [lockToken, encodedIntent] = operationArguments;
-    assertLock(assertToken(lockToken));
-    if (typeof encodedIntent !== "string") invalid();
-    let input;
-    try { input = JSON.parse(encodedIntent); } catch { invalid(); }
-    const intent = exactRetirement(input);
-    if (intent.state !== "intent" || JSON.stringify(intent) !== encodedIntent) invalid();
-    const journal = readJournal();
-    if (
-      intent.generation > journal.highestReservedGeneration
-      || journal.retirements.some((record) => (
-        record.generation === intent.generation || record.retiredFilename === intent.retiredFilename
-      ))
-    ) invalid();
-    writeJournal({
-      highestReservedGeneration: journal.highestReservedGeneration,
-      retirements: [...journal.retirements, intent],
-    });
-    assertLock(lockToken);
-    process.stdout.write(JSON.stringify(intent));
-  } else if (operation === "complete-reconciliation-retirement") {
-    const [lockToken, encodedIntent, encodedImage] = operationArguments;
-    assertLock(assertToken(lockToken));
-    if (typeof encodedIntent !== "string" || typeof encodedImage !== "string") invalid();
-    let intentInput;
-    let imageInput;
-    try {
-      intentInput = JSON.parse(encodedIntent);
-      imageInput = JSON.parse(encodedImage);
-    } catch { invalid(); }
-    const intent = exactRetirement(intentInput);
-    const image = exactRetirementImage(imageInput);
-    if (
-      intent.state !== "intent"
-      || JSON.stringify(intent) !== encodedIntent
-      || JSON.stringify(image) !== encodedImage
-      || !sameGenerationRenameContinuity(image, intent.image)
-    ) invalid();
-    const journal = readJournal();
-    const index = journal.retirements.findIndex((record) => record.generation === intent.generation);
-    if (index < 0 || JSON.stringify(journal.retirements[index]) !== JSON.stringify(intent)) invalid();
-    const retired = {
-      state: "retired",
-      generation: intent.generation,
-      retiredFilename: intent.retiredFilename,
-      image,
-    };
-    const retirements = [...journal.retirements];
-    retirements[index] = retired;
-    writeJournal({ highestReservedGeneration: journal.highestReservedGeneration, retirements });
-    assertLock(lockToken);
-    process.stdout.write(JSON.stringify(retired));
-  } else if (operation === "read-reconciliation-retirements") {
-    const [lockToken] = operationArguments;
-    assertLock(assertToken(lockToken));
-    const journal = readJournal();
-    assertLock(lockToken);
-    process.stdout.write(JSON.stringify(journal.retirements));
-  } else if (operation === "read-generation-image") {
-    const [lockToken, filename] = operationArguments;
-    assertLock(assertToken(lockToken));
-    if (typeof filename !== "string" || !V2_GENERATION.test(filename)) invalid();
-    if (sidecarPresent(filename)) integrity();
-    const image = captureFileIdentity(filename, filename.startsWith("projections-3-") ? 64 * 1024 * 1024 : MAX_GENERATION_BYTES);
-    assertLock(lockToken);
-    process.stdout.write(JSON.stringify({
-      filename,
-      device: image.device,
-      inode: image.inode,
-      size: image.size,
-      ctimeNs: image.ctimeNs,
-      sha256: image.sha256,
-      bytesBase64: image.bytes.toString("base64"),
-    }));
-  } else if (operation === "retire-generation") {
-    const [lockToken, filename, retiredFilename, device, inode, size, ctimeNs, sha256] = operationArguments;
-    assertLock(assertToken(lockToken));
-    if (
-      typeof filename !== "string" || !V2_GENERATION.test(filename)
-      || typeof retiredFilename !== "string" || !V2_RETIRED.test(retiredFilename) || filename.split("-")[1] !== retiredFilename.split("-")[1]
-    ) invalid();
-    try {
-      lstatSync(retiredFilename);
-      invalid();
-    } catch (error) {
-      if (!error || error.code !== "ENOENT") throw error;
-    }
-    if (sidecarPresent(filename) || sidecarPresent(retiredFilename)) integrity();
-    const expected = { device, inode, size, ctimeNs, sha256 };
-    const current = captureFileIdentity(filename, MAX_GENERATION_BYTES);
-    if (!sameGenerationIdentity(current, expected)) invalid();
-    renameSync(filename, retiredFilename);
-    syncDirectory();
-    const retired = captureFileIdentity(retiredFilename, MAX_GENERATION_BYTES);
-    if (!sameGenerationRenameContinuity(retired, expected)) invalid();
-    assertLock(lockToken);
-    process.stdout.write(JSON.stringify({
-      filename: retiredFilename,
-      device: retired.device,
-      inode: retired.inode,
-      size: retired.size,
-      ctimeNs: retired.ctimeNs,
-      sha256: retired.sha256,
-    }));
-  } else if (operation === "capture-retired-generation") {
-    const [lockToken, retiredFilename] = operationArguments;
-    assertLock(assertToken(lockToken));
-    if (typeof retiredFilename !== "string" || !V2_RETIRED.test(retiredFilename)) invalid();
-    if (sidecarPresent(retiredFilename)) integrity();
-    let retired;
-    try {
-      retired = captureFileIdentity(retiredFilename, MAX_GENERATION_BYTES);
-    } catch (error) {
-      if (!error || error.code !== "ENOENT") throw error;
-      assertDirectory();
-    }
-    assertLock(lockToken);
-    process.stdout.write(retired === undefined ? "null" : JSON.stringify({
-      filename: retiredFilename,
-      device: retired.device,
-      inode: retired.inode,
-      size: retired.size,
-      ctimeNs: retired.ctimeNs,
-      sha256: retired.sha256,
-    }));
-  } else if (operation === "install-generation") {
-    const [lockToken, temporaryFilename, finalFilename, device, inode, size, sha256] = operationArguments;
-    assertLock(assertToken(lockToken));
-    if (
-      typeof temporaryFilename !== "string"
-      || !/^\.projections-[23]-[1-9][0-9]{0,9}-[0-9a-f]{32}\.sqlite\.tmp$/u.test(temporaryFilename)
-      || typeof finalFilename !== "string"
-      || !/^projections-[23]-[1-9][0-9]{0,9}\.sqlite$/u.test(finalFilename)
-      || !temporaryFilename.startsWith("." + finalFilename.slice(0, -7) + "-")
-    ) invalid();
-    const temporary = captureFileIdentity(temporaryFilename, MAX_GENERATION_BYTES);
-    if (
-      temporary.device !== device || temporary.inode !== inode
-      || temporary.size !== size || temporary.sha256 !== sha256
-      || sidecarPresent(temporaryFilename) || sidecarPresent(finalFilename)
-    ) invalid();
-    if (!linkIfAbsent(temporaryFilename, finalFilename)) {
-      process.stdout.write("superseded");
-    } else {
-      const installed = captureFileIdentity(finalFilename, MAX_GENERATION_BYTES);
-      if (
-        installed.device !== temporary.device || installed.inode !== temporary.inode
-        || installed.size !== temporary.size || installed.sha256 !== temporary.sha256
-      ) integrity();
-      removeRegularFile(temporaryFilename);
-      syncDirectory();
-      assertLock(lockToken);
-      process.stdout.write("installed");
-    }
-  } else if (operation === "acquire-manifest-lock") {
-    const lockToken = assertToken(operationArguments[0]);
-    let handle;
-    try {
-      handle = openSync(LOCK_NAME, "wx", 0o600);
-    } catch (error) {
-      if (error && error.code === "EEXIST") {
-        process.stdout.write("busy");
-      } else throw error;
-    }
-    if (handle !== undefined) {
-      try {
-        const bytes = Buffer.from(lockToken, "utf8");
-        let offset = 0;
-        while (offset < bytes.byteLength) {
-          const written = writeSync(handle, bytes, offset, bytes.byteLength - offset, offset);
-          if (!Number.isSafeInteger(written) || written <= 0) invalid();
-          offset += written;
-        }
-        fsyncSync(handle);
-      } finally {
-        closeSync(handle);
-      }
-      syncDirectory();
-      assertLock(lockToken);
-      process.stdout.write("acquired");
-    }
-  } else if (operation === "release-manifest-lock") {
-    const lockToken = assertToken(operationArguments[0]);
-    assertLock(lockToken);
-    const retained = readdirSync(".").some((name) => (
-      name.startsWith(".projection-manifest.previous-")
-      || name.startsWith(".projection-manifest.attempted-")
-      || name.startsWith(".projection-manifest.displaced-")
-      || name.startsWith(".projection-manifest.failed-")
-    ));
-    if (retained) process.stdout.write("poisoned");
-    else {
-      removeRegularFile(LOCK_NAME);
-      syncDirectory();
-      assertDirectory();
-      process.stdout.write("released");
-    }
-  } else if (operation === "prepare-manifest") {
-    const lockToken = assertToken(operationArguments[0]);
-    const attemptToken = assertToken(operationArguments[1]);
-    const expectedState = operationArguments[2];
-    if (expectedState !== "missing" && expectedState !== "present") invalid();
-    const names = transactionNames(attemptToken);
-    assertLock(lockToken);
-    const candidate = captureFileIdentity(MANIFEST_TEMP_NAME);
-    for (const name of Object.values(names)) {
-      try {
-        lstatSync(name);
-        invalid();
-      } catch (error) {
-        if (!error || error.code !== "ENOENT") throw error;
-      }
-    }
-    if (!linkIfAbsent(MANIFEST_TEMP_NAME, names.attempted)) invalid();
-    const attempted = captureFileIdentity(names.attempted);
-    if (
-      attempted.device !== candidate.device
-      || attempted.inode !== candidate.inode
-      || attempted.size !== candidate.size
-      || attempted.sha256 !== candidate.sha256
-    ) invalid();
-    let outcome = "prepared";
-    if (expectedState === "present") {
-      try {
-        linkSync(MANIFEST_NAME, names.previous);
-      } catch (error) {
-        if (error && error.code === "ENOENT") outcome = "poisoned";
-        else throw error;
-      }
-      if (outcome === "prepared") {
-        const previous = captureFileIdentity(names.previous);
-        if (!fileMatchesArguments(previous, 3)) outcome = "superseded";
-      }
-    } else {
-      try {
-        lstatSync(MANIFEST_NAME);
-        outcome = "superseded";
-      } catch (error) {
-        if (!error || error.code !== "ENOENT") throw error;
-      }
-    }
-    syncDirectory();
-    assertLock(lockToken);
-    process.stdout.write(outcome);
-  } else if (operation === "install-manifest") {
-    const lockToken = assertToken(operationArguments[0]);
-    const attemptToken = assertToken(operationArguments[1]);
-    const expectedState = operationArguments[2];
-    if (expectedState !== "missing" && expectedState !== "present") invalid();
-    const names = transactionNames(attemptToken);
-    assertLock(lockToken);
-    const attempted = captureFileIdentity(names.attempted);
-    if (expectedState === "present") {
-      const previous = captureFileIdentity(names.previous);
-      if (!fileMatchesArguments(previous, 3)) invalid();
-    } else {
-      try {
-        lstatSync(names.previous);
-        invalid();
-      } catch (error) {
-        if (!error || error.code !== "ENOENT") throw error;
-      }
-    }
-    for (const name of [names.displaced, names.failed]) {
-      try {
-        lstatSync(name);
-        invalid();
-      } catch (error) {
-        if (!error || error.code !== "ENOENT") throw error;
-      }
-    }
-    if (expectedState === "missing") {
-      if (!linkIfAbsent(names.attempted, MANIFEST_NAME)) {
-        process.stdout.write("superseded");
-      } else {
-        removeRegularFile(MANIFEST_TEMP_NAME);
-        syncDirectory();
-        assertLock(lockToken);
-        process.stdout.write("installed");
-      }
-    } else {
-      let moved = false;
-      try {
-        renameSync(MANIFEST_NAME, names.displaced);
-        moved = true;
-      } catch (error) {
-        if (!error || error.code !== "ENOENT") throw error;
-      }
-      if (!moved) process.stdout.write("poisoned");
-      else {
-        const displaced = captureFileIdentity(names.displaced);
-        if (!fileMatchesArguments(displaced, 3)) {
-          if (!linkIfAbsent(names.displaced, MANIFEST_NAME)) {
-            process.stdout.write("poisoned");
-          } else {
-            syncDirectory();
-            process.stdout.write("superseded");
-          }
-        } else if (!linkIfAbsent(names.attempted, MANIFEST_NAME)) {
-          syncDirectory();
-          process.stdout.write("superseded");
-        } else {
-          removeRegularFile(MANIFEST_TEMP_NAME);
-          syncDirectory();
-          assertLock(lockToken);
-          process.stdout.write("installed");
-        }
-      }
-    }
-  } else if (operation === "commit-manifest") {
-    const lockToken = assertToken(operationArguments[0]);
-    const attemptToken = assertToken(operationArguments[1]);
-    const previousState = operationArguments[2];
-    if (previousState !== "missing" && previousState !== "present") invalid();
-    const names = transactionNames(attemptToken);
-    assertLock(lockToken);
-    const attemptedSize = operationArguments[7];
-    const attemptedSha256 = operationArguments[8];
-    if (
-      typeof attemptedSize !== "string"
-      || !/^(?:0|[1-9][0-9]*)$/u.test(attemptedSize)
-      || BigInt(attemptedSize) > BigInt(MAX_MANIFEST_BYTES)
-      || typeof attemptedSha256 !== "string"
-      || !/^[0-9a-f]{64}$/u.test(attemptedSha256)
-    ) invalid();
-    const attempted = captureFileIdentity(names.attempted);
-    if (attempted.size !== attemptedSize || attempted.sha256 !== attemptedSha256) invalid();
-    if (previousState === "present") {
-      captureFileIdentity(names.previous);
-    } else {
-      try {
-        lstatSync(names.previous);
-        invalid();
-      } catch (error) {
-        if (!error || error.code !== "ENOENT") throw error;
-      }
-    }
-    const retained = [];
-    for (const name of [names.displaced, names.failed]) {
-      try {
-        captureFileIdentity(name);
-        retained.push(name);
-      } catch (error) {
-        if (!error || error.code !== "ENOENT") throw error;
-      }
-    }
-    removeRegularFile(names.attempted);
-    if (previousState === "present") removeRegularFile(names.previous);
-    for (const name of retained) removeRegularFile(name);
-    syncDirectory();
-    assertLock(lockToken);
-    process.stdout.write("committed");
-  } else if (operation === "rollback-manifest") {
-    const lockToken = assertToken(operationArguments[0]);
-    const attemptToken = assertToken(operationArguments[1]);
-    const previousState = operationArguments[2];
-    if (previousState !== "missing" && previousState !== "present") invalid();
-    const names = transactionNames(attemptToken);
-    assertLock(lockToken);
-    const attempted = captureFileIdentity(names.attempted);
-    if (!fileMatchesArguments(attempted, 7)) invalid();
-    if (previousState === "present") {
-      const previous = captureFileIdentity(names.previous);
-      if (!fileMatchesArguments(previous, 3)) invalid();
-      const displaced = captureFileIdentity(names.displaced);
-      if (!fileMatchesArguments(displaced, 3)) invalid();
-    } else {
-      for (const name of [names.previous, names.displaced]) {
-        try {
-          lstatSync(name);
-          invalid();
-        } catch (error) {
-          if (!error || error.code !== "ENOENT") throw error;
-        }
-      }
-    }
-    try {
-      lstatSync(names.failed);
-      invalid();
-    } catch (error) {
-      if (!error || error.code !== "ENOENT") throw error;
-    }
-    let moved = false;
-    try {
-      renameSync(MANIFEST_NAME, names.failed);
-      moved = true;
-    } catch (error) {
-      if (!error || error.code !== "ENOENT") throw error;
-    }
-    if (!moved) {
-      syncDirectory();
-      process.stdout.write("poisoned");
-    } else {
-      const failed = captureFileIdentity(names.failed);
-      if (!fileMatchesArguments(failed, 7)) {
-        if (!linkIfAbsent(names.failed, MANIFEST_NAME)) {
-          process.stdout.write("superseded");
-        } else {
-          syncDirectory();
-          process.stdout.write("superseded");
-        }
-      } else {
-        let outcome;
-        if (previousState === "present") {
-          outcome = linkIfAbsent(names.previous, MANIFEST_NAME) ? "restored" : "superseded";
-          if (outcome === "restored") {
-            const restored = captureFileIdentity(MANIFEST_NAME);
-            if (!fileMatchesArguments(restored, 3)) invalid();
-          }
-        } else {
-          try {
-            lstatSync(MANIFEST_NAME);
-            outcome = "superseded";
-          } catch (error) {
-            if (error && error.code === "ENOENT") outcome = "removed";
-            else throw error;
-          }
-        }
-        syncDirectory();
-        assertLock(lockToken);
-        process.stdout.write(outcome);
-      }
-    }
-  } else invalid();
-} catch (error) {
-  process.stderr.write(error instanceof Error ? error.message : "PROJECTION_PATH_INVALID");
-  process.exitCode = 2;
-}
-`;
 
 export interface ProjectionDirectoryIdentity {
   readonly canonicalPath: string;
@@ -1061,37 +247,955 @@ function runStableMutation(
   identity: ProjectionDirectoryIdentity,
   argumentsAfterIdentity: readonly string[] = [],
 ): string {
-  const result = spawnSync(
-    process.execPath,
-    [
-      "-e",
-      MUTATION_SCRIPT,
-      operation,
-      identity.canonicalPath,
-      identity.device,
-      identity.inode,
-      ...argumentsAfterIdentity,
-    ],
-    {
-      cwd: directory,
-      encoding: "utf8",
-      maxBuffer: operation === "read-generation-image"
-        ? Math.ceil((MAX_STABLE_GENERATION_BYTES * 4) / 3) + 4_096
-        : (MAX_STABLE_MANIFEST_BYTES * 2) + 4_096,
-      timeout: MUTATION_TIMEOUT_MS,
-      windowsHide: true,
-    },
-  );
-  if (result.status !== 0 || result.error !== undefined) {
-    if (result.error === undefined && result.stderr === "INTEGRITY_FAILURE") {
-      throw new LifecycleError("INTEGRITY_FAILURE");
+  const expectedPath = identity.canonicalPath;
+  const expectedDevice = identity.device;
+  const expectedInode = identity.inode;
+  const operationArguments = argumentsAfterIdentity;
+  const MAX_MANIFEST_BYTES = MAX_STABLE_MANIFEST_BYTES;
+  const MAX_GENERATION_BYTES = MAX_STABLE_GENERATION_BYTES;
+  const MANIFEST_NAME = "projection-manifest.json";
+  const MANIFEST_TEMP_NAME = ".projection-manifest.json.tmp";
+  const LOCK_NAME = PROJECTION_MANIFEST_PUBLICATION_LOCK_FILENAME;
+  const RECONCILIATION_JOURNAL_NAME = PROJECTION_RECONCILIATION_JOURNAL_FILENAME;
+  const RECONCILIATION_JOURNAL_TEMP_NAME = ".projection-reconciliation-v2.json.tmp";
+  const TOKEN = /^[0-9a-f]{32}$/u;
+  const V2_GENERATION = /^projections-[23]-([1-9][0-9]{0,9})\.sqlite$/u;
+  const V2_RETIRED = /^\.projections-[23]-retired-([0-9a-f]{32})\.sqlite$/u;
+
+  const integrity = (): never => {
+    throw new Error("INTEGRITY_FAILURE");
+  };
+  const fileInDir = (name: string): string => {
+    if (
+      typeof name !== "string"
+      || name.length === 0
+      || basename(name) !== name
+      || name === "."
+      || name === ".."
+      || name.includes("/")
+      || name.includes("\\")
+    ) {
+      return invalid();
     }
-    if (result.error === undefined && result.stderr === "PROJECTION_PUBLICATION_RECOVERY_REQUIRED") {
+    return join(directory, name);
+  };
+  let verifiedRealpath = false;
+  const assertDirectory = () => {
+    if (
+      typeof directory !== "string"
+      || !isAbsolute(directory)
+      || normalize(directory) !== directory
+      || resolve(directory) !== directory
+    ) {
+      return invalid();
+    }
+    const dirStat = lstatSync(directory, { bigint: true });
+    if (!dirStat.isDirectory() || dirStat.isSymbolicLink()) return invalid();
+    if (
+      dirStat.dev.toString() !== expectedDevice
+      || dirStat.ino.toString() !== expectedInode
+    ) {
+      return invalid();
+    }
+    if (!verifiedRealpath) {
+      if (normalizedPath(realpathSync.native(directory)) !== normalizedPath(expectedPath)) {
+        return invalid();
+      }
+      verifiedRealpath = true;
+    }
+    return dirStat;
+  };
+  const captureManifestInDir = () => {
+    const manifestPath = fileInDir(MANIFEST_NAME);
+    let before;
+    try {
+      before = lstatSync(manifestPath, { bigint: true });
+    } catch (error) {
+      if (error && (error as { code?: string }).code === "ENOENT") {
+        const dirStat = assertDirectory();
+        return {
+          state: "missing",
+          directoryDevice: dirStat.dev.toString(),
+          directoryInode: dirStat.ino.toString(),
+        };
+      }
+      throw error;
+    }
+    if (
+      !before.isFile()
+      || before.isSymbolicLink()
+      || before.size < 0n
+      || before.size > BigInt(MAX_MANIFEST_BYTES)
+    ) {
+      return invalid();
+    }
+    let handle: number | undefined;
+    try {
+      handle = openSync(manifestPath, "r");
+      const opened = fstatSync(handle, { bigint: true });
+      if (
+        !opened.isFile()
+        || opened.dev !== before.dev
+        || opened.ino !== before.ino
+        || opened.size !== before.size
+      ) {
+        return invalid();
+      }
+      const bytes = readFileSync(handle);
+      const openedAfter = fstatSync(handle, { bigint: true });
+      const after = lstatSync(manifestPath, { bigint: true });
+      if (
+        bytes.byteLength !== Number(before.size)
+        || openedAfter.dev !== opened.dev
+        || openedAfter.ino !== opened.ino
+        || openedAfter.size !== opened.size
+        || after.dev !== before.dev
+        || after.ino !== before.ino
+        || after.size !== before.size
+        || !after.isFile()
+        || after.isSymbolicLink()
+      ) {
+        return invalid();
+      }
+      const dirStat = assertDirectory();
+      return {
+        state: "present",
+        directoryDevice: dirStat.dev.toString(),
+        directoryInode: dirStat.ino.toString(),
+        device: opened.dev.toString(),
+        inode: opened.ino.toString(),
+        size: opened.size.toString(),
+        sha256: createHash("sha256").update(bytes).digest("hex"),
+        bytesBase64: bytes.toString("base64"),
+      };
+    } finally {
+      if (handle !== undefined) closeSync(handle);
+    }
+  };
+  const syncDirectory = () => {
+    let handle: number | undefined;
+    try {
+      handle = openSync(directory, "r");
+      fsyncSync(handle);
+    } catch (error) {
+      const code = error && (error as { code?: string }).code;
+      if (
+        code !== "EINVAL"
+        && code !== "EISDIR"
+        && code !== "ENOTSUP"
+        && code !== "EOPNOTSUPP"
+        && !(process.platform === "win32" && (code === "EACCES" || code === "EBADF" || code === "EPERM"))
+      ) {
+        throw error;
+      }
+    } finally {
+      if (handle !== undefined) closeSync(handle);
+    }
+  };
+  const sidecarPresent = (name: string): boolean => {
+    for (const suffix of ["-wal", "-shm"]) {
+      try {
+        lstatSync(fileInDir(name + suffix));
+        return true;
+      } catch (error) {
+        if (error && (error as { code?: string }).code === "ENOENT") continue;
+        integrity();
+      }
+    }
+    return false;
+  };
+  const captureFileIdentity = (name: string, maximumBytes = MAX_MANIFEST_BYTES) => {
+    const fullPath = fileInDir(name);
+    const before = lstatSync(fullPath, { bigint: true });
+    if (
+      !before.isFile()
+      || before.isSymbolicLink()
+      || before.size < 0n
+      || before.size > BigInt(maximumBytes)
+    ) {
+      return invalid();
+    }
+    let handle: number | undefined;
+    try {
+      handle = openSync(fullPath, "r");
+      const opened = fstatSync(handle, { bigint: true });
+      if (
+        !opened.isFile()
+        || opened.dev !== before.dev
+        || opened.ino !== before.ino
+        || opened.size !== before.size
+        || opened.ctimeNs !== before.ctimeNs
+      ) {
+        return invalid();
+      }
+      const bytes = readFileSync(handle);
+      const openedAfter = fstatSync(handle, { bigint: true });
+      const after = lstatSync(fullPath, { bigint: true });
+      if (
+        bytes.byteLength !== Number(before.size)
+        || openedAfter.dev !== opened.dev
+        || openedAfter.ino !== opened.ino
+        || openedAfter.size !== opened.size
+        || openedAfter.ctimeNs !== opened.ctimeNs
+        || after.dev !== before.dev
+        || after.ino !== before.ino
+        || after.size !== before.size
+        || after.ctimeNs !== before.ctimeNs
+        || !after.isFile()
+        || after.isSymbolicLink()
+      ) {
+        return invalid();
+      }
+      assertDirectory();
+      return {
+        device: opened.dev.toString(),
+        inode: opened.ino.toString(),
+        size: opened.size.toString(),
+        ctimeNs: opened.ctimeNs.toString(),
+        sha256: createHash("sha256").update(bytes).digest("hex"),
+        bytes,
+      };
+    } finally {
+      if (handle !== undefined) closeSync(handle);
+    }
+  };
+  const assertToken = (token: string | undefined): string => {
+    if (typeof token !== "string" || !TOKEN.test(token)) return invalid();
+    return token;
+  };
+  const assertLock = (token: string) => {
+    const lock = captureFileIdentity(LOCK_NAME);
+    if (lock.bytes.toString("utf8") !== token) return invalid();
+  };
+  const linkIfAbsent = (source: string, target: string): boolean => {
+    try {
+      linkSync(fileInDir(source), fileInDir(target));
+      return true;
+    } catch (error) {
+      if (error && (error as { code?: string }).code === "EEXIST") return false;
+      throw error;
+    }
+  };
+  const removeRegularFile = (name: string) => {
+    const fullPath = fileInDir(name);
+    const entry = lstatSync(fullPath);
+    if (!entry.isFile() || entry.isSymbolicLink()) return invalid();
+    unlinkSync(fullPath);
+  };
+  const fileMatchesArguments = (
+    file: { device: string; inode: string; size: string; sha256: string },
+    offset: number,
+  ): boolean => (
+    file.device === operationArguments[offset]
+    && file.inode === operationArguments[offset + 1]
+    && file.size === operationArguments[offset + 2]
+    && file.sha256 === operationArguments[offset + 3]
+  );
+  const sameGenerationIdentity = (
+    file: { device: string; inode: string; size: string; ctimeNs: string; sha256: string },
+    expected: { device?: string; inode?: string; size?: string; ctimeNs?: string; sha256?: string },
+  ): boolean => (
+    file.device === expected.device
+    && file.inode === expected.inode
+    && file.size === expected.size
+    && file.ctimeNs === expected.ctimeNs
+    && file.sha256 === expected.sha256
+  );
+  const sameGenerationRenameContinuity = (
+    file: { device: string; inode: string; size: string; sha256: string },
+    expected: { device?: string; inode?: string; size?: string; sha256?: string },
+  ): boolean => (
+    file.device === expected.device
+    && file.inode === expected.inode
+    && file.size === expected.size
+    && file.sha256 === expected.sha256
+  );
+  const exactKeys = (value: unknown, keys: readonly string[]): boolean => (
+    typeof value === "object"
+    && value !== null
+    && !Array.isArray(value)
+    && Reflect.ownKeys(value).length === keys.length
+    && keys.every((key) => Object.prototype.hasOwnProperty.call(value, key))
+  );
+  const validGeneration = (value: unknown): value is number => (
+    Number.isSafeInteger(value) && (value as number) >= 0 && (value as number) <= 2147483647
+  );
+  const validRetirementGen = (value: unknown): value is number => (
+    Number.isSafeInteger(value) && (value as number) >= 1 && (value as number) <= 2147483647
+  );
+  const exactRetirementImage = (rawValue: unknown): V2RetirementImage => {
+    const value = rawValue as Record<string, unknown>;
+    if (
+      !exactKeys(rawValue, ["device", "inode", "size", "ctimeNs", "sha256"])
+      || typeof value.device !== "string" || !/^(?:0|[1-9][0-9]*)$/u.test(value.device)
+      || typeof value.inode !== "string" || !/^(?:0|[1-9][0-9]*)$/u.test(value.inode)
+      || typeof value.size !== "string" || !/^(?:0|[1-9][0-9]*)$/u.test(value.size)
+      || BigInt(value.size) > BigInt(MAX_GENERATION_BYTES)
+      || typeof value.ctimeNs !== "string" || !/^(?:0|[1-9][0-9]*)$/u.test(value.ctimeNs)
+      || typeof value.sha256 !== "string" || !/^[0-9a-f]{64}$/u.test(value.sha256)
+    ) {
+      return invalid();
+    }
+    return {
+      device: value.device,
+      inode: value.inode,
+      size: value.size,
+      ctimeNs: value.ctimeNs,
+      sha256: value.sha256,
+    };
+  };
+  const exactRetirement = (value: unknown): V2RetirementIntent | V2RetiredGeneration => {
+    const rec = value as Record<string, unknown> | null | undefined;
+    if (!rec || !validRetirementGen(rec.generation)) return invalid();
+    if (rec.state === "intent") {
+      if (
+        !exactKeys(rec, ["state", "generation", "finalFilename", "retiredFilename", "image"])
+        || typeof rec.finalFilename !== "string"
+        || !V2_GENERATION.test(rec.finalFilename)
+        || Number(V2_GENERATION.exec(rec.finalFilename)![1]) !== rec.generation
+        || typeof rec.retiredFilename !== "string"
+        || !V2_RETIRED.test(rec.retiredFilename)
+        || rec.finalFilename.split("-")[1] !== rec.retiredFilename.split("-")[1]
+      ) {
+        return invalid();
+      }
+      return {
+        state: "intent",
+        generation: rec.generation,
+        finalFilename: rec.finalFilename,
+        retiredFilename: rec.retiredFilename,
+        image: exactRetirementImage(rec.image),
+      };
+    }
+    if (
+      rec.state !== "retired"
+      || !exactKeys(rec, ["state", "generation", "retiredFilename", "image"])
+      || typeof rec.retiredFilename !== "string"
+      || !V2_RETIRED.test(rec.retiredFilename)
+    ) {
+      return invalid();
+    }
+    return {
+      state: "retired",
+      generation: rec.generation,
+      retiredFilename: rec.retiredFilename,
+      image: exactRetirementImage(rec.image),
+    };
+  };
+  const canonicalJournalBytes = (journal: unknown): Buffer =>
+    Buffer.from(JSON.stringify(journal) + "\n", "utf8");
+  const exactJournal = (
+    bytes: Buffer,
+  ): { highestReservedGeneration: number; retirements: Array<V2RetirementIntent | V2RetiredGeneration> } => {
+    let value: Record<string, unknown>;
+    try {
+      value = JSON.parse(bytes.toString("utf8")) as Record<string, unknown>;
+    } catch {
+      return invalid();
+    }
+    if (!validGeneration(value && value.highestReservedGeneration)) return invalid();
+    if (exactKeys(value, ["highestReservedGeneration"])) {
+      const legacy = { highestReservedGeneration: value.highestReservedGeneration };
+      if (!canonicalJournalBytes(legacy).equals(bytes)) throw new Error("JOURNAL_FORMAT_MISMATCH");
+      return { highestReservedGeneration: legacy.highestReservedGeneration as number, retirements: [] };
+    }
+    if (exactKeys(value, ["highestReservedGeneration", "schemaVersion"]) && value.schemaVersion === 1) {
+      const legacy = { highestReservedGeneration: value.highestReservedGeneration, schemaVersion: 1 };
+      if (!canonicalJournalBytes(legacy).equals(bytes)) throw new Error("JOURNAL_FORMAT_MISMATCH");
+      return { highestReservedGeneration: legacy.highestReservedGeneration as number, retirements: [] };
+    }
+    if (
+      !exactKeys(value, ["highestReservedGeneration", "retirements"])
+      || !Array.isArray(value.retirements)
+      || value.retirements.length > 100000
+    ) {
+      return invalid();
+    }
+    const generations = new Set<number>();
+    const retiredFilenames = new Set<string>();
+    const retirements = value.retirements.map((record) => {
+      const retirement = exactRetirement(record);
+      if (
+        retirement.generation > (value.highestReservedGeneration as number)
+        || generations.has(retirement.generation)
+        || retiredFilenames.has(retirement.retiredFilename)
+      ) {
+        return invalid();
+      }
+      generations.add(retirement.generation);
+      retiredFilenames.add(retirement.retiredFilename);
+      return retirement;
+    });
+    const canonical = {
+      highestReservedGeneration: value.highestReservedGeneration as number,
+      retirements,
+    };
+    if (!canonicalJournalBytes(canonical).equals(bytes)) throw new Error("JOURNAL_FORMAT_MISMATCH");
+    return canonical;
+  };
+  const readJournal = () => {
+    try {
+      return exactJournal(captureFileIdentity(RECONCILIATION_JOURNAL_NAME).bytes);
+    } catch (error) {
+      if (error && (error as { code?: string }).code === "ENOENT") {
+        return { highestReservedGeneration: 0, retirements: [] as Array<V2RetirementIntent | V2RetiredGeneration> };
+      }
       throw new Error("PROJECTION_PUBLICATION_RECOVERY_REQUIRED");
     }
-    return invalid(result.error ?? result.stderr);
+  };
+  const writeDurable = (name: string, bytes: Buffer) => {
+    const fullPath = fileInDir(name);
+    let handle: number | undefined;
+    try {
+      handle = openSync(fullPath, "wx", 0o600);
+      let offset = 0;
+      while (offset < bytes.byteLength) {
+        const written = writeSync(handle, bytes, offset, bytes.byteLength - offset, offset);
+        if (!Number.isSafeInteger(written) || written <= 0) return invalid();
+        offset += written;
+      }
+      fsyncSync(handle);
+    } finally {
+      if (handle !== undefined) closeSync(handle);
+    }
+  };
+  const writeJournal = (journal: {
+    highestReservedGeneration: number;
+    retirements: ReadonlyArray<V2RetirementIntent | V2RetiredGeneration>;
+  }) => {
+    try {
+      lstatSync(fileInDir(RECONCILIATION_JOURNAL_TEMP_NAME));
+      return invalid();
+    } catch (error) {
+      if (!error || (error as { code?: string }).code !== "ENOENT") throw error;
+    }
+    const bytes = canonicalJournalBytes(journal);
+    writeDurable(RECONCILIATION_JOURNAL_TEMP_NAME, bytes);
+    renameSync(fileInDir(RECONCILIATION_JOURNAL_TEMP_NAME), fileInDir(RECONCILIATION_JOURNAL_NAME));
+    syncDirectory();
+    const observed = readJournal();
+    if (!canonicalJournalBytes(observed).equals(bytes)) throw new Error("JOURNAL_VERIFY_MISMATCH");
+  };
+  const transactionNames = (attemptToken: string) => ({
+    previous: ".projection-manifest.previous-" + attemptToken,
+    attempted: ".projection-manifest.attempted-" + attemptToken,
+    displaced: ".projection-manifest.displaced-" + attemptToken,
+    failed: ".projection-manifest.failed-" + attemptToken,
+  });
+
+  try {
+    assertDirectory();
+    if (operation === "cleanup") {
+      const generationTemp = /^\.projections-[123]-[1-9][0-9]{0,9}(?:-[0-9a-f]{32})?\.sqlite\.tmp(?:-(?:wal|shm))?$/u;
+      for (const name of readdirSync(directory)) {
+        if (name !== ".projection-manifest.json.tmp" && !generationTemp.test(name)) continue;
+        const fullPath = fileInDir(name);
+        const entry = lstatSync(fullPath);
+        if (!entry.isFile() || entry.isSymbolicLink()) return invalid();
+        unlinkSync(fullPath);
+      }
+      return "cleaned";
+    } else if (operation === "capture-manifest") {
+      return JSON.stringify(captureManifestInDir());
+    } else if (operation === "assert-generation") {
+      const [filename] = operationArguments;
+      if (
+        typeof filename !== "string"
+        || basename(filename) !== filename
+        || !/^projections-[123]-[1-9][0-9]{0,9}\.sqlite$/u.test(filename)
+      ) {
+        return invalid();
+      }
+      if (sidecarPresent(filename)) integrity();
+      try {
+        const entry = lstatSync(fileInDir(filename));
+        if (!entry.isFile() || entry.isSymbolicLink()) return invalid();
+        return "present";
+      } catch (error) {
+        if (error && (error as { code?: string }).code === "ENOENT") return "missing";
+        throw error;
+      }
+    } else if (operation === "reserve-reconciliation-journal") {
+      const [rawLockToken, requested] = operationArguments;
+      const lockToken = assertToken(rawLockToken);
+      assertLock(lockToken);
+      if (typeof requested !== "string" || !/^(?:0|[1-9][0-9]*)$/u.test(requested)) return invalid();
+      const requestedGeneration = Number(requested);
+      if (!Number.isSafeInteger(requestedGeneration) || requestedGeneration > 2147483647) return invalid();
+      const journal = readJournal();
+      const next = Math.max(journal.highestReservedGeneration, requestedGeneration);
+      writeJournal({ highestReservedGeneration: next, retirements: journal.retirements });
+      assertLock(lockToken);
+      return String(next);
+    } else if (operation === "begin-reconciliation-retirement") {
+      const [rawLockToken, encodedIntent] = operationArguments;
+      const lockToken = assertToken(rawLockToken);
+      assertLock(lockToken);
+      if (typeof encodedIntent !== "string") return invalid();
+      let input: unknown;
+      try {
+        input = JSON.parse(encodedIntent);
+      } catch {
+        return invalid();
+      }
+      const intent = exactRetirement(input);
+      if (intent.state !== "intent" || JSON.stringify(intent) !== encodedIntent) return invalid();
+      const journal = readJournal();
+      if (
+        intent.generation > journal.highestReservedGeneration
+        || journal.retirements.some(
+          (record) => record.generation === intent.generation || record.retiredFilename === intent.retiredFilename,
+        )
+      ) {
+        return invalid();
+      }
+      writeJournal({
+        highestReservedGeneration: journal.highestReservedGeneration,
+        retirements: [...journal.retirements, intent],
+      });
+      assertLock(lockToken);
+      return JSON.stringify(intent);
+    } else if (operation === "complete-reconciliation-retirement") {
+      const [rawLockToken, encodedIntent, encodedImage] = operationArguments;
+      const lockToken = assertToken(rawLockToken);
+      assertLock(lockToken);
+      if (typeof encodedIntent !== "string" || typeof encodedImage !== "string") return invalid();
+      let intentInput: unknown;
+      let imageInput: unknown;
+      try {
+        intentInput = JSON.parse(encodedIntent);
+        imageInput = JSON.parse(encodedImage);
+      } catch {
+        return invalid();
+      }
+      const intent = exactRetirement(intentInput);
+      const image = exactRetirementImage(imageInput);
+      if (
+        intent.state !== "intent"
+        || JSON.stringify(intent) !== encodedIntent
+        || JSON.stringify(image) !== encodedImage
+        || !sameGenerationRenameContinuity(image, intent.image)
+      ) {
+        return invalid();
+      }
+      const journal = readJournal();
+      const index = journal.retirements.findIndex((record) => record.generation === intent.generation);
+      if (index < 0 || JSON.stringify(journal.retirements[index]) !== JSON.stringify(intent)) return invalid();
+      const retired: V2RetiredGeneration = {
+        state: "retired",
+        generation: intent.generation,
+        retiredFilename: intent.retiredFilename,
+        image,
+      };
+      const retirements = [...journal.retirements];
+      retirements[index] = retired;
+      writeJournal({ highestReservedGeneration: journal.highestReservedGeneration, retirements });
+      assertLock(lockToken);
+      return JSON.stringify(retired);
+    } else if (operation === "read-reconciliation-retirements") {
+      const [rawLockToken] = operationArguments;
+      const lockToken = assertToken(rawLockToken);
+      assertLock(lockToken);
+      const journal = readJournal();
+      assertLock(lockToken);
+      return JSON.stringify(journal.retirements);
+    } else if (operation === "read-generation-image") {
+      const [rawLockToken, filename] = operationArguments;
+      const lockToken = assertToken(rawLockToken);
+      assertLock(lockToken);
+      if (typeof filename !== "string" || !V2_GENERATION.test(filename)) return invalid();
+      if (sidecarPresent(filename)) integrity();
+      const image = captureFileIdentity(
+        filename,
+        filename.startsWith("projections-3-") ? 64 * 1024 * 1024 : MAX_GENERATION_BYTES,
+      );
+      assertLock(lockToken);
+      return JSON.stringify({
+        filename,
+        device: image.device,
+        inode: image.inode,
+        size: image.size,
+        ctimeNs: image.ctimeNs,
+        sha256: image.sha256,
+        bytesBase64: image.bytes.toString("base64"),
+      });
+    } else if (operation === "retire-generation") {
+      const [rawLockToken, filename, retiredFilename, device, inode, size, ctimeNs, sha256] = operationArguments;
+      const lockToken = assertToken(rawLockToken);
+      assertLock(lockToken);
+      if (
+        typeof filename !== "string"
+        || !V2_GENERATION.test(filename)
+        || typeof retiredFilename !== "string"
+        || !V2_RETIRED.test(retiredFilename)
+        || filename.split("-")[1] !== retiredFilename.split("-")[1]
+      ) {
+        return invalid();
+      }
+      try {
+        lstatSync(fileInDir(retiredFilename));
+        return invalid();
+      } catch (error) {
+        if (!error || (error as { code?: string }).code !== "ENOENT") throw error;
+      }
+      if (sidecarPresent(filename) || sidecarPresent(retiredFilename)) integrity();
+      const expected = { device, inode, size, ctimeNs, sha256 };
+      const current = captureFileIdentity(filename, MAX_GENERATION_BYTES);
+      if (!sameGenerationIdentity(current, expected)) return invalid();
+      renameSync(fileInDir(filename), fileInDir(retiredFilename));
+      syncDirectory();
+      const retired = captureFileIdentity(retiredFilename, MAX_GENERATION_BYTES);
+      if (!sameGenerationRenameContinuity(retired, expected)) return invalid();
+      assertLock(lockToken);
+      return JSON.stringify({
+        filename: retiredFilename,
+        device: retired.device,
+        inode: retired.inode,
+        size: retired.size,
+        ctimeNs: retired.ctimeNs,
+        sha256: retired.sha256,
+      });
+    } else if (operation === "capture-retired-generation") {
+      const [rawLockToken, retiredFilename] = operationArguments;
+      const lockToken = assertToken(rawLockToken);
+      assertLock(lockToken);
+      if (typeof retiredFilename !== "string" || !V2_RETIRED.test(retiredFilename)) return invalid();
+      if (sidecarPresent(retiredFilename)) integrity();
+      let retired: ReturnType<typeof captureFileIdentity> | undefined;
+      try {
+        retired = captureFileIdentity(retiredFilename, MAX_GENERATION_BYTES);
+      } catch (error) {
+        if (!error || (error as { code?: string }).code !== "ENOENT") throw error;
+        assertDirectory();
+      }
+      assertLock(lockToken);
+      return retired === undefined
+        ? "null"
+        : JSON.stringify({
+            filename: retiredFilename,
+            device: retired.device,
+            inode: retired.inode,
+            size: retired.size,
+            ctimeNs: retired.ctimeNs,
+            sha256: retired.sha256,
+          });
+    } else if (operation === "install-generation") {
+      const [rawLockToken, temporaryFilename, finalFilename, device, inode, size, sha256] = operationArguments;
+      const lockToken = assertToken(rawLockToken);
+      assertLock(lockToken);
+      if (
+        typeof temporaryFilename !== "string"
+        || !/^\.projections-[23]-[1-9][0-9]{0,9}-[0-9a-f]{32}\.sqlite\.tmp$/u.test(temporaryFilename)
+        || typeof finalFilename !== "string"
+        || !/^projections-[23]-[1-9][0-9]{0,9}\.sqlite$/u.test(finalFilename)
+        || !temporaryFilename.startsWith("." + finalFilename.slice(0, -7) + "-")
+      ) {
+        return invalid();
+      }
+      const temporary = captureFileIdentity(temporaryFilename, MAX_GENERATION_BYTES);
+      if (
+        temporary.device !== device
+        || temporary.inode !== inode
+        || temporary.size !== size
+        || temporary.sha256 !== sha256
+        || sidecarPresent(temporaryFilename)
+        || sidecarPresent(finalFilename)
+      ) {
+        return invalid();
+      }
+      if (!linkIfAbsent(temporaryFilename, finalFilename)) {
+        return "superseded";
+      }
+      const installed = captureFileIdentity(finalFilename, MAX_GENERATION_BYTES);
+      if (
+        installed.device !== temporary.device
+        || installed.inode !== temporary.inode
+        || installed.size !== temporary.size
+        || installed.sha256 !== temporary.sha256
+      ) {
+        integrity();
+      }
+      removeRegularFile(temporaryFilename);
+      syncDirectory();
+      assertLock(lockToken);
+      return "installed";
+    } else if (operation === "acquire-manifest-lock") {
+      const lockToken = assertToken(operationArguments[0]);
+      const lockPath = fileInDir(LOCK_NAME);
+      let handle: number | undefined;
+      try {
+        handle = openSync(lockPath, "wx", 0o600);
+      } catch (error) {
+        if (error && (error as { code?: string }).code === "EEXIST") {
+          return "busy";
+        }
+        throw error;
+      }
+      try {
+        const bytes = Buffer.from(lockToken, "utf8");
+        let offset = 0;
+        while (offset < bytes.byteLength) {
+          const written = writeSync(handle, bytes, offset, bytes.byteLength - offset, offset);
+          if (!Number.isSafeInteger(written) || written <= 0) return invalid();
+          offset += written;
+        }
+        fsyncSync(handle);
+      } finally {
+        closeSync(handle);
+      }
+      syncDirectory();
+      assertLock(lockToken);
+      return "acquired";
+    } else if (operation === "release-manifest-lock") {
+      const lockToken = assertToken(operationArguments[0]);
+      assertLock(lockToken);
+      const retained = readdirSync(directory).some(
+        (name) =>
+          name.startsWith(".projection-manifest.previous-")
+          || name.startsWith(".projection-manifest.attempted-")
+          || name.startsWith(".projection-manifest.displaced-")
+          || name.startsWith(".projection-manifest.failed-"),
+      );
+      if (retained) return "poisoned";
+      removeRegularFile(LOCK_NAME);
+      syncDirectory();
+      assertDirectory();
+      return "released";
+    } else if (operation === "prepare-manifest") {
+      const lockToken = assertToken(operationArguments[0]);
+      const attemptToken = assertToken(operationArguments[1]);
+      const expectedState = operationArguments[2];
+      if (expectedState !== "missing" && expectedState !== "present") return invalid();
+      const names = transactionNames(attemptToken);
+      assertLock(lockToken);
+      const candidate = captureFileIdentity(MANIFEST_TEMP_NAME);
+      for (const name of Object.values(names)) {
+        try {
+          lstatSync(fileInDir(name));
+          return invalid();
+        } catch (error) {
+          if (!error || (error as { code?: string }).code !== "ENOENT") throw error;
+        }
+      }
+      if (!linkIfAbsent(MANIFEST_TEMP_NAME, names.attempted)) return invalid();
+      const attempted = captureFileIdentity(names.attempted);
+      if (
+        attempted.device !== candidate.device
+        || attempted.inode !== candidate.inode
+        || attempted.size !== candidate.size
+        || attempted.sha256 !== candidate.sha256
+      ) {
+        return invalid();
+      }
+      let outcome = "prepared";
+      if (expectedState === "present") {
+        try {
+          linkSync(fileInDir(MANIFEST_NAME), fileInDir(names.previous));
+        } catch (error) {
+          if (error && (error as { code?: string }).code === "ENOENT") outcome = "poisoned";
+          else throw error;
+        }
+        if (outcome === "prepared") {
+          const previous = captureFileIdentity(names.previous);
+          if (!fileMatchesArguments(previous, 3)) outcome = "superseded";
+        }
+      } else {
+        try {
+          lstatSync(fileInDir(MANIFEST_NAME));
+          outcome = "superseded";
+        } catch (error) {
+          if (!error || (error as { code?: string }).code !== "ENOENT") throw error;
+        }
+      }
+      syncDirectory();
+      assertLock(lockToken);
+      return outcome;
+    } else if (operation === "install-manifest") {
+      const lockToken = assertToken(operationArguments[0]);
+      const attemptToken = assertToken(operationArguments[1]);
+      const expectedState = operationArguments[2];
+      if (expectedState !== "missing" && expectedState !== "present") return invalid();
+      const names = transactionNames(attemptToken);
+      assertLock(lockToken);
+      captureFileIdentity(names.attempted);
+      if (expectedState === "present") {
+        const previous = captureFileIdentity(names.previous);
+        if (!fileMatchesArguments(previous, 3)) return invalid();
+      } else {
+        try {
+          lstatSync(fileInDir(names.previous));
+          return invalid();
+        } catch (error) {
+          if (!error || (error as { code?: string }).code !== "ENOENT") throw error;
+        }
+      }
+      for (const name of [names.displaced, names.failed]) {
+        try {
+          lstatSync(fileInDir(name));
+          return invalid();
+        } catch (error) {
+          if (!error || (error as { code?: string }).code !== "ENOENT") throw error;
+        }
+      }
+      if (expectedState === "missing") {
+        if (!linkIfAbsent(names.attempted, MANIFEST_NAME)) {
+          return "superseded";
+        }
+        removeRegularFile(MANIFEST_TEMP_NAME);
+        syncDirectory();
+        assertLock(lockToken);
+        return "installed";
+      }
+      let moved = false;
+      try {
+        renameSync(fileInDir(MANIFEST_NAME), fileInDir(names.displaced));
+        moved = true;
+      } catch (error) {
+        if (!error || (error as { code?: string }).code !== "ENOENT") throw error;
+      }
+      if (!moved) return "poisoned";
+      const displaced = captureFileIdentity(names.displaced);
+      if (!fileMatchesArguments(displaced, 3)) {
+        if (!linkIfAbsent(names.displaced, MANIFEST_NAME)) {
+          return "poisoned";
+        }
+        syncDirectory();
+        return "superseded";
+      }
+      if (!linkIfAbsent(names.attempted, MANIFEST_NAME)) {
+        syncDirectory();
+        return "superseded";
+      }
+      removeRegularFile(MANIFEST_TEMP_NAME);
+      syncDirectory();
+      assertLock(lockToken);
+      return "installed";
+    } else if (operation === "commit-manifest") {
+      const lockToken = assertToken(operationArguments[0]);
+      const attemptToken = assertToken(operationArguments[1]);
+      const previousState = operationArguments[2];
+      if (previousState !== "missing" && previousState !== "present") return invalid();
+      const names = transactionNames(attemptToken);
+      assertLock(lockToken);
+      const attemptedSize = operationArguments[7];
+      const attemptedSha256 = operationArguments[8];
+      if (
+        typeof attemptedSize !== "string"
+        || !/^(?:0|[1-9][0-9]*)$/u.test(attemptedSize)
+        || BigInt(attemptedSize) > BigInt(MAX_MANIFEST_BYTES)
+        || typeof attemptedSha256 !== "string"
+        || !/^[0-9a-f]{64}$/u.test(attemptedSha256)
+      ) {
+        return invalid();
+      }
+      const attempted = captureFileIdentity(names.attempted);
+      if (attempted.size !== attemptedSize || attempted.sha256 !== attemptedSha256) return invalid();
+      if (previousState === "present") {
+        captureFileIdentity(names.previous);
+      } else {
+        try {
+          lstatSync(fileInDir(names.previous));
+          return invalid();
+        } catch (error) {
+          if (!error || (error as { code?: string }).code !== "ENOENT") throw error;
+        }
+      }
+      const retained: string[] = [];
+      for (const name of [names.displaced, names.failed]) {
+        try {
+          captureFileIdentity(name);
+          retained.push(name);
+        } catch (error) {
+          if (!error || (error as { code?: string }).code !== "ENOENT") throw error;
+        }
+      }
+      removeRegularFile(names.attempted);
+      if (previousState === "present") removeRegularFile(names.previous);
+      for (const name of retained) removeRegularFile(name);
+      syncDirectory();
+      assertLock(lockToken);
+      return "committed";
+    } else if (operation === "rollback-manifest") {
+      const lockToken = assertToken(operationArguments[0]);
+      const attemptToken = assertToken(operationArguments[1]);
+      const previousState = operationArguments[2];
+      if (previousState !== "missing" && previousState !== "present") return invalid();
+      const names = transactionNames(attemptToken);
+      assertLock(lockToken);
+      const attempted = captureFileIdentity(names.attempted);
+      if (!fileMatchesArguments(attempted, 7)) return invalid();
+      if (previousState === "present") {
+        const previous = captureFileIdentity(names.previous);
+        if (!fileMatchesArguments(previous, 3)) return invalid();
+        const displaced = captureFileIdentity(names.displaced);
+        if (!fileMatchesArguments(displaced, 3)) return invalid();
+      } else {
+        for (const name of [names.previous, names.displaced]) {
+          try {
+            lstatSync(fileInDir(name));
+            return invalid();
+          } catch (error) {
+            if (!error || (error as { code?: string }).code !== "ENOENT") throw error;
+          }
+        }
+      }
+      try {
+        lstatSync(fileInDir(names.failed));
+        return invalid();
+      } catch (error) {
+        if (!error || (error as { code?: string }).code !== "ENOENT") throw error;
+      }
+      let moved = false;
+      try {
+        renameSync(fileInDir(MANIFEST_NAME), fileInDir(names.failed));
+        moved = true;
+      } catch (error) {
+        if (!error || (error as { code?: string }).code !== "ENOENT") throw error;
+      }
+      if (!moved) {
+        syncDirectory();
+        return "poisoned";
+      }
+      const failed = captureFileIdentity(names.failed);
+      if (!fileMatchesArguments(failed, 7)) {
+        if (!linkIfAbsent(names.failed, MANIFEST_NAME)) {
+          return "superseded";
+        }
+        syncDirectory();
+        return "superseded";
+      }
+      let outcome: string;
+      if (previousState === "present") {
+        outcome = linkIfAbsent(names.previous, MANIFEST_NAME) ? "restored" : "superseded";
+        if (outcome === "restored") {
+          const restored = captureFileIdentity(MANIFEST_NAME);
+          if (!fileMatchesArguments(restored, 3)) return invalid();
+        }
+      } else {
+        try {
+          lstatSync(fileInDir(MANIFEST_NAME));
+          outcome = "superseded";
+        } catch (error) {
+          if (error && (error as { code?: string }).code === "ENOENT") outcome = "removed";
+          else throw error;
+        }
+      }
+      syncDirectory();
+      assertLock(lockToken);
+      return outcome;
+    }
+    return invalid();
+  } catch (error) {
+    if (error instanceof LifecycleError) throw error;
+    const message = error instanceof Error ? error.message : "PROJECTION_PATH_INVALID";
+    if (message === "INTEGRITY_FAILURE") {
+      throw new LifecycleError("INTEGRITY_FAILURE");
+    }
+    if (message === "PROJECTION_PUBLICATION_RECOVERY_REQUIRED") {
+      throw new Error("PROJECTION_PUBLICATION_RECOVERY_REQUIRED");
+    }
+    return invalid(error);
   }
-  return result.stdout;
 }
 
 function snapshotIdentityArguments(
