@@ -4,6 +4,7 @@ import { AppSidebar } from '@/components/shell/app-sidebar';
 import { Topbar } from '@/components/shell/topbar';
 import { MobileNav } from '@/components/shell/mobile-nav';
 import { CommandPalette } from '@/components/shell/command-palette';
+import { NoteDetailSheet } from '@/features/note/note-detail-sheet';
 import { Toaster } from '@/components/ui/sonner';
 import { validateAppSearch } from '@/lib/search';
 import { isImeComposing, isEditableTarget } from '@/lib/keyboard';
@@ -63,6 +64,7 @@ function RootLayout() {
         open={commandPaletteOpen}
         onOpenChange={setCommandPaletteOpen}
       />
+      <NoteDetailSheet />
       <Toaster position="bottom-right" duration={4500} />
     </div>
   );
