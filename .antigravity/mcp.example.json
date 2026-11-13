@@ -3,13 +3,15 @@
     "project-memory": {
       "command": "node",
       "args": [
-        "C:/Users/Server/Desktop/Awakened-AI-System/dist/index.js"
+        "<ENGINE_ROOT>/dist/v2.js"
       ],
       "env": {
-        "MEMORY_PROJECT_ROOT": "dynamic"
-      },
-      "disabledTools": [],
-      "disabled": false
+        "MEMORY_PROJECT_ROOT": "<PROJECT_ROOT>",
+        "MEMORY_V2_VAULT_PATH": "<PROJECT_ROOT>/memory-v2",
+        "MEMORY_V1_ARCHIVE_PATH": "<PROJECT_ROOT>/memory",
+        "MEMORY_V2_RELEASE_ID": "<RELEASE_UUID>",
+        "MEMORY_V2_AUTO_SYNC_BUILD": "0"
+      }
     }
   }
 }

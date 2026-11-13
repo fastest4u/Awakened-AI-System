@@ -1,12 +1,24 @@
-import { existsSync, readdirSync, statSync } from "node:fs";
+import { randomBytes, timingSafeEqual } from "node:crypto";
+import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { dirname, isAbsolute, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { buildWikilinkResolver } from "../utils/links.js";
 import {
   createV2Foundation,
   ensureProjectV2StoreReady,
   type V2Foundation,
 } from "./composition.js";
+import {
+  computeCausalTriads,
+  deriveCleanNoteTitleFromFields,
+  extractMemoryEntities,
+  isAcceptablePath,
+  normalizeCandidatePath,
+  resolveContainedWorkspaceFile,
+  type CausalTriadNoteInput,
+  type CausalTriadSummary,
+} from "./entity-extractor.js";
 import { V2_PUBLIC_TOOL_DEFINITIONS } from "./public-tools.js";
 import { WebUiMvcController, renderMvcControllersJs } from "./webui/controllers.js";
 import { renderMvcModelsJs } from "./webui/models.js";
@@ -31,6 +43,8 @@ export interface GraphNode {
   readonly summary?: string;
   readonly filePaths?: readonly string[];
   readonly symbols?: readonly string[];
+  readonly wikilinks?: readonly string[];
+  readonly supersedesRecordIds?: readonly string[];
 }
 
 export interface GraphEdge {
@@ -41,12 +55,16 @@ export interface GraphEdge {
     | "forked-from"
     | "touches-file"
     | "mentions-symbol"
-    | "defines-symbol";
+    | "defines-symbol"
+    | "links-to-note"
+    | "supersedes"
+    | "causal-triad";
 }
 
 export interface KnowledgeGraphPayload {
   readonly nodes: readonly GraphNode[];
   readonly edges: readonly GraphEdge[];
+  readonly causalTriads?: readonly CausalTriadSummary[];
   readonly stats: {
     readonly sessionNodes: number;
     readonly noteNodes: number;
@@ -56,49 +74,87 @@ export interface KnowledgeGraphPayload {
   };
 }
 
-export function extractNoteFilePathsAndSymbols(text: string): {
+export function deriveCleanNoteTitle(raw: Record<string, unknown>, recordId: string): {
+  readonly title: string;
+  readonly cleanSummary: string;
+} {
+  return deriveCleanNoteTitleFromFields(
+    {
+      title: raw.title,
+      summary: raw.summary,
+      text: raw.text,
+      body: raw.body,
+    },
+    recordId,
+  );
+}
+
+export function extractNoteFilePathsAndSymbols(
+  text: string,
+  projectRoot?: string,
+): {
   readonly filePaths: readonly string[];
   readonly symbols: readonly string[];
+  readonly wikilinks: readonly string[];
 } {
-  const filePaths = new Set<string>();
-  const symbols = new Set<string>();
+  return extractMemoryEntities(text, projectRoot ? { projectRoot } : undefined);
+}
 
-  const pathRegex =
-    /(?:^|[\s`'":(])((?:src|tests|scripts|docs|memory-v2|app|routes|config|packages|lib)\/[A-Za-z0-9_./-]+\.[A-Za-z0-9]+|[A-Za-z0-9_-]+\.(?:ts|tsx|js|mjs|cjs|json|py|php|go|rs|sql|md))(?=$|[\s`'");,])/gu;
-  for (const match of text.matchAll(pathRegex)) {
-    const candidate = match[1]?.trim().replace(/\\/gu, "/");
-    if (candidate && candidate.length >= 4) {
-      filePaths.add(candidate);
-    }
-  }
-
-  for (const match of text.matchAll(/`([A-Za-z_][A-Za-z0-9_]{2,60})(?:\(\))?`/gu)) {
-    const sym = match[1]!.trim();
-    if (!sym.includes("/") && !sym.includes(".")) {
-      symbols.add(sym);
-    }
-  }
-
-  for (const match of text.matchAll(/\b([A-Z][a-z0-9]+(?:[A-Z][a-z0-9]+)+)\b/gu)) {
-    const sym = match[1]!.trim();
-    if (sym.length >= 6) {
-      symbols.add(sym);
-    }
-  }
-
-  return Object.freeze({
-    filePaths: Object.freeze([...filePaths].slice(0, 25)),
-    symbols: Object.freeze([...symbols].slice(0, 25)),
-  });
+export interface BuildKnowledgeGraphOptions {
+  readonly projectRoot?: string;
+  readonly filterMissingRepoFiles?: boolean;
 }
 
 export function buildMemoryKnowledgeGraph(
   notes: readonly Record<string, unknown>[],
   sessions: readonly Record<string, unknown>[] = [],
+  options?: BuildKnowledgeGraphOptions,
 ): KnowledgeGraphPayload {
   const nodesMap = new Map<string, GraphNode>();
   const edges: GraphEdge[] = [];
   const edgeKeys = new Set<string>();
+  const fileContentsCache = new Map<string, string | null>();
+
+  const cacheFileEntry = (key: string, value: string | null): void => {
+    if (!fileContentsCache.has(key) && fileContentsCache.size >= 256) {
+      const oldest = fileContentsCache.keys().next().value;
+      if (oldest !== undefined) {
+        fileContentsCache.delete(oldest);
+      }
+    }
+    fileContentsCache.set(key, value);
+  };
+
+  const readRepoFileCached = (relPath: string): string | null => {
+    if (!options?.projectRoot) return null;
+    if (fileContentsCache.has(relPath)) {
+      return fileContentsCache.get(relPath) ?? null;
+    }
+    try {
+      const contained = resolveContainedWorkspaceFile(options.projectRoot, relPath, 512 * 1024);
+      if (!contained) {
+        cacheFileEntry(relPath, null);
+        return null;
+      }
+      const content = readFileSync(contained.absPath, "utf8");
+      cacheFileEntry(relPath, content);
+      return content;
+    } catch {
+      cacheFileEntry(relPath, null);
+      return null;
+    }
+  };
+
+  const fileDefinesSymbolOnDisk = (relPath: string, sym: string): boolean => {
+    const content = readRepoFileCached(relPath);
+    if (!content) return false;
+    const escaped = sym.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+    const declRe = new RegExp(
+      `(?:export\\s+)?(?:default\\s+)?(?:abstract\\s+)?(?:async\\s+)?(?:class|function|interface|type|const|let|var|enum)\\s+${escaped}\\b`,
+      "u",
+    );
+    return declRe.test(content);
+  };
 
   const addEdge = (
     source: string,
@@ -148,11 +204,6 @@ export function buildMemoryKnowledgeGraph(
   for (const s of sessions) {
     const sid = String(s.sessionId ?? "").trim();
     if (!sid) continue;
-    const sNodeId = ensureSessionNode(sid, s);
-    if (typeof s.parentSessionId === "string" && s.parentSessionId.trim().length > 0) {
-      const parentNodeId = ensureSessionNode(s.parentSessionId.trim());
-      addEdge(parentNodeId, sNodeId, "forked-from");
-    }
     if (Array.isArray(s.noteIds)) {
       for (const nid of s.noteIds) {
         if (typeof nid === "string" && nid.trim()) {
@@ -160,42 +211,63 @@ export function buildMemoryKnowledgeGraph(
         }
       }
     }
+    const hasNotes =
+      Number(s.noteCount ?? 0) > 0 || (Array.isArray(s.noteIds) && s.noteIds.length > 0);
+    const hasParent =
+      typeof s.parentSessionId === "string" && s.parentSessionId.trim().length > 0;
+    if (!hasNotes && !hasParent && s.semanticState !== "active" && s !== sessions[0]) {
+      continue;
+    }
+    const sNodeId = ensureSessionNode(sid, s);
+    if (hasParent) {
+      const parentNodeId = ensureSessionNode(String(s.parentSessionId).trim());
+      addEdge(parentNodeId, sNodeId, "forked-from");
+    }
   }
 
-  const defaultSessionId =
-    sessions[0] && typeof sessions[0].sessionId === "string" && sessions[0].sessionId.trim()
-      ? sessions[0].sessionId.trim()
-      : "";
+  interface ParsedNoteGraphEntry extends CausalTriadNoteInput {
+    readonly normalizedKey: string;
+    readonly wikilinks: readonly string[];
+    readonly supersedesTargets: readonly string[];
+  }
+
+  const parsedNotes: ParsedNoteGraphEntry[] = [];
 
   for (const raw of notes) {
     const recordId = String(raw.recordId ?? raw.id ?? "").trim();
     if (!recordId) continue;
+    const { title, cleanSummary } = deriveCleanNoteTitle(raw, recordId);
     const summary = String(raw.summary ?? raw.text ?? "");
-    const colonIdx = summary.indexOf(": ");
-    const title =
-      typeof raw.title === "string" && raw.title.trim().length > 0
-        ? raw.title.trim()
-        : colonIdx > 0
-          ? summary.slice(0, colonIdx)
-          : summary || recordId;
     const subkind = String(raw.recordKind ?? raw.kind ?? "insight");
     const status = String(raw.status ?? "provisional");
+    const normalizedKey =
+      typeof raw.normalizedKey === "string" ? raw.normalizedKey.trim() : "";
+
+    // Never fall back to sessions[0] for orphan / imported notes lacking a sessionId.
     const sessionId =
       typeof raw.sessionId === "string" && raw.sessionId.trim().length > 0
         ? raw.sessionId.trim()
-        : (noteToSessionFallback.get(recordId) ?? defaultSessionId);
+        : (noteToSessionFallback.get(recordId) ?? "");
 
-    const extracted = extractNoteFilePathsAndSymbols(
+    const extracted = extractMemoryEntities(
       `${title}\n${summary}\n${String(raw.body ?? "")}`,
+      options?.projectRoot ? { projectRoot: options.projectRoot } : undefined,
     );
-    const filePaths = [
-      ...new Set([
-        ...(Array.isArray(raw.filePaths)
-          ? raw.filePaths.filter((p): p is string => typeof p === "string")
-          : []),
-        ...extracted.filePaths,
-      ]),
-    ];
+    const safeRawFilePaths = Array.isArray(raw.filePaths)
+      ? raw.filePaths
+          .filter((p): p is string => typeof p === "string")
+          .map((p) => normalizeCandidatePath(p))
+          .filter((p) => isAcceptablePath(p, options?.projectRoot))
+      : [];
+    const mergedFilePaths = [...new Set([...safeRawFilePaths, ...extracted.filePaths])];
+    const filePaths =
+      options?.filterMissingRepoFiles && options.projectRoot
+        ? mergedFilePaths.filter(
+            (fp) =>
+              resolveContainedWorkspaceFile(options.projectRoot!, fp, 16 * 1024 * 1024) !== null,
+          )
+        : mergedFilePaths;
+
     const symbols = [
       ...new Set([
         ...(Array.isArray(raw.symbols)
@@ -204,11 +276,27 @@ export function buildMemoryKnowledgeGraph(
         ...extracted.symbols,
       ]),
     ];
+    const wikilinks = [
+      ...new Set([
+        ...(Array.isArray(raw.wikilinks)
+          ? raw.wikilinks.filter((w): w is string => typeof w === "string")
+          : []),
+        ...extracted.wikilinks,
+      ]),
+    ];
 
-    const cleanSummary =
-      colonIdx > 0 && summary.slice(0, colonIdx).trim() === title
-        ? summary.slice(colonIdx + 2).trim()
-        : summary.trim();
+    const supersedesTargets = [
+      ...new Set([
+        ...(typeof raw.supersedesRecordId === "string" && raw.supersedesRecordId.trim()
+          ? [raw.supersedesRecordId.trim()]
+          : []),
+        ...(Array.isArray(raw.supersedesRecordIds)
+          ? raw.supersedesRecordIds
+              .filter((id): id is string => typeof id === "string" && id.trim().length > 0)
+              .map((id) => id.trim())
+          : []),
+      ]),
+    ];
 
     const noteNodeId = `note:${recordId}`;
     nodesMap.set(
@@ -223,9 +311,26 @@ export function buildMemoryKnowledgeGraph(
         summary: (cleanSummary || title).slice(0, 360),
         filePaths: Object.freeze(filePaths.slice(0, 12)),
         symbols: Object.freeze(symbols.slice(0, 16)),
+        ...(wikilinks.length > 0 ? { wikilinks: Object.freeze(wikilinks.slice(0, 20)) } : {}),
+        ...(supersedesTargets.length > 0
+          ? { supersedesRecordIds: Object.freeze(supersedesTargets) }
+          : {}),
         ...(sessionId ? { sessionId } : {}),
       }),
     );
+
+    parsedNotes.push({
+      id: recordId,
+      recordId,
+      recordKind: subkind,
+      title,
+      sessionId: sessionId || null,
+      filePaths,
+      symbols,
+      normalizedKey,
+      wikilinks,
+      supersedesTargets,
+    });
 
     if (sessionId) {
       const sNodeId = ensureSessionNode(sessionId, {
@@ -262,8 +367,65 @@ export function buildMemoryKnowledgeGraph(
         );
       }
       addEdge(noteNodeId, symNodeId, "mentions-symbol");
-      if (filePaths.length === 1) {
+
+      if (options?.projectRoot) {
+        for (const fp of filePaths) {
+          if (fileDefinesSymbolOnDisk(fp, sym)) {
+            addEdge(`file:${fp}`, symNodeId, "defines-symbol");
+          }
+        }
+      } else if (filePaths.length === 1) {
         addEdge(`file:${filePaths[0]!}`, symNodeId, "defines-symbol");
+      }
+    }
+  }
+
+  // Pass 2: Wikilink, Supersession, and IDF-weighted Causal Triad edges across notes
+  const wikilinkResolver = buildWikilinkResolver(
+    parsedNotes.map((n) => ({
+      path: n.recordId,
+      title: n.title,
+      id: n.recordId,
+      aliases: n.normalizedKey
+        ? [n.normalizedKey, n.normalizedKey.split("/").pop() ?? ""].filter(Boolean)
+        : [],
+    })),
+  );
+
+  for (const n of parsedNotes) {
+    const sourceNodeId = `note:${n.recordId}`;
+    for (const target of n.wikilinks) {
+      const resolvedRecordId = wikilinkResolver(target);
+      if (
+        resolvedRecordId
+        && resolvedRecordId !== n.recordId
+        && nodesMap.has(`note:${resolvedRecordId}`)
+      ) {
+        addEdge(sourceNodeId, `note:${resolvedRecordId}`, "links-to-note");
+      }
+    }
+    for (const oldRecordId of n.supersedesTargets) {
+      if (oldRecordId !== n.recordId && nodesMap.has(`note:${oldRecordId}`)) {
+        addEdge(sourceNodeId, `note:${oldRecordId}`, "supersedes");
+      }
+    }
+  }
+
+  const { causalTriads } = computeCausalTriads(
+    parsedNotes.map((note) => ({ note, score: 1 })),
+    parsedNotes,
+  );
+  for (const triad of causalTriads) {
+    const mistakeNodeId = `note:${triad.anchorMistakeId}`;
+    if (!nodesMap.has(mistakeNodeId)) continue;
+    for (const adrId of triad.relatedAdrIds) {
+      if (adrId !== triad.anchorMistakeId && nodesMap.has(`note:${adrId}`)) {
+        addEdge(mistakeNodeId, `note:${adrId}`, "causal-triad");
+      }
+    }
+    for (const insightId of triad.relatedInsightIds) {
+      if (insightId !== triad.anchorMistakeId && nodesMap.has(`note:${insightId}`)) {
+        addEdge(mistakeNodeId, `note:${insightId}`, "causal-triad");
       }
     }
   }
@@ -272,6 +434,7 @@ export function buildMemoryKnowledgeGraph(
   return Object.freeze({
     nodes: Object.freeze(nodes),
     edges: Object.freeze(edges),
+    causalTriads,
     stats: Object.freeze({
       sessionNodes: nodes.filter((n) => n.kind === "session").length,
       noteNodes: nodes.filter((n) => n.kind === "note").length,
@@ -348,6 +511,76 @@ function resolveDefaultEntryUrl(): string {
   return import.meta.url;
 }
 
+const WEBUI_SECURITY_HEADERS: Readonly<Record<string, string>> = Object.freeze({
+  "content-security-policy":
+    "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'",
+  "x-frame-options": "DENY",
+  "x-content-type-options": "nosniff",
+  "referrer-policy": "no-referrer",
+});
+
+const WILDCARD_BIND_HOSTS = new Set(["0.0.0.0", "::", "[::]", "::0", "[::0]", "*"]);
+
+function isAllowedHostName(hostname: string, extraHost?: string): boolean {
+  const lower = hostname.trim().toLowerCase();
+  if (!lower || WILDCARD_BIND_HOSTS.has(lower)) {
+    return false;
+  }
+  if (
+    lower === "127.0.0.1"
+    || lower === "localhost"
+    || lower === "[::1]"
+    || lower === "::1"
+  ) {
+    return true;
+  }
+  if (extraHost) {
+    const normalizedExtra = extraHost.trim().toLowerCase();
+    if (
+      normalizedExtra &&
+      !WILDCARD_BIND_HOSTS.has(normalizedExtra) &&
+      (lower === normalizedExtra ||
+        (normalizedExtra.includes(":") && !normalizedExtra.startsWith("[") && lower === `[${normalizedExtra}]`))
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function pathContainsOrEquals(root: string, target: string): boolean {
+  const norm = (p: string) => (process.platform === "win32" ? p.toLowerCase() : p);
+  const rel = relative(norm(root), norm(target));
+  return rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
+}
+
+function canonicalizeProjectRoot(projectRoot: string): string {
+  const resolved = resolve(projectRoot);
+  try {
+    if (existsSync(resolved)) {
+      return realpathSync.native(resolved);
+    }
+  } catch {
+    // Fall back to resolved path when target is missing
+  }
+  return resolved;
+}
+
+function canonicalProjectKey(projectRoot: string): string {
+  const canonical = canonicalizeProjectRoot(projectRoot);
+  return process.platform === "win32" ? canonical.toLowerCase() : canonical;
+}
+
+function extractHostnameFromHostHeader(hostHeader: string): string {
+  const trimmed = hostHeader.trim();
+  if (trimmed.startsWith("[")) {
+    const closeIdx = trimmed.indexOf("]");
+    return closeIdx > 0 ? trimmed.slice(0, closeIdx + 1) : trimmed;
+  }
+  const colonIdx = trimmed.indexOf(":");
+  return colonIdx >= 0 ? trimmed.slice(0, colonIdx) : trimmed;
+}
+
 async function readJsonBody(req: IncomingMessage): Promise<Record<string, unknown>> {
   const chunks: Buffer[] = [];
   let total = 0;
@@ -361,7 +594,12 @@ async function readJsonBody(req: IncomingMessage): Promise<Record<string, unknow
   }
   const raw = Buffer.concat(chunks).toString("utf8").trim();
   if (!raw) return {};
-  const parsed = JSON.parse(raw);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error("INVALID_JSON");
+  }
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
     throw new Error("INVALID_JSON_OBJECT");
   }
@@ -371,6 +609,7 @@ async function readJsonBody(req: IncomingMessage): Promise<Record<string, unknow
 function sendJson(res: ServerResponse, statusCode: number, payload: unknown): void {
   const body = JSON.stringify(payload);
   res.writeHead(statusCode, {
+    ...WEBUI_SECURITY_HEADERS,
     "content-type": "application/json; charset=utf-8",
     "cache-control": "no-store",
   });
@@ -379,6 +618,7 @@ function sendJson(res: ServerResponse, statusCode: number, payload: unknown): vo
 
 function sendJs(res: ServerResponse, scriptBody: string): void {
   res.writeHead(200, {
+    ...WEBUI_SECURITY_HEADERS,
     "content-type": "application/javascript; charset=utf-8",
     "cache-control": "no-store",
   });
@@ -390,53 +630,195 @@ export interface V2WebUiOptions {
   readonly extraProjectRoots?: readonly string[];
   readonly entryUrl?: string;
   readonly foundations?: ReadonlyMap<string, V2Foundation>;
+  readonly allowedHost?: string;
 }
 
 export function createV2WebUiHandler(options: V2WebUiOptions) {
-  const defaultProjectRoot = resolve(options.defaultProjectRoot);
+  const defaultProjectRoot = canonicalizeProjectRoot(options.defaultProjectRoot);
   const entryUrl = options.entryUrl ?? resolveDefaultEntryUrl();
+  const csrfToken = randomBytes(24).toString("hex");
   const foundationCache = new Map<string, V2Foundation>();
+  const foundationPromiseCache = new Map<string, Promise<V2Foundation>>();
   const ownedFoundations = new Set<V2Foundation>();
-  const knownProjects = new Set<string>(
-    discoverV2Projects(defaultProjectRoot, options.extraProjectRoots ?? []),
-  );
+  const knownProjects = new Set<string>();
+  const addKnownProject = (root: string): void => {
+    const canonical = canonicalizeProjectRoot(root);
+    const key = canonicalProjectKey(canonical);
+    for (const existing of knownProjects) {
+      if (canonicalProjectKey(existing) === key) return;
+    }
+    knownProjects.add(canonical);
+  };
+  for (const p of discoverV2Projects(defaultProjectRoot, options.extraProjectRoots ?? [])) {
+    addKnownProject(p);
+  }
+  addKnownProject(defaultProjectRoot);
 
   if (options.foundations) {
     for (const [root, foundation] of options.foundations.entries()) {
-      const resolvedRoot = resolve(root);
-      foundationCache.set(resolvedRoot, foundation);
-      knownProjects.add(resolvedRoot);
+      const canonical = canonicalizeProjectRoot(root);
+      foundationCache.set(canonicalProjectKey(canonical), foundation);
+      addKnownProject(canonical);
     }
   }
 
-  async function getFoundationForProject(projectRoot: string): Promise<V2Foundation> {
-    const resolvedRoot = resolve(projectRoot);
-    const cached = foundationCache.get(resolvedRoot);
-    if (cached) return cached;
+  function isRegisteredOrInitializedProject(projectRoot: string): boolean {
+    const canonical = canonicalizeProjectRoot(projectRoot);
+    const key = canonicalProjectKey(canonical);
+    if (foundationCache.has(key)) return true;
+    for (const known of knownProjects) {
+      if (canonicalProjectKey(known) === key) return true;
+    }
+    const identityFile = join(canonical, "memory-v2", ".memory-mcp", "project-identity.json");
+    if (existsSync(identityFile)) {
+      addKnownProject(canonical);
+      return true;
+    }
+    return false;
+  }
 
-    const config = await ensureProjectV2StoreReady({
-      projectRoot: resolvedRoot,
-      entryUrl,
-      syncBuild: true,
-      ensureActive: true,
-    });
-    const foundation = await createV2Foundation(config, { entryUrl });
-    foundationCache.set(resolvedRoot, foundation);
-    ownedFoundations.add(foundation);
-    knownProjects.add(resolvedRoot);
-    return foundation;
+  async function getFoundationForProject(
+    projectRoot: string,
+    getOpts?: { readonly allowBootstrap?: boolean },
+  ): Promise<V2Foundation> {
+    const canonicalRoot = canonicalizeProjectRoot(projectRoot);
+    const cacheKey = canonicalProjectKey(canonicalRoot);
+    const cached = foundationCache.get(cacheKey);
+    if (cached) {
+      foundationCache.delete(cacheKey);
+      foundationCache.set(cacheKey, cached);
+      return cached;
+    }
+    const allowBootstrap = getOpts?.allowBootstrap === true;
+    const inflightKey = `${cacheKey}:${allowBootstrap ? "boot" : "open"}`;
+    const inflight = foundationPromiseCache.get(inflightKey);
+    if (inflight) return inflight;
+
+    const autoSyncBuild = process.env.MEMORY_V2_AUTO_SYNC_BUILD === "1";
+    const initPromise = (async () => {
+      const config = await ensureProjectV2StoreReady({
+        projectRoot: canonicalRoot,
+        entryUrl,
+        allowBootstrap,
+        syncBuild: autoSyncBuild,
+        ensureActive: allowBootstrap,
+        promotePrepared: false,
+      });
+      const foundation = await createV2Foundation(config, {
+        entryUrl,
+        autoHealBuildSync: autoSyncBuild,
+      });
+      if (ownedFoundations.size >= 32) {
+        for (const [oldKey, oldFoundation] of foundationCache.entries()) {
+          if (ownedFoundations.has(oldFoundation)) {
+            foundationCache.delete(oldKey);
+            ownedFoundations.delete(oldFoundation);
+            void oldFoundation.close().catch(() => undefined);
+            break;
+          }
+        }
+      }
+      foundationCache.set(cacheKey, foundation);
+      ownedFoundations.add(foundation);
+      addKnownProject(canonicalRoot);
+      return foundation;
+    })();
+    foundationPromiseCache.set(inflightKey, initPromise);
+    try {
+      return await initPromise;
+    } finally {
+      foundationPromiseCache.delete(inflightKey);
+    }
   }
 
   const handler = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
     try {
-      const method = req.method ?? "GET";
-      const parsedUrl = new URL(req.url ?? "/", "http://127.0.0.1");
+      const method = (req.method ?? "GET").toUpperCase();
+
+      // 0a. DNS-Rebinding defense: strictly require & validate Host header
+      const rawHostHeader = typeof req.headers.host === "string" ? req.headers.host.trim() : "";
+      if (!rawHostHeader) {
+        sendJson(res, 403, { ok: false, error: "FORBIDDEN_HOST" });
+        return;
+      }
+      const hostOnly = extractHostnameFromHostHeader(rawHostHeader);
+      if (!isAllowedHostName(hostOnly, options.allowedHost)) {
+        sendJson(res, 403, { ok: false, error: "FORBIDDEN_HOST" });
+        return;
+      }
+
+      // 0b. Mutating request security: Content-Type + Origin/Sec-Fetch-Site + Unconditional X-PM-CSRF-Token
+      if (method !== "GET" && method !== "HEAD" && method !== "OPTIONS") {
+        const contentType = String(req.headers["content-type"] ?? "").toLowerCase();
+        if (!contentType.startsWith("application/json")) {
+          sendJson(res, 415, { ok: false, error: "UNSUPPORTED_MEDIA_TYPE" });
+          return;
+        }
+
+        const secFetchSite =
+          typeof req.headers["sec-fetch-site"] === "string"
+            ? req.headers["sec-fetch-site"].trim().toLowerCase()
+            : "";
+        if (secFetchSite && secFetchSite !== "same-origin" && secFetchSite !== "none") {
+          sendJson(res, 403, { ok: false, error: "CSRF_ORIGIN_DENIED" });
+          return;
+        }
+
+        const originHeader = typeof req.headers.origin === "string" ? req.headers.origin.trim() : "";
+        if (originHeader) {
+          let parsedOrigin: URL;
+          try {
+            parsedOrigin = new URL(originHeader);
+          } catch {
+            sendJson(res, 403, { ok: false, error: "CSRF_ORIGIN_DENIED" });
+            return;
+          }
+          if (!isAllowedHostName(parsedOrigin.hostname, options.allowedHost)) {
+            sendJson(res, 403, { ok: false, error: "CSRF_ORIGIN_DENIED" });
+            return;
+          }
+          const originPort =
+            parsedOrigin.port || (parsedOrigin.protocol === "https:" ? "443" : "80");
+          const closeBracket = rawHostHeader.indexOf("]");
+          const colonIdx = rawHostHeader.lastIndexOf(":");
+          if (colonIdx > closeBracket) {
+            const reqPort = rawHostHeader.slice(colonIdx + 1).trim();
+            if (reqPort && originPort !== reqPort) {
+              sendJson(res, 403, { ok: false, error: "CSRF_ORIGIN_DENIED" });
+              return;
+            }
+          }
+        }
+
+        const providedCsrf =
+          typeof req.headers["x-pm-csrf-token"] === "string"
+            ? req.headers["x-pm-csrf-token"].trim()
+            : "";
+        const expectedBuf = Buffer.from(csrfToken, "utf8");
+        const providedBuf = Buffer.from(providedCsrf, "utf8");
+        if (
+          providedBuf.byteLength !== expectedBuf.byteLength
+          || !timingSafeEqual(providedBuf, expectedBuf)
+        ) {
+          sendJson(res, 403, { ok: false, error: "CSRF_TOKEN_INVALID" });
+          return;
+        }
+      }
+
+      let parsedUrl: URL;
+      try {
+        parsedUrl = new URL(req.url ?? "/", "http://127.0.0.1");
+      } catch {
+        sendJson(res, 400, { ok: false, error: "INVALID_URI" });
+        return;
+      }
       const pathname = parsedUrl.pathname;
 
       // 1. HTML Host & Modular Frontend MVC Scripts (React + TanStack + shadcn/ui + Web Components)
       if (method === "GET" && (pathname === "/" || pathname === "/index.html")) {
-        const html = renderMvcIndexHtml(defaultProjectRoot);
+        const html = renderMvcIndexHtml(defaultProjectRoot, csrfToken);
         res.writeHead(200, {
+          ...WEBUI_SECURITY_HEADERS,
           "content-type": "text/html; charset=utf-8",
           "cache-control": "no-store",
         });
@@ -481,6 +863,7 @@ export function createV2WebUiHandler(options: V2WebUiOptions) {
           options.extraProjectRoots ?? [],
           knownProjects,
           getFoundationForProject,
+          (root) => foundationCache.has(canonicalProjectKey(root)),
         );
         sendJson(res, 200, payload);
         return;
@@ -492,15 +875,48 @@ export function createV2WebUiHandler(options: V2WebUiOptions) {
           typeof body.projectRoot === "string" ? body.projectRoot : null,
           "",
         );
-        if (!candidate) {
+        if (!candidate || !existsSync(candidate)) {
           sendJson(res, 400, { ok: false, error: "INVALID_PROJECT_ROOT" });
           return;
         }
-        const foundation = await getFoundationForProject(candidate);
+        let candidateStat: ReturnType<typeof lstatSync>;
+        try {
+          candidateStat = lstatSync(candidate);
+        } catch {
+          sendJson(res, 400, { ok: false, error: "INVALID_PROJECT_ROOT" });
+          return;
+        }
+        if (candidateStat.isSymbolicLink() || !candidateStat.isDirectory()) {
+          sendJson(res, 400, { ok: false, error: "INVALID_PROJECT_ROOT" });
+          return;
+        }
+        let canonicalCandidate: string;
+        try {
+          canonicalCandidate = realpathSync.native(candidate);
+        } catch {
+          sendJson(res, 400, { ok: false, error: "INVALID_PROJECT_ROOT" });
+          return;
+        }
+        if (canonicalProjectKey(canonicalCandidate) !== canonicalProjectKey(defaultProjectRoot)) {
+          const defaultMemory = join(defaultProjectRoot, "memory");
+          const defaultVaultV2 = join(defaultProjectRoot, "memory-v2");
+          if (
+            pathContainsOrEquals(defaultMemory, canonicalCandidate) ||
+            pathContainsOrEquals(canonicalCandidate, defaultMemory) ||
+            pathContainsOrEquals(defaultVaultV2, canonicalCandidate) ||
+            pathContainsOrEquals(canonicalCandidate, defaultVaultV2)
+          ) {
+            sendJson(res, 400, { ok: false, error: "PROJECT_PATH_OVERLAP" });
+            return;
+          }
+        }
+        const foundation = await getFoundationForProject(canonicalCandidate, {
+          allowBootstrap: true,
+        });
         const st = await foundation.status();
         sendJson(res, 200, {
           ok: true,
-          projectRoot: candidate,
+          projectRoot: canonicalCandidate,
           status: st,
         });
         return;
@@ -513,6 +929,10 @@ export function createV2WebUiHandler(options: V2WebUiOptions) {
         );
         if (!projectRoot) {
           sendJson(res, 400, { ok: false, error: "INVALID_PROJECT_ROOT" });
+          return;
+        }
+        if (!isRegisteredOrInitializedProject(projectRoot)) {
+          sendJson(res, 403, { ok: false, error: "UNREGISTERED_PROJECT_ROOT" });
           return;
         }
         const foundation = await getFoundationForProject(projectRoot);
@@ -530,6 +950,10 @@ export function createV2WebUiHandler(options: V2WebUiOptions) {
           sendJson(res, 400, { ok: false, error: "INVALID_PROJECT_ROOT" });
           return;
         }
+        if (!isRegisteredOrInitializedProject(projectRoot)) {
+          sendJson(res, 403, { ok: false, error: "UNREGISTERED_PROJECT_ROOT" });
+          return;
+        }
         const foundation = await getFoundationForProject(projectRoot);
         const payload = await WebUiMvcController.listNotes(projectRoot, foundation, {
           query: parsedUrl.searchParams.get("query") ?? undefined,
@@ -541,13 +965,23 @@ export function createV2WebUiHandler(options: V2WebUiOptions) {
       }
 
       if (method === "GET" && pathname.startsWith("/api/notes/")) {
-        const noteId = decodeURIComponent(pathname.slice("/api/notes/".length)).trim();
+        let noteId = "";
+        try {
+          noteId = decodeURIComponent(pathname.slice("/api/notes/".length)).trim();
+        } catch {
+          sendJson(res, 400, { ok: false, error: "INVALID_URI" });
+          return;
+        }
         const projectRoot = validateProjectRootParam(
           parsedUrl.searchParams.get("project"),
           defaultProjectRoot,
         );
         if (!projectRoot || !noteId) {
           sendJson(res, 400, { ok: false, error: "INVALID_PROJECT_ROOT" });
+          return;
+        }
+        if (!isRegisteredOrInitializedProject(projectRoot)) {
+          sendJson(res, 403, { ok: false, error: "UNREGISTERED_PROJECT_ROOT" });
           return;
         }
         const foundation = await getFoundationForProject(projectRoot);
@@ -568,6 +1002,10 @@ export function createV2WebUiHandler(options: V2WebUiOptions) {
           sendJson(res, 400, { ok: false, error: "INVALID_PROJECT_ROOT" });
           return;
         }
+        if (!isRegisteredOrInitializedProject(projectRoot)) {
+          sendJson(res, 403, { ok: false, error: "UNREGISTERED_PROJECT_ROOT" });
+          return;
+        }
         const foundation = await getFoundationForProject(projectRoot);
         const { statusCode, payload } = await WebUiMvcController.executeGovernanceAction(
           foundation,
@@ -586,6 +1024,10 @@ export function createV2WebUiHandler(options: V2WebUiOptions) {
           sendJson(res, 400, { ok: false, error: "INVALID_PROJECT_ROOT" });
           return;
         }
+        if (!isRegisteredOrInitializedProject(projectRoot)) {
+          sendJson(res, 403, { ok: false, error: "UNREGISTERED_PROJECT_ROOT" });
+          return;
+        }
         const foundation = await getFoundationForProject(projectRoot);
         const payload = await WebUiMvcController.getKnowledgeGraph(projectRoot, foundation);
         sendJson(res, 200, payload);
@@ -599,6 +1041,10 @@ export function createV2WebUiHandler(options: V2WebUiOptions) {
         );
         if (!projectRoot) {
           sendJson(res, 400, { ok: false, error: "INVALID_PROJECT_ROOT" });
+          return;
+        }
+        if (!isRegisteredOrInitializedProject(projectRoot)) {
+          sendJson(res, 403, { ok: false, error: "UNREGISTERED_PROJECT_ROOT" });
           return;
         }
         const foundation = await getFoundationForProject(projectRoot);
@@ -617,6 +1063,10 @@ export function createV2WebUiHandler(options: V2WebUiOptions) {
         );
         if (!projectRoot) {
           sendJson(res, 400, { ok: false, error: "INVALID_PROJECT_ROOT" });
+          return;
+        }
+        if (!isRegisteredOrInitializedProject(projectRoot)) {
+          sendJson(res, 403, { ok: false, error: "UNREGISTERED_PROJECT_ROOT" });
           return;
         }
         const foundation = await getFoundationForProject(projectRoot);
@@ -639,6 +1089,10 @@ export function createV2WebUiHandler(options: V2WebUiOptions) {
         );
         if (!projectRoot) {
           sendJson(res, 400, { ok: false, error: "INVALID_PROJECT_ROOT" });
+          return;
+        }
+        if (!isRegisteredOrInitializedProject(projectRoot)) {
+          sendJson(res, 403, { ok: false, error: "UNREGISTERED_PROJECT_ROOT" });
           return;
         }
         const message = typeof body.message === "string" ? body.message.trim() : "";
@@ -677,6 +1131,10 @@ export function createV2WebUiHandler(options: V2WebUiOptions) {
           sendJson(res, 400, { ok: false, error: "INVALID_PROJECT_ROOT" });
           return;
         }
+        if (!isRegisteredOrInitializedProject(projectRoot)) {
+          sendJson(res, 403, { ok: false, error: "UNREGISTERED_PROJECT_ROOT" });
+          return;
+        }
         const toolName = typeof body.tool === "string" ? body.tool.trim() : "";
         const isAllowedTool = V2_PUBLIC_TOOL_DEFINITIONS.some((t) => t.name === toolName);
         if (!toolName || !isAllowedTool) {
@@ -687,7 +1145,37 @@ export function createV2WebUiHandler(options: V2WebUiOptions) {
           body.args && typeof body.args === "object" && !Array.isArray(body.args)
             ? (body.args as Record<string, unknown>)
             : {};
-        const foundation = await getFoundationForProject(projectRoot);
+        let nestedTargetRoot: string | null = null;
+        for (const nestedKey of ["projectRoot", "workspaceRoot"] as const) {
+          const nestedVal = toolArgs[nestedKey];
+          if (nestedVal !== undefined && nestedVal !== null) {
+            if (typeof nestedVal !== "string" || nestedVal.trim().length === 0) {
+              sendJson(res, 400, { ok: false, error: "INVALID_PROJECT_ROOT" });
+              return;
+            }
+            const validatedNested = validateProjectRootParam(nestedVal, "");
+            if (!validatedNested) {
+              sendJson(res, 400, { ok: false, error: "INVALID_PROJECT_ROOT" });
+              return;
+            }
+            if (!isRegisteredOrInitializedProject(validatedNested)) {
+              sendJson(res, 403, { ok: false, error: "UNREGISTERED_PROJECT_ROOT" });
+              return;
+            }
+            if (
+              nestedTargetRoot !== null &&
+              canonicalProjectKey(nestedTargetRoot) !== canonicalProjectKey(validatedNested)
+            ) {
+              sendJson(res, 400, { ok: false, error: "INVALID_PROJECT_ROOT" });
+              return;
+            }
+            nestedTargetRoot = validatedNested;
+          }
+        }
+        const effectiveProjectRoot = nestedTargetRoot ?? projectRoot;
+        const { projectRoot: _ignoredProj, workspaceRoot: _ignoredWs, ...sanitizedToolArgs } =
+          toolArgs;
+        const foundation = await getFoundationForProject(effectiveProjectRoot);
         if (toolName === "memory_v2Status") {
           sendJson(res, 200, {
             ok: true,
@@ -696,7 +1184,7 @@ export function createV2WebUiHandler(options: V2WebUiOptions) {
           });
           return;
         }
-        const result = await foundation.content.invoke(toolName, toolArgs);
+        const result = await foundation.content.invoke(toolName, sanitizedToolArgs);
         sendJson(res, 200, {
           ok: true,
           tool: toolName,
@@ -707,10 +1195,22 @@ export function createV2WebUiHandler(options: V2WebUiOptions) {
 
       sendJson(res, 404, { ok: false, error: "NOT_FOUND", path: pathname });
     } catch (err) {
+      const code = err instanceof Error ? err.message : "";
+      if (code === "PAYLOAD_TOO_LARGE") {
+        sendJson(res, 413, { ok: false, error: "PAYLOAD_TOO_LARGE" });
+        return;
+      }
+      if (
+        err instanceof URIError
+        || code === "INVALID_JSON"
+        || code === "INVALID_JSON_OBJECT"
+      ) {
+        sendJson(res, 400, { ok: false, error: code || "INVALID_REQUEST" });
+        return;
+      }
       sendJson(res, 500, {
         ok: false,
         error: "WEBUI_INTERNAL_ERROR",
-        message: err instanceof Error ? err.message : String(err),
       });
     }
   };
@@ -740,7 +1240,10 @@ export async function startV2WebUiServer(
 }> {
   const host = options.host ?? "127.0.0.1";
   const requestedPort = options.port ?? 4321;
-  const { handler, closeAll } = createV2WebUiHandler(options);
+  const { handler, closeAll } = createV2WebUiHandler({
+    ...options,
+    allowedHost: host,
+  });
   const server = createServer((req, res) => {
     void handler(req, res);
   });
@@ -752,7 +1255,8 @@ export async function startV2WebUiServer(
 
   const addr = server.address();
   const actualPort = typeof addr === "object" && addr ? addr.port : requestedPort;
-  const url = `http://${host}:${actualPort}`;
+  const formattedHost = host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
+  const url = `http://${formattedHost}:${actualPort}`;
 
   return {
     url,

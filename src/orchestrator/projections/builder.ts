@@ -823,7 +823,7 @@ export function foldProjectionSnapshotV3(snapshot: ProjectionEventSnapshotV3, ma
   if (!Number.isSafeInteger(maxEvents) || maxEvents < 0 || maxEvents > 100_000 || !Number.isSafeInteger(maxBytes) || maxBytes < 0 || maxBytes > 64 * 1024 * 1024
     || typeof snapshot.dispositions !== "function" || !Number.isSafeInteger(snapshot.eventCount) || snapshot.eventCount < 0 || snapshot.eventCount > maxEvents
     || !Number.isSafeInteger(snapshot.aggregateBytes) || snapshot.aggregateBytes < 0 || snapshot.aggregateBytes > maxBytes) return failure("INTEGRITY_FAILURE");
-  const accumulator = new ProjectionFoldAccumulatorV3();
+  const accumulator = new ProjectionFoldAccumulatorV3(snapshot.crossScopeItemIds?.());
   let count = 0, bytes = 0;
   for (const source of snapshot.dispositions()) {
     if (++count > snapshot.eventCount) return failure("INTEGRITY_FAILURE");

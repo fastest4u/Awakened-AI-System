@@ -1049,10 +1049,14 @@ export class ProjectionIntegrityService {
       // Parse and reject non-V2 metadata before any directory or generation-byte inspection.
       const manifest = parseRichProjectionManifest(manifestValue, binding);
       if (manifest.schemaVersion === 3) {
-        const accumulator = new ProjectionFoldAccumulatorV3();
+        const crossScopeIds = new Set<string>();
+        const accumulator = new ProjectionFoldAccumulatorV3(crossScopeIds);
         const replayed = replayCommittedProjectionSources(binding, { driver:this.#options.driver, eventStorePath:this.#options.eventStorePath,
           busyTimeoutMs:this.#options.busyTimeoutMs, terminalEventPosition:BigInt(manifest.terminalEventPosition),
-          maxEvents:this.#options.maxReplayEvents, maxAggregateBytes:this.#options.maxReplayBytes }, source => accumulator.append(source));
+          maxEvents:this.#options.maxReplayEvents, maxAggregateBytes:this.#options.maxReplayBytes }, (source, seenCrossScope) => {
+            for (const id of seenCrossScope) crossScopeIds.add(id);
+            accumulator.append(source);
+          });
         if (replayed.terminalEventPosition !== BigInt(manifest.terminalEventPosition)
           || replayed.terminalEventHash !== manifest.terminalEventHash) return integrity();
         this.#inspectV3State(binding,manifest,accumulator.finish());

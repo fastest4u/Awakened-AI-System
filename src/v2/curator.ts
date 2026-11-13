@@ -1,4 +1,6 @@
+import { createHash } from "node:crypto";
 import type { V2Foundation } from "./composition.js";
+import { deriveCleanNoteTitleFromFields } from "./entity-extractor.js";
 
 export interface CuratorNoteSummary {
   readonly recordId: string;
@@ -96,13 +98,16 @@ export interface CuratorChatResponse {
 function normalizeNoteItem(raw: Record<string, unknown>): CuratorNoteSummary {
   const recordId = String(raw.recordId ?? raw.id ?? "");
   const summary = String(raw.summary ?? raw.text ?? "");
-  const colonIdx = summary.indexOf(": ");
-  const title =
-    typeof raw.title === "string" && raw.title.trim().length > 0
-      ? raw.title.trim()
-      : colonIdx > 0
-        ? summary.slice(0, colonIdx)
-        : summary || recordId;
+  const body = typeof raw.body === "string" ? raw.body : "";
+  const { title } = deriveCleanNoteTitleFromFields(
+    {
+      title: raw.title,
+      summary,
+      text: raw.text,
+      body,
+    },
+    recordId,
+  );
   const kind = String(raw.recordKind ?? raw.kind ?? "insight");
   const filePaths = Array.isArray(raw.filePaths)
     ? raw.filePaths.filter((p): p is string => typeof p === "string")
@@ -131,12 +136,42 @@ export class V2MemoryCuratorAgent {
     this.#foundation = foundation;
   }
 
-  async auditVault(options?: { readonly limit?: number }): Promise<CuratorAuditReport> {
-    const limit = options?.limit ?? 200;
+  async auditVault(options?: {
+    readonly limit?: number;
+    readonly pageSize?: number;
+    readonly onCollectedItems?: (items: readonly Record<string, unknown>[]) => void;
+  }): Promise<CuratorAuditReport> {
+    const maxItems = Math.max(1, options?.limit ?? 1_000);
+    const pageSize = Math.max(1, Math.min(200, options?.pageSize ?? Math.min(200, maxItems)));
     const status = await this.#foundation.status();
-    const listRaw = (await this.#foundation.content.invoke("memory_list", {
-      limit,
-    })) as { items?: Array<Record<string, unknown>> };
+    const collectedRawItems: Array<Record<string, unknown>> = [];
+    const seenIds = new Set<string>();
+    let cursor: string | null = null;
+    for (let page = 0; page < 50 && collectedRawItems.length < maxItems; page += 1) {
+      const remaining = maxItems - collectedRawItems.length;
+      const listRaw = (await this.#foundation.content.invoke("memory_list", {
+        limit: Math.min(pageSize, remaining),
+        ...(cursor ? { cursor } : {}),
+      })) as {
+        items?: Array<Record<string, unknown>>;
+        hasMore?: boolean;
+        nextCursor?: string | null;
+      };
+      const pageItems = listRaw.items ?? [];
+      let addedInPage = 0;
+      for (const item of pageItems) {
+        const id = String(item.recordId ?? item.id ?? "");
+        if (!id || seenIds.has(id)) continue;
+        seenIds.add(id);
+        collectedRawItems.push(item);
+        addedInPage += 1;
+      }
+      if (!listRaw.hasMore || !listRaw.nextCursor || addedInPage === 0) {
+        break;
+      }
+      cursor = listRaw.nextCursor;
+    }
+    options?.onCollectedItems?.(collectedRawItems);
     const dupRaw = (await this.#foundation.content.invoke("memory_findDuplicates", {})) as {
       duplicateGroups?: Array<{ contentHash: string; recordIds: string[] }>;
     };
@@ -144,7 +179,7 @@ export class V2MemoryCuratorAgent {
       staleItems?: Array<Record<string, unknown>>;
     };
 
-    const notes = (listRaw.items ?? []).map(normalizeNoteItem);
+    const notes = collectedRawItems.map(normalizeNoteItem);
     const notesById = new Map<string, CuratorNoteSummary>(notes.map((n) => [n.recordId, n]));
 
     const activeNotes = notes.filter(
@@ -196,7 +231,8 @@ export class V2MemoryCuratorAgent {
           uniqueIds.every((id) => existing.includes(id)) && existing.length === uniqueIds.length,
       );
       if (!alreadyCovered) {
-        seenGroups.set(`summary:${norm.slice(0, 48)}`, uniqueIds);
+        const digest = createHash("sha256").update(norm).digest("hex").slice(0, 32);
+        seenGroups.set(`summary:${digest}`, uniqueIds);
       }
     }
 
@@ -352,10 +388,34 @@ export class V2MemoryCuratorAgent {
     }> = [];
     const expired: Array<{ readonly recordId: string }> = [];
 
+    const promotedSet = new Set<string>();
+    const notesById = new Map<string, CuratorNoteSummary>(
+      auditBefore.candidateQueue.map((c) => [c.recordId, c]),
+    );
+
+    let primaryError: unknown;
     try {
       if (resolveDuplicates) {
         for (const group of auditBefore.duplicateGroups) {
           const keeperId = group.keeperRecordId;
+          const keeperCandidate = notesById.get(keeperId);
+          if (keeperCandidate && !promotedSet.has(keeperId)) {
+            await this.#foundation.content.invoke("memory_promote", {
+              sessionId,
+              recordId: keeperId,
+              targetStatus: "verified",
+              verificationMethod: "user-confirmed",
+              reason: "Auto-promoted duplicate group keeper before superseding duplicates",
+            });
+            promotedSet.add(keeperId);
+            promoted.push(
+              Object.freeze({
+                recordId: keeperId,
+                title: keeperCandidate.title,
+                status: "verified",
+              }),
+            );
+          }
           for (const dupId of group.duplicateRecordIds) {
             if (dupId === keeperId || supersededSet.has(dupId)) continue;
             const reason = `Auto-superseded duplicate of ${keeperId} by AI Memory Curator`;
@@ -379,7 +439,7 @@ export class V2MemoryCuratorAgent {
 
       if (promoteCandidates) {
         for (const candidate of auditBefore.candidateQueue) {
-          if (supersededSet.has(candidate.recordId)) continue;
+          if (supersededSet.has(candidate.recordId) || promotedSet.has(candidate.recordId)) continue;
           await this.#foundation.content.invoke("memory_promote", {
             sessionId,
             recordId: candidate.recordId,
@@ -387,6 +447,7 @@ export class V2MemoryCuratorAgent {
             verificationMethod: "user-confirmed",
             reason: "Auto-promoted verified candidate by AI Memory Curator",
           });
+          promotedSet.add(candidate.recordId);
           promoted.push(
             Object.freeze({
               recordId: candidate.recordId,
@@ -415,11 +476,21 @@ export class V2MemoryCuratorAgent {
           expired.push(Object.freeze({ recordId: stale.recordId }));
         }
       }
+    } catch (err) {
+      primaryError = err;
+      throw err;
     } finally {
-      await this.#foundation.content.invoke("memory_sessionEnd", {
-        sessionId,
-        summary: `AI Memory Curator completed: promoted ${promoted.length}, superseded ${superseded.length}, expired ${expired.length}.`,
-      });
+      try {
+        await this.#foundation.content.invoke("memory_sessionEnd", {
+          sessionId,
+          summary: `AI Memory Curator completed: promoted ${promoted.length}, superseded ${superseded.length}, expired ${expired.length}.`,
+          finalize: true,
+        });
+      } catch (cleanupErr) {
+        if (primaryError === undefined) {
+          throw cleanupErr;
+        }
+      }
     }
 
     const auditAfter = await this.auditVault();
@@ -514,19 +585,35 @@ export class V2MemoryCuratorAgent {
         rawMessage,
       )
     ) {
-      executedTools.push(
-        "memory_sessionStart",
-        "memory_list",
-        "memory_findDuplicates",
-        "memory_promote",
-        "memory_supersede",
-        "memory_sessionEnd",
-      );
+      if (request.autoExecute === false) {
+        executedTools.push("memory_list", "memory_findDuplicates", "memory_checkStaleness");
+        const previewAudit = await this.auditVault();
+        return Object.freeze({
+          ok: true,
+          intent: "audit",
+          reply:
+            `[Dry-Run Preview] พบรายการรอจัดการ: รออนุมัติ ${previewAudit.counts.unpromotedCandidates} รายการ, ` +
+            `ซ้ำ ${previewAudit.counts.duplicateGroups} กลุ่ม, ล้าสมัย ${previewAudit.counts.staleNotes} รายการ ` +
+            `(autoExecute=false จึงยังไม่แก้ไขคลังความจำ)`,
+          executedTools: Object.freeze(executedTools),
+          data: previewAudit,
+        });
+      }
       const receipt = await this.autoCurate({
         promoteCandidates: true,
         resolveDuplicates: true,
         expireStale: true,
       });
+      executedTools.push(
+        "memory_sessionStart",
+        "memory_list",
+        "memory_findDuplicates",
+        "memory_checkStaleness",
+      );
+      if (receipt.promoted.length > 0) executedTools.push("memory_promote");
+      if (receipt.superseded.length > 0) executedTools.push("memory_supersede");
+      if (receipt.expired.length > 0) executedTools.push("memory_expire");
+      executedTools.push("memory_sessionEnd");
       return Object.freeze({
         ok: true,
         intent: "auto_curate",
@@ -534,6 +621,7 @@ export class V2MemoryCuratorAgent {
           `AI Curator จัดการความจำเสร็จสมบูรณ์! ` +
           `อนุมัติ (Promoted): ${receipt.promoted.length} รายการ, ` +
           `รวมความจำซ้ำ (Superseded): ${receipt.superseded.length} รายการ, ` +
+          `หมดอายุ (Expired): ${receipt.expired.length} รายการ, ` +
           `คะแนนสุขภาพความจำ: ${receipt.beforeHealthScore} → ${receipt.afterHealthScore}/100`,
         executedTools: Object.freeze(executedTools),
         data: receipt,

@@ -41,7 +41,10 @@ import type {
   WorkspaceSnapshot,
 } from "../orchestrator/identity/contracts.js";
 import { computeProjectContextFingerprint } from "../orchestrator/identity/project-binding.service.js";
-import { SpawnSyncGitCommandRunner } from "../orchestrator/identity/git-workspace.resolver.js";
+import {
+  GitWorkspaceResolver,
+  SpawnSyncGitCommandRunner,
+} from "../orchestrator/identity/git-workspace.resolver.js";
 import { EventIntegrityService } from "../orchestrator/integrity/event-integrity.service.js";
 import { OperationalKeyCustodyProvider } from "../orchestrator/keys/operational-key-custody.js";
 import {
@@ -54,10 +57,23 @@ import {
   type StoredCapabilityMaterialV1,
 } from "../orchestrator/lifecycle/capability.service.js";
 import type { CheckpointDraftV2 } from "../orchestrator/lifecycle/contracts/checkpoint.js";
-import { decodeLifecycleSemanticCommandDraft } from "../orchestrator/lifecycle/contracts/commands.js";
-import type { SessionId } from "../orchestrator/lifecycle/contracts/identifiers.js";
+import {
+  decodeLifecycleSemanticCommandDraft,
+  type InternalRootWorkflowPhasePlan,
+  type InternalValidationResultCommand,
+} from "../orchestrator/lifecycle/contracts/commands.js";
+import type { CheckpointId, SessionId, WorkflowId } from "../orchestrator/lifecycle/contracts/identifiers.js";
+import { LifecycleError } from "../orchestrator/lifecycle/errors.js";
 import { connectionBoundEvidenceCoverage } from "../orchestrator/lifecycle/lifecycle-command.store.js";
 import { buildLifecycleIntentWitness } from "../orchestrator/lifecycle/lifecycle-intent-witness.js";
+import { sessionEndPhaseIdentityV1 } from "../orchestrator/lifecycle/session-end-identifiers.js";
+import type { SessionEndCoordinator } from "../orchestrator/lifecycle/session-end.coordinator.js";
+import {
+  createTrustedValidationProfileRegistry,
+  expandValidationAttemptPlans,
+  type TrustedValidationProfileRegistry,
+} from "../orchestrator/lifecycle/validation-profile.registry.js";
+import { ValidationProfileRunner } from "../orchestrator/lifecycle/validation-profile.runner.js";
 import { decodeRetainEvidenceBatch } from "../orchestrator/privacy/evidence-contracts.js";
 import type { TrustedRedactionPolicyV1 } from "../orchestrator/privacy/redaction.js";
 import { retainedEvidenceProofTarget } from "../orchestrator/privacy/retained-evidence-authority.js";
@@ -75,17 +91,20 @@ import type { ProjectionDirectoryIdentity } from "../orchestrator/projections/st
 import { decodeLifecycleWorkerOperationWire } from "../orchestrator/runtime/lifecycle-worker-protocol.js";
 import { LifecycleWorkerRuntimeFactory } from "../orchestrator/runtime/lifecycle-worker-runtime.factory.js";
 import { canonicalJson } from "../orchestrator/serialization/canonical-json.js";
+import { BranchScopeRepository } from "../orchestrator/storage/branch-scope.repository.js";
 import { ChildTransferRepository } from "../orchestrator/storage/child-transfer.repository.js";
 import { GENESIS_GLOBAL_HASH } from "../orchestrator/storage/event-chain-constants.js";
 import { EvidenceCoverageRepository } from "../orchestrator/storage/evidence-coverage.repository.js";
 import { LifecycleApprovalRepository } from "../orchestrator/storage/lifecycle-approval.repository.js";
+import { LifecycleOutboxRepository } from "../orchestrator/storage/lifecycle-outbox.repository.js";
 import { SqliteLifecycleProjectionRepository } from "../orchestrator/storage/lifecycle-projection.repository.js";
 import type { SessionAuthorityRecord } from "../orchestrator/storage/lifecycle-storage.types.js";
 import { MaintenanceFence } from "../orchestrator/storage/maintenance-fence.js";
 import { NodeSqliteDriver } from "../orchestrator/storage/node-sqlite-driver.js";
 import { SessionAuthorityRepository } from "../orchestrator/storage/session-authority.repository.js";
+import { SessionEndWorkflowRepository } from "../orchestrator/storage/session-end.repository.js";
 import { SessionLeaseRepository } from "../orchestrator/storage/session-lease.repository.js";
-import type { SqliteConnection } from "../orchestrator/storage/sqlite-driver.js";
+import type { SqliteConnection, SqliteParams, SqliteStatement } from "../orchestrator/storage/sqlite-driver.js";
 import { queryNativeContent } from "../orchestrator/verified-read/content-query.js";
 import { buildNativeContentResult } from "../orchestrator/verified-read/content-result.js";
 import type { VerifiedReadBinding } from "../orchestrator/verified-read/contracts.js";
@@ -107,6 +126,14 @@ import {
   V2_SUPPORTED_V1_TOOLS,
   V2_UNAVAILABLE_V1_TOOLS,
 } from "./capabilities.js";
+import { buildWikilinkResolver } from "../utils/links.js";
+import {
+  computeCausalTriads,
+  deriveCleanNoteTitleFromFields,
+  extractMemoryEntities,
+  isAcceptablePath,
+  resolveContainedWorkspaceFile,
+} from "./entity-extractor.js";
 
 export interface McpToolDefinition {
   readonly name: string;
@@ -194,6 +221,14 @@ const WRITE_NOTE_PROPS = Object.freeze({
     description: "Optional explicit provenance references.",
     items: Object.freeze({ type: "object" }),
   }),
+  autoVerify: Object.freeze({
+    type: "boolean",
+    description: "When true, automatically promotes the newly created note to verified status in one step.",
+  }),
+  verificationMethod: Object.freeze({
+    type: "string",
+    description: "Optional verification method for 1-step auto-promotion (e.g., user-confirmed, test-verified, source-anchored).",
+  }),
 });
 
 const CHECKPOINT_DRAFT_PROPS = Object.freeze({
@@ -257,7 +292,8 @@ const PUBLIC_TOOL_SCHEMA_CATALOG: Readonly<
     properties: Object.freeze({
       ...PROJECT_ROOT_PROP,
       ...SESSION_ID_PROP,
-      limit: Object.freeze({ type: "number", description: "Maximum number of records to return (default 20)." }),
+      limit: Object.freeze({ type: "number", description: "Maximum number of records to return (default 20, max 200)." }),
+      cursor: Object.freeze({ type: "string", description: "Optional pagination cursor from a previous memory_list response." }),
     }),
   }),
   memory_recent: Object.freeze({
@@ -328,6 +364,10 @@ const PUBLIC_TOOL_SCHEMA_CATALOG: Readonly<
         items: Object.freeze({ type: "string" }),
         description: "Optional list of file paths planned to be inspected or modified.",
       }),
+      autoDetectFiles: Object.freeze({
+        type: "boolean",
+        description: "Automatically inspect dirty/untracked Git workspace files when plannedFiles is omitted (default true).",
+      }),
       includeContext: Object.freeze({
         type: "boolean",
         description: "Whether to bundle awaken, contextPack, and selfCheck in the startup response (default true).",
@@ -347,6 +387,15 @@ const PUBLIC_TOOL_SCHEMA_CATALOG: Readonly<
         type: "array",
         items: Object.freeze({ type: "string" }),
         description: "Optional list of file paths to match against historical ADRs, mistakes, and insights.",
+      }),
+      filesTouched: Object.freeze({
+        type: "array",
+        items: Object.freeze({ type: "string" }),
+        description: "Alias for plannedFiles.",
+      }),
+      autoDetectFiles: Object.freeze({
+        type: "boolean",
+        description: "Automatically inspect dirty/untracked Git workspace files when plannedFiles is omitted (default true).",
       }),
     }),
   }),
@@ -376,14 +425,35 @@ const PUBLIC_TOOL_SCHEMA_CATALOG: Readonly<
         items: Object.freeze({ type: "string" }),
         description: "Alias for plannedFiles.",
       }),
+      autoDetectFiles: Object.freeze({
+        type: "boolean",
+        description: "Automatically inspect dirty/untracked Git workspace files when plannedFiles is omitted (default true).",
+      }),
     }),
   }),
   memory_sessionEnd: Object.freeze({
-    description: "Request governed session completion with final structured checkpoint.",
+    description: "Request or finalize governed session completion with final structured checkpoint.",
     properties: Object.freeze({
       ...PROJECT_ROOT_PROP,
       ...SESSION_ID_PROP,
+      workflowId: Object.freeze({ type: "string", description: "Optional active session-end workflow UUID when resuming/finalizing." }),
       summary: Object.freeze({ type: "string", description: "Final summary of work completed in this session." }),
+      finalize: Object.freeze({
+        type: "boolean",
+        description: "When true, completes verification and terminal completion immediately and releases the root session lease.",
+      }),
+      complete: Object.freeze({
+        type: "boolean",
+        description: "Alias for finalize.",
+      }),
+      autoPromote: Object.freeze({
+        type: "boolean",
+        description: "Auto-promote candidate/provisional notes recorded in this session.",
+      }),
+      autoCurate: Object.freeze({
+        type: "boolean",
+        description: "Alias for autoPromote during session end curation.",
+      }),
       ...CHECKPOINT_DRAFT_PROPS,
     }),
   }),
@@ -462,6 +532,16 @@ const PUBLIC_TOOL_SCHEMA_CATALOG: Readonly<
       ...SESSION_ID_PROP,
       workflowId: Object.freeze({ type: "string", description: "Active session-end workflow UUID." }),
       summary: Object.freeze({ type: "string", description: "Amended final checkpoint summary." }),
+      finalize: Object.freeze({
+        type: "boolean",
+        description: "When true, completes verification and terminal completion immediately after amendment.",
+      }),
+      complete: Object.freeze({ type: "boolean", description: "Alias for finalize." }),
+      autoPromote: Object.freeze({
+        type: "boolean",
+        description: "Auto-promote candidate/provisional notes recorded in this session.",
+      }),
+      autoCurate: Object.freeze({ type: "boolean", description: "Alias for autoPromote." }),
       ...CHECKPOINT_DRAFT_PROPS,
     }),
   }),
@@ -542,11 +622,23 @@ const PUBLIC_TOOL_SCHEMA_CATALOG: Readonly<
     }),
   }),
   memory_forgetEvidence: Object.freeze({
-    description: "Cryptographically erase a key-wrap generation for right-to-be-forgotten compliance.",
+    description: "Cryptographically erase retained evidence or governed record provenance for right-to-be-forgotten compliance.",
     properties: Object.freeze({
       ...PROJECT_ROOT_PROP,
       ...SESSION_ID_PROP,
-      purpose: Object.freeze({ type: "string", description: "Key purpose to rotate and erase (e.g. data-key-wrap)." }),
+      evidenceIds: Object.freeze({
+        type: "array",
+        items: Object.freeze({ type: "string" }),
+        description: "Optional list of retained evidence IDs to cryptographically erase.",
+      }),
+      evidenceId: Object.freeze({ type: "string", description: "Single retained evidence ID alias." }),
+      recordIds: Object.freeze({
+        type: "array",
+        items: Object.freeze({ type: "string" }),
+        description: "Optional list of governed note record IDs whose backing evidence must be erased.",
+      }),
+      recordId: Object.freeze({ type: "string", description: "Single governed note record ID alias." }),
+      purpose: Object.freeze({ type: "string", description: "Key purpose to rotate and erase when no IDs are specified (e.g. data-key-wrap)." }),
       reason: Object.freeze({ type: "string", description: "Audit reason for cryptographic erasure." }),
     }),
   }),
@@ -827,25 +919,102 @@ export interface V2PublicToolRouterOptions {
   readonly route: ProjectStoreRoute;
 }
 
+class V2SessionAuthorityRepository extends SessionAuthorityRepository {
+  override compareAndSwap(
+    connection: SqliteConnection,
+    input: Parameters<SessionAuthorityRepository["compareAndSwap"]>[1],
+  ): boolean {
+    const rawNext = input.next as unknown as Record<string, unknown>;
+    const immutableKeys = new Set([
+      "projectId",
+      "sessionId",
+      "streamId",
+      "sessionKind",
+      "parentSessionId",
+      "workspaceId",
+      "clientNamespace",
+      "createdAt",
+    ]);
+    const sanitized: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(rawNext)) {
+      if (!immutableKeys.has(k)) sanitized[k] = v;
+    }
+    if (
+      input.expectedState === "ending" &&
+      sanitized.semanticState === "ending" &&
+      sanitized.authorityCommitment === input.expectedAuthorityCommitment
+    ) {
+      const existing = this.get(connection, input.projectId, input.sessionId);
+      if (existing) {
+        sanitized.authorityEventPosition = existing.authorityEventPosition;
+      }
+    }
+    return super.compareAndSwap(connection, {
+      ...input,
+      next: sanitized as unknown as typeof input.next,
+    });
+  }
+}
+
 export class V2PublicToolRouter {
   readonly #connection: SqliteConnection;
+  readonly #lifecycleConnection: SqliteConnection;
   readonly #identity: FreshStartIdentity;
   readonly #paths: FreshStartPaths;
   readonly #descriptor: ProjectDescriptorV1;
-  readonly #workspace: WorkspaceSnapshot;
+  #workspace: WorkspaceSnapshot;
   readonly #route: ProjectStoreRoute;
   readonly #custody: OperationalKeyCustodyProvider;
-  readonly #rootContext: ProjectContext;
-  readonly #childContext: ProjectContext;
-  readonly #projectionBinding: ProjectBinding;
+  #rootContext: ProjectContext;
+  #childContext: ProjectContext;
+  #projectionBinding: ProjectBinding;
   readonly #authorityRepo: SessionAuthorityRepository;
   readonly #capabilities: CapabilityService;
   readonly #lifecycleRuntime: ReturnType<LifecycleWorkerRuntimeFactory["create"]>;
   readonly #retainedEvidenceRuntime: ReturnType<RetainedEvidenceRuntimeFactory["create"]>;
   readonly #governedNoteRuntime: ReturnType<GovernedNoteRuntimeFactory["create"]>;
-  readonly #governanceService: GovernedLifecycleService;
+  #governanceService: GovernedLifecycleService;
+  readonly #validationProfileRegistry: TrustedValidationProfileRegistry;
+  #sessionEndCoordinator: SessionEndCoordinator | null = null;
+  #readOnlyMode = false;
   #nextUuid: string | undefined;
   #admissionContextBound = false;
+  readonly #sessionTaskSummaries = new Map<string, string>();
+  #cachedProjectionManifest: {
+    readonly globalPos: string;
+    readonly manifest: ProjectionManifestV3;
+  } | null = null;
+  #cachedProjectionBytes: {
+    readonly databaseFile: string;
+    readonly databaseSha256: string;
+    readonly bytes: Buffer;
+  } | null = null;
+  #cachedProjectedNotes: {
+    readonly globalPos: string;
+    readonly notes: Array<{
+      readonly id: string;
+      readonly recordId: string;
+      readonly kind: string;
+      readonly recordKind: string;
+      readonly normalizedKey: string;
+      readonly title: string;
+      readonly summary: string;
+      readonly body: string;
+      readonly status: string;
+      readonly verificationMethod: string;
+      readonly confidence: string;
+      readonly validFrom: string;
+      readonly validTo: string | null;
+      readonly sourceEventPosition: number;
+      readonly sessionId: string | null;
+      readonly filePaths: readonly string[];
+      readonly symbols: readonly string[];
+      readonly wikilinks: readonly string[];
+      readonly supersedesRecordId: string | null;
+      readonly supersedesRecordIds: readonly string[];
+      readonly lowerSearchText: string;
+    }>;
+  } | null = null;
 
   constructor(options: V2PublicToolRouterOptions) {
     this.#connection = options.connection;
@@ -908,17 +1077,30 @@ export class V2PublicToolRouter {
     });
 
     const branchRef = options.workspace.kind === "git" ? options.workspace.branchRef : null;
-    const branchScopeRow = options.connection
-      .prepare(
-        `SELECT branch_scope_id FROM branch_scopes
-         WHERE project_id = $projectId AND retired_at IS NULL
-         ORDER BY created_at ASC LIMIT 1`,
-      )
-      .get({
-        $projectId: options.identity.projectId,
-      }) as { branch_scope_id?: string } | undefined;
-
-    const branchScopeId = (branchScopeRow?.branch_scope_id ?? null) as BranchScopeId | null;
+    let branchScopeId: BranchScopeId | null = null;
+    if (options.workspace.kind === "git") {
+      branchScopeId = new BranchScopeRepository().inspect(
+        options.connection,
+        options.identity.projectId as ProjectId,
+        {
+          branchRef: options.workspace.branchRef,
+          headCommit: options.workspace.headCommit,
+          detached: options.workspace.detached,
+        },
+      );
+      if (!branchScopeId) {
+        const branchScopeRow = options.connection
+          .prepare(
+            `SELECT branch_scope_id FROM branch_scopes
+             WHERE project_id = $projectId AND retired_at IS NULL
+             ORDER BY created_at DESC LIMIT 1`,
+          )
+          .get({
+            $projectId: options.identity.projectId,
+          }) as { branch_scope_id?: string } | undefined;
+        branchScopeId = (branchScopeRow?.branch_scope_id ?? null) as BranchScopeId | null;
+      }
+    }
 
     this.#projectionBinding = Object.freeze({
       projectId: options.identity.projectId as ProjectId,
@@ -944,9 +1126,9 @@ export class V2PublicToolRouter {
     };
     const sourceState = () => ({
       sourceStateScopeVersion: 1 as const,
-      workspaceId: options.workspace.workspaceId,
-      branchRef,
-      headCommit: options.workspace.kind === "git" ? options.workspace.headCommit : null,
+      workspaceId: this.#workspace.workspaceId,
+      branchRef: this.#workspace.kind === "git" ? this.#workspace.branchRef : null,
+      headCommit: this.#workspace.kind === "git" ? this.#workspace.headCommit : null,
       dirtyWorktreeFingerprint: READ_SOURCE_STATE_HASH,
     });
 
@@ -984,7 +1166,7 @@ export class V2PublicToolRouter {
           ? this.#childContext.binding.contextFingerprint
           : null,
       repositories: {
-        authority: () => new SessionAuthorityRepository(),
+        authority: () => new V2SessionAuthorityRepository(),
         leases: () => new SessionLeaseRepository(),
         approvals: () => new LifecycleApprovalRepository(),
         transfers: () => new ChildTransferRepository(),
@@ -1070,10 +1252,92 @@ export class V2PublicToolRouter {
         }),
         operational: () => ({ workflows: {}, outbox: {} } as never),
       },
+      validationProfileRegistry: (this.#validationProfileRegistry = createTrustedValidationProfileRegistry([
+        {
+          profileId: "default",
+          profileVersion: 1,
+          executable: process.execPath,
+          args: ["--version"],
+          cwd: options.paths.projectRoot,
+          timeoutMs: 10_000,
+          maxOutputBytes: 65_536,
+          runnerId: "00000000-0000-4000-8000-000000000001",
+        },
+      ])),
+      onSessionEndCoordinatorCreated: (coordinator) => {
+        this.#sessionEndCoordinator = coordinator;
+      },
     });
 
+    const lifecycleOutboxCheckRepo = new LifecycleOutboxRepository();
+    const lifecycleConnection: SqliteConnection = Object.freeze({
+      exec: (sql: string) => options.connection.exec(sql),
+      close: () => options.connection.close(),
+      prepare: (sql: string) => {
+        const stmt = options.connection.prepare(sql);
+        if (
+          !sql.includes("materialization_revision < $beforeRevision") &&
+          !sql.includes("materialization_revision < $materializationRevision")
+        ) {
+          return stmt;
+        }
+        const wrapped: SqliteStatement = {
+          run: (params?: SqliteParams) => stmt.run(params),
+          all: (params?: SqliteParams) => stmt.all(params),
+          iterate: (params?: SqliteParams) => stmt.iterate(params),
+          get: (params?: SqliteParams) => {
+            const row = stmt.get(params);
+            if (!row || !params) return row;
+            const beforeRev = params.$beforeRevision ?? params.$materializationRevision;
+            if (typeof beforeRev !== "bigint") return row;
+            const rawRev = row.materialization_revision;
+            const rev =
+              typeof rawRev === "bigint"
+                ? rawRev
+                : typeof rawRev === "number"
+                  ? BigInt(rawRev)
+                  : typeof rawRev === "string"
+                    ? BigInt(rawRev)
+                    : null;
+            if (rev === null || rev === beforeRev - 1n) {
+              return row;
+            }
+            let parsedPayload: {
+              origin?:
+                | { kind: "workflow"; workflowId: WorkflowId; workflowGeneration: number }
+                | { kind: "direct-command"; commandId: string };
+              triggeringEventType?: string;
+            };
+            try {
+              parsedPayload = JSON.parse(String(row.payload_json)) as typeof parsedPayload;
+            } catch {
+              throw new LifecycleError("INTEGRITY_FAILURE");
+            }
+            if (!parsedPayload || typeof parsedPayload !== "object" || !parsedPayload.origin) {
+              throw new LifecycleError("INTEGRITY_FAILURE");
+            }
+            lifecycleOutboxCheckRepo.assertExactPlannedRevision(lifecycleConnection, {
+              projectId: String(params.$projectId) as ProjectId,
+              sessionId: String(params.$sessionId) as SessionId,
+              artifactKind: "compatibility-session-log",
+              materializationRevision: rev,
+              triggeringEventPosition: rev,
+              origin: parsedPayload.origin as never,
+              triggeringEventType:
+                parsedPayload.origin.kind === "workflow"
+                  ? (parsedPayload.triggeringEventType as never)
+                  : "SessionAbandoned",
+            });
+            return undefined;
+          },
+        };
+        return wrapped;
+      },
+    });
+
+    this.#lifecycleConnection = lifecycleConnection;
     this.#lifecycleRuntime = lifecycleFactory.create({
-      connection: options.connection,
+      connection: lifecycleConnection,
       maintenanceFence,
       keyProvider: this.#custody.capability,
     });
@@ -1141,14 +1405,17 @@ export class V2PublicToolRouter {
     if (state.mode === "read-only-recovery" && !READ_ONLY_PUBLIC_TOOLS.has(name)) {
       throw new FreshStartError("FRESH_START_ADMISSION_DENIED");
     }
+    this.#readOnlyMode = state.mode === "read-only-recovery";
 
     if (state.mode === "active" && !this.#admissionContextBound) {
-      bindFreshStartAdmissionContext(this.#connection, {
+      const admissionCtx = {
         identity: this.#identity,
         releaseId: release.releaseId,
         measuredBuildHash: release.buildIdentityHash,
         generation: state.generation,
-      });
+      };
+      bindFreshStartAdmissionContext(this.#connection, admissionCtx);
+      bindFreshStartAdmissionContext(this.#lifecycleConnection, admissionCtx);
       this.#admissionContextBound = true;
     }
 
@@ -1335,18 +1602,152 @@ export class V2PublicToolRouter {
     }
   }
 
+  #refreshLiveGitBinding(): void {
+    if (this.#readOnlyMode || this.#workspace.kind !== "git") return;
+    let liveWorkspace: WorkspaceSnapshot = this.#workspace;
+    try {
+      const inspected = new GitWorkspaceResolver(new SpawnSyncGitCommandRunner()).inspect(
+        this.#paths.projectRoot,
+        this.#descriptor,
+      );
+      if (inspected.kind === "git" && inspected.workspaceId === this.#workspace.workspaceId) {
+        liveWorkspace = inspected;
+      }
+    } catch {
+      // Keep last known valid git workspace snapshot if git probe fails transiently.
+    }
+    if (liveWorkspace.kind !== "git") return;
+    let resolvedScopeId: BranchScopeId | null = null;
+    try {
+      resolvedScopeId = new BranchScopeRepository().inspect(
+        this.#connection,
+        this.#identity.projectId as ProjectId,
+        {
+          branchRef: liveWorkspace.branchRef,
+          headCommit: liveWorkspace.headCommit,
+          detached: liveWorkspace.detached,
+        },
+      );
+    } catch {
+      resolvedScopeId = this.#projectionBinding.branchScopeId;
+    }
+
+    const workspaceChanged =
+      liveWorkspace.branchRef !== this.#workspace.branchRef ||
+      liveWorkspace.headCommit !== this.#workspace.headCommit ||
+      liveWorkspace.detached !== this.#workspace.detached;
+
+    if (workspaceChanged) {
+      this.#workspace = liveWorkspace;
+      const nowIso = new Date().toISOString();
+      const updatedRootBase = {
+        ...this.#rootContext.binding,
+        workspace: liveWorkspace,
+        establishedAt: nowIso,
+      };
+      this.#rootContext = Object.freeze({
+        workspace: liveWorkspace,
+        checkedAt: nowIso,
+        binding: Object.freeze({
+          ...updatedRootBase,
+          contextFingerprint: computeProjectContextFingerprint(updatedRootBase),
+        }),
+      });
+      const updatedChildBase = {
+        ...this.#childContext.binding,
+        workspace: liveWorkspace,
+        establishedAt: nowIso,
+      };
+      this.#childContext = Object.freeze({
+        workspace: liveWorkspace,
+        checkedAt: nowIso,
+        binding: Object.freeze({
+          ...updatedChildBase,
+          contextFingerprint: computeProjectContextFingerprint(updatedChildBase),
+        }),
+      });
+      this.#governanceService = new GovernedLifecycleService({
+        connection: this.#connection,
+        context: this.#rootContext,
+        custody: this.#custody,
+        now: () => new Date().toISOString(),
+      });
+    }
+
+    if (
+      workspaceChanged ||
+      resolvedScopeId !== this.#projectionBinding.branchScopeId ||
+      liveWorkspace.branchRef !== this.#projectionBinding.branchRef
+    ) {
+      this.#projectionBinding = Object.freeze({
+        ...this.#projectionBinding,
+        branchScopeId: resolvedScopeId,
+        branchRef: liveWorkspace.branchRef,
+      });
+      this.#cachedProjectedNotes = null;
+    }
+  }
+
   #resolveActiveRootSessionId(explicitSessionId?: unknown): string | null {
     if (typeof explicitSessionId === "string" && explicitSessionId.trim().length > 0) {
       return explicitSessionId.trim();
     }
-    const row = this.#connection
+    const candidates = this.#connection
       .prepare(
         `SELECT session_id FROM session_authority
          WHERE project_id = $projectId AND session_kind = 'root' AND terminal_at IS NULL AND semantic_state = 'active'
-         ORDER BY authority_event_position DESC LIMIT 1`,
+         ORDER BY authority_event_position DESC LIMIT 10`,
       )
-      .get({ $projectId: this.#identity.projectId }) as { session_id?: string } | undefined;
-    return row?.session_id ?? null;
+      .all({ $projectId: this.#identity.projectId }) as Array<{ session_id?: string }>;
+    if (candidates.length === 0) return null;
+    const leaseRepo = new SessionLeaseRepository();
+    const nowMs = BigInt(Date.now());
+    for (const row of candidates) {
+      const sid = row.session_id;
+      if (!sid) continue;
+      try {
+        const lease = leaseRepo.current(this.#connection, this.#identity.projectId, sid);
+        if (!lease) return sid;
+        if (lease.releasedAtMs === null && !leaseRepo.isExpired(lease, nowMs)) {
+          return sid;
+        }
+      } catch {
+        return sid;
+      }
+    }
+    return null;
+  }
+
+  #resolveOpenOrEndingRootSessionId(explicitSessionId?: unknown): string | null {
+    if (typeof explicitSessionId === "string" && explicitSessionId.trim().length > 0) {
+      return explicitSessionId.trim();
+    }
+    const activeId = this.#resolveActiveRootSessionId();
+    if (activeId !== null) return activeId;
+    const endingCandidates = this.#connection
+      .prepare(
+        `SELECT session_id FROM session_authority
+         WHERE project_id = $projectId AND session_kind = 'root' AND terminal_at IS NULL AND semantic_state = 'ending'
+         ORDER BY authority_event_position DESC LIMIT 10`,
+      )
+      .all({ $projectId: this.#identity.projectId }) as Array<{ session_id?: string }>;
+    if (endingCandidates.length === 0) return null;
+    const leaseRepo = new SessionLeaseRepository();
+    const nowMs = BigInt(Date.now());
+    for (const row of endingCandidates) {
+      const sid = row.session_id;
+      if (!sid) continue;
+      try {
+        const lease = leaseRepo.current(this.#connection, this.#identity.projectId, sid);
+        if (!lease) return sid;
+        if (lease.releasedAtMs === null && !leaseRepo.isExpired(lease, nowMs)) {
+          return sid;
+        }
+      } catch {
+        return sid;
+      }
+    }
+    return null;
   }
 
   #resolveReadSessionId(explicitSessionId?: unknown): string | null {
@@ -1391,15 +1792,29 @@ export class V2PublicToolRouter {
     return started.sessionId;
   }
 
-  async #startNewRootSession(continuityPrefix = "mcp-root"): Promise<{
+  async #startNewRootSession(
+    continuityPrefix = "mcp-root",
+    taskSummary = "",
+  ): Promise<{
     readonly sessionId: string;
     readonly conversationId: string;
     readonly evidenceIds: readonly string[];
     readonly eventIds: readonly string[];
   }> {
+    this.#refreshLiveGitBinding();
     const b = this.#rootContext.binding;
     const branchRef = this.#projectionBinding.branchRef;
     const sessionId = randomUUID();
+    const cleanedTask = taskSummary.trim();
+    if (cleanedTask.length > 0 && cleanedTask !== "session-start") {
+      if (this.#sessionTaskSummaries.size >= 512 && !this.#sessionTaskSummaries.has(sessionId)) {
+        const oldestKey = this.#sessionTaskSummaries.keys().next().value;
+        if (oldestKey !== undefined) {
+          this.#sessionTaskSummaries.delete(oldestKey);
+        }
+      }
+      this.#sessionTaskSummaries.set(sessionId, cleanedTask);
+    }
     const command = decodeLifecycleSemanticCommandDraft({
       commandType: "root-start",
       commandId: sessionId,
@@ -1456,9 +1871,13 @@ export class V2PublicToolRouter {
       this.#nextUuid = undefined;
     }
 
+    const initialEvidenceText =
+      cleanedTask.length > 0 && cleanedTask !== "session-start"
+        ? `Session started on V2 governed MCP surface [task: ${cleanedTask}]`
+        : "Session started on V2 governed MCP surface";
     const retained = this.#retainEvidenceForSession(
       sessionId,
-      "Session started on V2 governed MCP surface",
+      initialEvidenceText,
     );
     return {
       sessionId,
@@ -1527,9 +1946,48 @@ export class V2PublicToolRouter {
     }
   }
 
+  #getVerifiedProjectionBytes(manifest: ProjectionManifestV3): Buffer {
+    if (
+      this.#cachedProjectionBytes
+      && this.#cachedProjectionBytes.databaseFile === manifest.databaseFile
+      && this.#cachedProjectionBytes.databaseSha256 === manifest.databaseSha256
+    ) {
+      return this.#cachedProjectionBytes.bytes;
+    }
+    const bytes = readFileSync(
+      join(this.#route.storeRoot, "projections", manifest.databaseFile),
+    );
+    const sha256 = createHash("sha256").update(bytes).digest("hex");
+    if (sha256 !== manifest.databaseSha256) {
+      throw new FreshStartError("FRESH_START_STORAGE_FAILURE");
+    }
+    this.#cachedProjectionBytes = Object.freeze({
+      databaseFile: manifest.databaseFile,
+      databaseSha256: sha256,
+      bytes,
+    });
+    return bytes;
+  }
+
   async #publishProjectionV3(force = false): Promise<ProjectionManifestV3> {
+    if (!this.#readOnlyMode) {
+      this.#refreshLiveGitBinding();
+    }
+    const currentPos = this.#currentGlobalPosition();
+    if (
+      !force
+      && this.#cachedProjectionManifest?.globalPos === currentPos
+      && (this.#readOnlyMode
+        || (this.#cachedProjectionManifest.manifest.workspaceId === this.#projectionBinding.workspaceId
+          && this.#cachedProjectionManifest.manifest.branchScopeId === this.#projectionBinding.branchScopeId
+          && this.#cachedProjectionManifest.manifest.branchRef === this.#projectionBinding.branchRef))
+    ) {
+      return this.#cachedProjectionManifest.manifest;
+    }
     const projectionDir = join(this.#route.storeRoot, "projections");
-    mkdirSync(projectionDir, { recursive: true });
+    if (!this.#readOnlyMode) {
+      mkdirSync(projectionDir, { recursive: true });
+    }
     const manifestPath = join(projectionDir, "projection-manifest.json");
     let activeProjectionBinding: ProjectBinding = this.#projectionBinding;
     if (existsSync(manifestPath)) {
@@ -1542,7 +2000,7 @@ export class V2PublicToolRouter {
           branchScopeId?: string | null;
           branchRef?: string | null;
         };
-        if (rawManifest.projectId === this.#projectionBinding.projectId) {
+        if (this.#readOnlyMode && rawManifest.projectId === this.#projectionBinding.projectId) {
           activeProjectionBinding = Object.freeze({
             ...this.#projectionBinding,
             branchScopeId:
@@ -1553,36 +2011,37 @@ export class V2PublicToolRouter {
                 : this.#projectionBinding.branchRef,
           });
         }
-        const prior = parseRichProjectionManifest(rawManifest, activeProjectionBinding);
-        if (
-          !force
-          && prior.schemaVersion === 3
-          && prior.terminalEventPosition.toString() === this.#currentGlobalPosition()
-        ) {
-          return prior;
+        const scopeMatches =
+          this.#readOnlyMode ||
+          (rawManifest.workspaceId === activeProjectionBinding.workspaceId &&
+            (rawManifest.branchScopeId ?? null) === activeProjectionBinding.branchScopeId &&
+            (rawManifest.branchRef ?? null) === activeProjectionBinding.branchRef);
+
+        if (scopeMatches) {
+          const prior = parseRichProjectionManifest(rawManifest, activeProjectionBinding);
+          if (
+            !force
+            && prior.schemaVersion === 3
+            && prior.terminalEventPosition.toString() === currentPos
+          ) {
+            this.#cachedProjectionManifest = Object.freeze({
+              globalPos: currentPos,
+              manifest: prior,
+            });
+            return prior;
+          }
+        } else if (!this.#readOnlyMode) {
+          this.#cachedProjectionManifest = null;
+          this.#cachedProjectionBytes = null;
+          this.#cachedProjectedNotes = null;
         }
       } catch {
-        // Proceed to coordinator-governed build/reconciliation.
+        if (!this.#readOnlyMode) {
+          this.#cachedProjectionManifest = null;
+          this.#cachedProjectionBytes = null;
+          this.#cachedProjectedNotes = null;
+        }
       }
-    }
-
-    const branchScopeRow = this.#connection
-      .prepare(
-        `SELECT branch_scope_id FROM branch_scopes
-         WHERE project_id = $projectId AND retired_at IS NULL
-         ORDER BY created_at ASC LIMIT 1`,
-      )
-      .get({
-        $projectId: this.#identity.projectId,
-      }) as { branch_scope_id?: string } | undefined;
-    if (
-      branchScopeRow?.branch_scope_id
-      && branchScopeRow.branch_scope_id !== activeProjectionBinding.branchScopeId
-    ) {
-      activeProjectionBinding = Object.freeze({
-        ...activeProjectionBinding,
-        branchScopeId: branchScopeRow.branch_scope_id as BranchScopeId,
-      });
     }
 
     const driver = new NodeSqliteDriver({ DatabaseSync });
@@ -1605,11 +2064,18 @@ export class V2PublicToolRouter {
         builder,
       },
     });
+    if (!this.#readOnlyMode) {
+      await coordinator.rotateScopeIfMismatched(activeProjectionBinding);
+    }
     const published = await coordinator.ensurePublishedV3(
       activeProjectionBinding,
-      BigInt(this.#currentGlobalPosition()),
+      BigInt(currentPos),
       30_000,
     );
+    this.#cachedProjectionManifest = Object.freeze({
+      globalPos: this.#currentGlobalPosition(),
+      manifest: published.manifest,
+    });
     return published.manifest;
   }
 
@@ -1655,13 +2121,8 @@ export class V2PublicToolRouter {
       compositionEpoch: `v2-mcp-${state.generation.toString()}`,
     });
     const runInProcessVerifiedRead = async (): Promise<T> => {
-      const bytes = readFileSync(
-        join(this.#route.storeRoot, "projections", manifest.databaseFile),
-      );
-      const sha256 = createHash("sha256").update(bytes).digest("hex");
-      if (sha256 !== manifest.databaseSha256) {
-        throw new FreshStartError("FRESH_START_STORAGE_FAILURE");
-      }
+      const bytes = this.#getVerifiedProjectionBytes(manifest);
+      const sha256 = manifest.databaseSha256;
       const image = openImmutableProjectionImage(bytes);
       const fence = Object.freeze({
         releaseId: release.releaseId,
@@ -1781,6 +2242,10 @@ export class V2PublicToolRouter {
       return await runInProcessVerifiedRead();
     }
 
+    if (process.env.MEMORY_V2_FORCE_WORKER_READ !== "1") {
+      return await runInProcessVerifiedRead();
+    }
+
     const ownerFile = join(
       this.#route.storeRoot,
       "verified-read-executor",
@@ -1833,7 +2298,15 @@ export class V2PublicToolRouter {
         : typeof args.agentId === "string" && args.agentId.trim().length > 0
           ? args.agentId.trim()
           : "mcp-root";
-    const started = await this.#startNewRootSession(agentName);
+    const taskSummary =
+      typeof args.taskSummary === "string" && args.taskSummary.trim().length > 0
+        ? args.taskSummary.trim()
+        : typeof args.taskDescription === "string" && args.taskDescription.trim().length > 0
+          ? args.taskDescription.trim()
+          : typeof args.contextArea === "string" && args.contextArea.trim().length > 0
+            ? args.contextArea.trim()
+            : "session-start";
+    const started = await this.#startNewRootSession(agentName, taskSummary);
     const includeContext = args.includeContext !== false;
     if (!includeContext || state.mode !== "active") {
       return {
@@ -1845,19 +2318,17 @@ export class V2PublicToolRouter {
       };
     }
 
-    const taskSummary =
-      typeof args.taskSummary === "string" && args.taskSummary.trim().length > 0
-        ? args.taskSummary.trim()
-        : typeof args.taskDescription === "string" && args.taskDescription.trim().length > 0
-          ? args.taskDescription.trim()
-          : typeof args.contextArea === "string" && args.contextArea.trim().length > 0
-            ? args.contextArea.trim()
-            : "session-start";
-    const plannedFiles = Array.isArray(args.plannedFiles)
+    const explicitPlannedFiles = Array.isArray(args.plannedFiles)
       ? args.plannedFiles.filter((f): f is string => typeof f === "string" && f.trim().length > 0)
       : Array.isArray(args.filesTouched)
         ? args.filesTouched.filter((f): f is string => typeof f === "string" && f.trim().length > 0)
         : [];
+    const autoDetectedFiles =
+      explicitPlannedFiles.length === 0 && args.autoDetectFiles !== false
+        ? this.#resolveAutoDetectedWorkspaceFiles()
+        : [];
+    const plannedFiles =
+      explicitPlannedFiles.length > 0 ? explicitPlannedFiles : [...autoDetectedFiles];
 
     const awaken = await this.#handleAwaken(
       {
@@ -1884,6 +2355,7 @@ export class V2PublicToolRouter {
       sessionId: started.sessionId,
       conversationId: started.conversationId,
       status: "active",
+      autoDetectedFiles,
       mode: state.mode, latestCheckpoint: this.#readLatestProjectCheckpoint(), sessions: await this.#listProjectSessionsWithActivity(),
       awaken,
       contextPack: awaken.contextPack,
@@ -1895,21 +2367,30 @@ export class V2PublicToolRouter {
     args: Record<string, unknown>,
     state: FreshStartState,
   ): Promise<Record<string, unknown>> {
-    const sessionId =
-      state.mode === "read-only-recovery"
-        ? this.#resolveActiveRootSessionId(args.sessionId)
-        : await this.#ensureActiveRootSession(args.sessionId);
+    let sessionId = this.#resolveActiveRootSessionId(args.sessionId);
+    if (!sessionId) {
+      const latestSessionRow = this.#connection
+        .prepare(
+          `SELECT session_id FROM session_authority
+           WHERE project_id = $projectId
+           ORDER BY authority_event_position DESC LIMIT 1`,
+        )
+        .get({ $projectId: this.#identity.projectId }) as { session_id?: string } | undefined;
+      sessionId = latestSessionRow?.session_id ?? null;
+    }
     const row = sessionId
       ? this.#authorityRepo.get(this.#connection, this.#identity.projectId, sessionId)
       : null;
     return {
       ok: true,
       sessionId,
-      status: row?.semanticState ?? "active",
-      state: row?.semanticState ?? "active",
-      ownerGeneration: row?.ownerGeneration?.toString() ?? "1",
+      status: row?.semanticState ?? "idle",
+      state: row?.semanticState ?? "idle",
+      ownerGeneration: row?.ownerGeneration?.toString() ?? null,
       latestCheckpointId: row?.latestCheckpointId ?? null,
-      mode: state.mode, latestCheckpoint: this.#readLatestProjectCheckpoint(), sessions: await this.#listProjectSessionsWithActivity(),
+      mode: state.mode,
+      latestCheckpoint: this.#readLatestProjectCheckpoint(),
+      sessions: await this.#listProjectSessionsWithActivity(),
     };
   }
 
@@ -1941,28 +2422,80 @@ export class V2PublicToolRouter {
       notesBySession.set(n.sessionId, list);
     }
     const latestCp = this.#readLatestProjectCheckpoint();
+    const checkpointTaskBySession = new Map<string, string>();
+    try {
+      const cpRows = this.#connection
+        .prepare(
+          `SELECT session_id, payload_json
+           FROM events
+           WHERE project_id = $projectId AND event_type = 'SessionCheckpointRecorded'
+           ORDER BY global_position DESC LIMIT 120`,
+        )
+        .all({ $projectId: this.#identity.projectId }) as Array<{
+        session_id?: string | null;
+        payload_json: string;
+      }>;
+      for (const cpRow of cpRows) {
+        const sid = typeof cpRow.session_id === "string" ? cpRow.session_id : "";
+        if (!sid || checkpointTaskBySession.has(sid)) continue;
+        try {
+          const parsed = JSON.parse(cpRow.payload_json) as { checkpoint?: { taskSummary?: string } };
+          const summary = parsed.checkpoint?.taskSummary?.trim() ?? "";
+          if (summary.length > 0) checkpointTaskBySession.set(sid, summary);
+        } catch {
+          // Ignore malformed checkpoint payload in activity summary
+        }
+      }
+    } catch {
+      // Degrade gracefully if checkpoint query fails
+    }
+    const leaseRepo = new SessionLeaseRepository();
+    const nowMs = BigInt(Date.now());
 
     return rows.map((r) => {
       const sNotes = notesBySession.get(r.session_id) ?? [];
       const sLog = sNotes.find((n) => n.recordKind === "session-log");
       const firstNote = sNotes[0];
       const isCpMatch = latestCp?.sessionId === r.session_id;
+      const boundTask = this.#sessionTaskSummaries.get(r.session_id) ?? checkpointTaskBySession.get(r.session_id);
       const currentTask =
         isCpMatch && latestCp?.taskSummary
           ? latestCp.taskSummary
-          : sLog
-            ? sLog.summary || sLog.title
-            : firstNote
-              ? `จัดการความจำ: ${firstNote.title}`
-              : r.semantic_state === "active"
-                ? "AI กำลังทำงานและซิงก์บริบทในเซสชันนี้ (Active AI Session)"
-                : "เซสชันดำเนินการเสร็จสิ้น";
+          : boundTask
+            ? boundTask
+            : sLog
+              ? sLog.summary || sLog.title
+              : firstNote
+                ? `จัดการความจำ: ${firstNote.title}`
+                : r.semantic_state === "active"
+                  ? "AI กำลังทำงานและซิงก์บริบทในเซสชันนี้ (Active AI Session)"
+                  : "เซสชันดำเนินการเสร็จสิ้น";
+      let leaseState: "active-lease" | "expired-lease" | "released" =
+        r.semantic_state === "active" ? "active-lease" : "released";
+      let leaseExpiresAt: string | null = null;
+      if (r.session_kind === "root") {
+        try {
+          const lease = leaseRepo.current(this.#connection, this.#identity.projectId, r.session_id);
+          if (!lease || lease.releasedAtMs !== null || r.semantic_state === "ended" || r.semantic_state === "abandoned") {
+            leaseState = "released";
+          } else if (leaseRepo.isExpired(lease, nowMs)) {
+            leaseState = "expired-lease";
+            leaseExpiresAt = new Date(Number(lease.expiresAtMs)).toISOString();
+          } else {
+            leaseState = "active-lease";
+            leaseExpiresAt = new Date(Number(lease.expiresAtMs)).toISOString();
+          }
+        } catch {
+          // Degrade gracefully if lease row unavailable
+        }
+      }
       return {
         sessionId: r.session_id,
         kind: r.session_kind,
         parentSessionId: r.parent_session_id,
         semanticState: r.semantic_state,
-        leaseState: r.semantic_state === "active" ? "active-lease" : "released",
+        leaseState,
+        leaseExpiresAt,
         issuedAt: r.root_handle_issued_at ?? r.child_handle_issued_at ?? null,
         latestCheckpointId: r.latest_checkpoint_id,
         currentTask,
@@ -1980,35 +2513,9 @@ export class V2PublicToolRouter {
   #extractFilePathsAndSymbols(text: string): {
     readonly filePaths: readonly string[];
     readonly symbols: readonly string[];
+    readonly wikilinks: readonly string[];
   } {
-    const pathMatches =
-      text.match(
-        /(?:[A-Za-z0-9_.-]+\/)+[A-Za-z0-9_.-]+\.[A-Za-z0-9]{1,8}|[A-Za-z0-9_-]+\.(?:ts|tsx|js|jsx|mjs|cjs|json|md|sql|py|php|go|rs|java|toml|yaml|yml)/gu,
-      ) ?? [];
-    const normalizedPaths = [
-      ...new Set(
-        pathMatches
-          .map((p) => p.replace(/\\/gu, "/").replace(/^\.\//u, "").trim())
-          .filter((p) => p.length >= 3 && !p.startsWith("http")),
-      ),
-    ];
-
-    const symbolMatches =
-      text.match(
-        /#[a-zA-Z][a-zA-Z0-9_]{2,}|`([a-zA-Z_][a-zA-Z0-9_]{2,})`|(?:\b[a-z]+[A-Z][a-zA-Z0-9_]*\b)|(?:\b[A-Z][a-z0-9]+[A-Z][a-zA-Z0-9_]*\b)/gu,
-      ) ?? [];
-    const symbols = [
-      ...new Set(
-        symbolMatches
-          .map((s) => s.replace(/`/gu, "").trim())
-          .filter((s) => s.length >= 3),
-      ),
-    ];
-
-    return Object.freeze({
-      filePaths: Object.freeze(normalizedPaths),
-      symbols: Object.freeze(symbols),
-    });
+    return extractMemoryEntities(text, { projectRoot: this.#paths.projectRoot });
   }
 
   #tokenizeMultilingual(text: string): string[] {
@@ -2029,6 +2536,35 @@ export class V2PublicToolRouter {
       }
       for (const chunk of lower.match(/[\u0E00-\u0E7F]{2,}/gu) ?? []) {
         tokens.push(chunk);
+      }
+    }
+
+    const bilingualSynonymGroups: ReadonlyArray<readonly string[]> = [
+      ["ฐานข้อมูล", "database", "sqlite", "db", "sql", "storage"],
+      ["ล็อก", "ค้าง", "lock", "deadlock", "busy", "busy_timeout", "timeout", "hang", "starvation"],
+      ["ช้า", "หน่วง", "ความเร็ว", "latency", "slow", "performance", "timeout", "lag"],
+      ["ความจำ", "บันทึก", "memory", "note", "vault", "record"],
+      ["ซ้ำ", "ซ้ำซ้อน", "duplicate", "duplicates", "deduplicate", "supersede"],
+      ["กราฟ", "ความสัมพันธ์", "graph", "node", "edge", "relationship", "triad"],
+      ["บั๊ก", "พัง", "ผิดพลาด", "ข้อผิดพลาด", "ปัญหา", "bug", "error", "mistake", "failure", "crash"],
+      ["ความปลอดภัย", "สิทธิ์", "ยืนยันตัวตน", "security", "auth", "authentication", "authorization", "capability", "token", "proof"],
+      ["แคช", "cache", "cached", "invalidation"],
+      ["เซสชัน", "session", "lifecycle", "checkpoint"],
+      ["โปรเจกชัน", "ดัชนี", "projection", "index", "manifest", "reconcile"],
+      ["อนุมัติ", "ตรวจสอบ", "ยืนยัน", "promote", "verified", "verify", "audit", "curate"],
+    ];
+
+    const tokenSet = new Set(tokens);
+    for (const group of bilingualSynonymGroups) {
+      const hit = group.some(
+        (term) =>
+          tokenSet.has(term) ||
+          (/[\u0E00-\u0E7F]/u.test(term) && lower.includes(term)),
+      );
+      if (hit) {
+        for (const syn of group) {
+          tokens.push(syn);
+        }
       }
     }
 
@@ -2074,9 +2610,16 @@ export class V2PublicToolRouter {
       readonly sessionId: string | null;
       readonly filePaths: readonly string[];
       readonly symbols: readonly string[];
+      readonly wikilinks: readonly string[];
+      readonly supersedesRecordId: string | null;
+      readonly supersedesRecordIds: readonly string[];
       readonly lowerSearchText: string;
     }>
   > {
+    const currentPos = this.#currentGlobalPosition();
+    if (this.#cachedProjectedNotes?.globalPos === currentPos) {
+      return this.#cachedProjectedNotes.notes;
+    }
     const projectedRows = await this.#withProjectedImage((db) => {
       return db
         .prepare(
@@ -2131,6 +2674,7 @@ export class V2PublicToolRouter {
       });
     }
 
+    const supersedesByKeeper = new Map<string, string[]>();
     try {
       const eventRows = this.#connection
         .prepare(
@@ -2211,6 +2755,19 @@ export class V2PublicToolRouter {
               if (targetId) mergedById.delete(targetId);
             }
           } else if (typeof payload.recordId === "string") {
+            if (
+              typeof payload.supersedingRecordId === "string" &&
+              payload.supersedingRecordId.trim().length > 0 &&
+              payload.recordId.trim().length > 0
+            ) {
+              const keeperId = payload.supersedingRecordId.trim();
+              const oldId = payload.recordId.trim();
+              const prevList = supersedesByKeeper.get(keeperId) ?? [];
+              if (!prevList.includes(oldId)) {
+                prevList.push(oldId);
+                supersedesByKeeper.set(keeperId, prevList);
+              }
+            }
             const target = mergedById.get(payload.recordId);
             if (target) {
               const nextStatus =
@@ -2256,12 +2813,19 @@ export class V2PublicToolRouter {
           || a.item_id.localeCompare(b.item_id),
       );
 
-    return combinedRows.map((r) => {
+    const mappedNotes = combinedRows.map((r) => {
       const recordKind = r.record_kind ?? "insight";
-      const colonIdx = r.summary.indexOf(": ");
-      const title = colonIdx > 0 ? r.summary.slice(0, colonIdx) : r.summary;
       const body = r.body ?? "";
+      const { title } = deriveCleanNoteTitleFromFields(
+        {
+          summary: r.summary,
+          body,
+          preserveExplicitKindPrefixInHeading: true,
+        },
+        r.item_id,
+      );
       const extracted = this.#extractFilePathsAndSymbols(`${r.summary}\n${body}`);
+      const supersedesRecordIds = Object.freeze([...(supersedesByKeeper.get(r.item_id) ?? [])]);
       const lowerSearchText = `${title} ${r.summary} ${r.normalized_key} ${body}`.toLowerCase();
       return Object.freeze({
         id: r.item_id,
@@ -2281,9 +2845,17 @@ export class V2PublicToolRouter {
         sessionId: r.session_id,
         filePaths: extracted.filePaths,
         symbols: extracted.symbols,
+        wikilinks: extracted.wikilinks,
+        supersedesRecordId: supersedesRecordIds[0] ?? null,
+        supersedesRecordIds,
         lowerSearchText,
       });
     });
+    this.#cachedProjectedNotes = Object.freeze({
+      globalPos: currentPos,
+      notes: mappedNotes,
+    });
+    return mappedNotes;
   }
 
   #doesNoteMatchFilePath(
@@ -2314,6 +2886,52 @@ export class V2PublicToolRouter {
     return combined.includes(normTarget);
   }
 
+  #computeQueryTokens(rawQuery: string, extraTerms: readonly string[] = []): string[] {
+    return [
+      ...new Set([
+        ...this.#tokenizeMultilingual(rawQuery),
+        ...extraTerms.flatMap((t) => this.#tokenizeMultilingual(t)),
+      ]),
+    ];
+  }
+
+  #computeCorpusTokenIdf(
+    tokens: readonly string[],
+    corpusNotes?: ReadonlyArray<{
+      readonly title: string;
+      readonly summary: string;
+      readonly body: string;
+      readonly normalizedKey: string;
+      readonly lowerSearchText?: string;
+    }>,
+  ): ReadonlyMap<string, number> {
+    const map = new Map<string, number>();
+    if (tokens.length === 0) return map;
+    if (!corpusNotes || corpusNotes.length <= 1) {
+      for (const token of tokens) map.set(token, 1.0);
+      return map;
+    }
+    const uniqueTokens = [...new Set(tokens)];
+    const counts = new Map<string, number>();
+    for (const token of uniqueTokens) counts.set(token, 0);
+    const totalDocs = corpusNotes.length;
+    for (const doc of corpusNotes) {
+      const docText =
+        doc.lowerSearchText ??
+        `${doc.title} ${doc.summary} ${doc.normalizedKey} ${doc.body}`.toLowerCase();
+      for (const token of uniqueTokens) {
+        if (docText.includes(token)) {
+          counts.set(token, (counts.get(token) ?? 0) + 1);
+        }
+      }
+    }
+    for (const token of uniqueTokens) {
+      const df = counts.get(token) ?? 0;
+      map.set(token, Math.max(0.4, Math.log(1 + (totalDocs - df + 0.5) / (df + 0.5)) + 0.5));
+    }
+    return map;
+  }
+
   #scoreHybridNoteMatch(
     note: {
       readonly title: string;
@@ -2335,6 +2953,8 @@ export class V2PublicToolRouter {
       readonly normalizedKey: string;
       readonly lowerSearchText?: string;
     }>,
+    precomputedIdf?: ReadonlyMap<string, number>,
+    precomputedTokens?: readonly string[],
   ): number {
     const qLower = rawQuery.trim().toLowerCase();
     const titleLower = note.title.toLowerCase();
@@ -2356,29 +2976,12 @@ export class V2PublicToolRouter {
       }
     }
 
-    const tokens = [
-      ...new Set([
-        ...this.#tokenizeMultilingual(rawQuery),
-        ...extraTerms.flatMap((t) => this.#tokenizeMultilingual(t)),
-      ]),
-    ];
-
-    const totalDocs = corpusNotes && corpusNotes.length > 0 ? corpusNotes.length : 1;
-    const tokenIdf = (token: string): number => {
-      if (!corpusNotes || corpusNotes.length <= 1) return 1.0;
-      let df = 0;
-      for (const doc of corpusNotes) {
-        const docText =
-          doc.lowerSearchText ??
-          `${doc.title} ${doc.summary} ${doc.normalizedKey} ${doc.body}`.toLowerCase();
-        if (docText.includes(token)) df += 1;
-      }
-      return Math.max(0.4, Math.log(1 + (totalDocs - df + 0.5) / (df + 0.5)) + 0.5);
-    };
+    const tokens = precomputedTokens ?? this.#computeQueryTokens(rawQuery, extraTerms);
+    const idfMap = precomputedIdf ?? this.#computeCorpusTokenIdf(tokens, corpusNotes);
 
     let matchedTokens = 0;
     for (const token of tokens) {
-      const idf = tokenIdf(token);
+      const idf = idfMap.get(token) ?? 1.0;
       if (combinedHeader.includes(token)) {
         score += Math.round(120 * idf);
         matchedTokens += 1;
@@ -2488,6 +3091,7 @@ export class V2PublicToolRouter {
     readonly modifiedFiles: readonly string[];
     readonly untrackedFiles: readonly string[];
   } {
+    this.#refreshLiveGitBinding();
     const branch = this.#workspace.kind === "git" ? this.#workspace.branchRef : null;
     const headCommit = this.#workspace.kind === "git" ? this.#workspace.headCommit : null;
     const modifiedFiles: string[] = [];
@@ -2496,14 +3100,20 @@ export class V2PublicToolRouter {
       const gitRes = new SpawnSyncGitCommandRunner().run(this.#paths.projectRoot, [
         "status",
         "--porcelain=v1",
-        "--untracked-files=normal",
+        "--untracked-files=all",
       ]);
       if (gitRes.exitCode === 0 && gitRes.stdout.trim().length > 0) {
         for (const rawLine of gitRes.stdout.split(/\r?\n/u)) {
           if (rawLine.length < 4) continue;
           const status = rawLine.slice(0, 2);
-          const filePath = rawLine.slice(3).trim();
-          if (!filePath) continue;
+          const filePath = rawLine.slice(3).trim().replace(/^"(.*)"$/u, "$1");
+          if (
+            !filePath ||
+            filePath.startsWith("memory-v2/") ||
+            filePath.startsWith(".memory-mcp/")
+          ) {
+            continue;
+          }
           if (status === "??") untrackedFiles.push(filePath);
           else modifiedFiles.push(filePath);
         }
@@ -2521,32 +3131,78 @@ export class V2PublicToolRouter {
     });
   }
 
+  #resolveAutoDetectedWorkspaceFiles(): readonly string[] {
+    const ws = this.#inspectLiveWorkspaceState();
+    const combined = [...ws.modifiedFiles, ...ws.untrackedFiles]
+      .map((f) => f.replace(/\\/gu, "/").replace(/^\.\//u, "").trim())
+      .filter(
+        (f) =>
+          f.length > 0 &&
+          !f.startsWith("memory/") &&
+          !f.startsWith("memory-v2/") &&
+          !f.startsWith(".memory-mcp/") &&
+          !f.startsWith(".antigravity/") &&
+          f !== "memory" &&
+          f !== "memory-v2" &&
+          f !== ".antigravity",
+      );
+    return Object.freeze([...new Set(combined)].slice(0, 25));
+  }
+
+  #buildCausalTriads<
+    TNote extends {
+      readonly id: string;
+      readonly recordId: string;
+      readonly recordKind: string;
+      readonly title: string;
+      readonly sessionId: string | null;
+      readonly filePaths: readonly string[];
+      readonly symbols: readonly string[];
+    },
+  >(
+    scoredEntries: ReadonlyArray<{ readonly note: TNote; readonly score: number }>,
+    allNotes: ReadonlyArray<TNote>,
+  ) {
+    return computeCausalTriads(scoredEntries, allNotes);
+  }
+
   async #handleSelfCheck(
     args: Record<string, unknown>,
     state: FreshStartState,
   ): Promise<Record<string, unknown>> {
-    const sessionId =
-      state.mode === "read-only-recovery"
-        ? this.#resolveActiveRootSessionId(args.sessionId)
-        : await this.#ensureActiveRootSession(args.sessionId);
+    const sessionId = this.#resolveActiveRootSessionId(args.sessionId);
     const taskSummary = typeof args.taskSummary === "string" ? args.taskSummary : null;
     const rawPlanned = Array.isArray(args.plannedFiles)
       ? args.plannedFiles
       : Array.isArray(args.filesTouched)
         ? args.filesTouched
         : [];
-    const filesTouched = rawPlanned.filter(
+    const explicitFiles = rawPlanned.filter(
       (f): f is string => typeof f === "string" && f.trim().length > 0,
     );
+    const autoDetectedFiles =
+      explicitFiles.length === 0 && args.autoDetectFiles !== false
+        ? this.#resolveAutoDetectedWorkspaceFiles()
+        : [];
+    const filesTouched =
+      explicitFiles.length > 0 ? explicitFiles : [...autoDetectedFiles];
 
     const allNotes = await this.#listProjectNotesFromProjection();
     const queryText = taskSummary ?? "";
+    const selfCheckTokens =
+      queryText || filesTouched.length > 0
+        ? this.#computeQueryTokens(queryText, filesTouched)
+        : [];
+    const selfCheckIdf =
+      selfCheckTokens.length > 0
+        ? this.#computeCorpusTokenIdf(selfCheckTokens, allNotes)
+        : undefined;
     const scoredMistakes = allNotes
       .filter((n) => n.recordKind === "mistake")
       .map((n) => ({
         note: n,
         score: queryText || filesTouched.length > 0
-          ? this.#scoreHybridNoteMatch(n, queryText, filesTouched, allNotes)
+          ? this.#scoreHybridNoteMatch(n, queryText, filesTouched, allNotes, selfCheckIdf, selfCheckTokens)
           : 1,
       }))
       .sort((a, b) => b.score - a.score || b.note.sourceEventPosition - a.note.sourceEventPosition);
@@ -2556,7 +3212,7 @@ export class V2PublicToolRouter {
       .map((n) => ({
         note: n,
         score: queryText || filesTouched.length > 0
-          ? this.#scoreHybridNoteMatch(n, queryText, filesTouched, allNotes)
+          ? this.#scoreHybridNoteMatch(n, queryText, filesTouched, allNotes, selfCheckIdf, selfCheckTokens)
           : 1,
       }))
       .sort((a, b) => b.score - a.score || b.note.sourceEventPosition - a.note.sourceEventPosition);
@@ -2658,6 +3314,7 @@ export class V2PublicToolRouter {
       taskSummary,
       filesTouched,
       plannedFiles: filesTouched,
+      autoDetectedFiles,
       riskLevel,
       pastMistakesToAvoid,
       bindingADRs,
@@ -2825,7 +3482,33 @@ export class V2PublicToolRouter {
 
     await this.#publishProjectionV3();
     if (recordKind === "adr" || recordKind === "mistake") {
-      await this.#publishProjectionV3(); await this.#syncIdeMemoryRulesFile();
+      await this.#syncIdeMemoryRulesFile();
+    }
+    const shouldAutoVerify =
+      args.autoVerify === true ||
+      args.status === "verified" ||
+      args.status === "active" ||
+      (typeof args.verificationMethod === "string" && args.verificationMethod.trim().length > 0);
+    let finalStatus: string = responseReceipt.status;
+    let finalVerificationStatus: string = responseReceipt.verificationStatus;
+    let autoPromoted = false;
+    if (shouldAutoVerify) {
+      const promoted = await this.#handlePromote({
+        recordId: responseReceipt.recordId,
+        targetStatus: "verified",
+        verificationMethod:
+          typeof args.verificationMethod === "string" && args.verificationMethod.trim().length > 0
+            ? args.verificationMethod
+            : "user-confirmed",
+        verificationAnchor:
+          typeof args.verificationAnchor === "string" && args.verificationAnchor.trim().length > 0
+            ? args.verificationAnchor
+            : `auto-verified-${recordKind}`,
+        reason: `Auto-verified ${recordKind} on creation`,
+      });
+      finalStatus = "verified";
+      finalVerificationStatus = "verified";
+      autoPromoted = Boolean(promoted.ok);
     }
     return {
       ok: true,
@@ -2833,8 +3516,9 @@ export class V2PublicToolRouter {
       noteId: responseReceipt.recordId,
       recordId: responseReceipt.recordId,
       recordKind: responseReceipt.recordKind,
-      status: responseReceipt.status,
-      verificationStatus: responseReceipt.verificationStatus,
+      status: finalStatus,
+      verificationStatus: finalVerificationStatus,
+      autoPromoted,
       eventId: responseReceipt.sourceEventIds[0],
       sourceEventIds: responseReceipt.sourceEventIds,
       evidenceId,
@@ -2964,11 +3648,13 @@ export class V2PublicToolRouter {
 
     if (existingItems.length < limit) {
       const allProjectNotes = await this.#listProjectNotesFromProjection();
+      const searchTokens = this.#computeQueryTokens(query, []);
+      const searchIdf = this.#computeCorpusTokenIdf(searchTokens, allProjectNotes);
       const hybridMatches = allProjectNotes
         .filter((note) => !seenIds.has(note.id))
         .map((note) => ({
           note,
-          score: this.#scoreHybridNoteMatch(note, query, [], allProjectNotes),
+          score: this.#scoreHybridNoteMatch(note, query, [], allProjectNotes, searchIdf, searchTokens),
         }))
         .filter((entry) => entry.score > 0)
         .sort((a, b) => b.score - a.score || b.note.sourceEventPosition - a.note.sourceEventPosition);
@@ -3007,7 +3693,12 @@ export class V2PublicToolRouter {
     state: FreshStartState,
     release: FreshStartRelease,
   ): Promise<Record<string, unknown>> {
-    const limit = typeof args.limit === "number" ? args.limit : 20;
+    const requestedLimit = typeof args.limit === "number" ? Math.trunc(args.limit) : 20;
+    const limit = Math.max(1, Math.min(200, requestedLimit));
+    const rawCursor = typeof args.cursor === "string" ? args.cursor.trim() : "";
+    const parsedOffset = rawCursor.length > 0 && /^\d+$/u.test(rawCursor) ? Number(rawCursor) : 0;
+    const offset = Number.isSafeInteger(parsedOffset) && parsedOffset >= 0 ? parsedOffset : 0;
+
     const sessionId = this.#resolveReadSessionId(args.sessionId);
     const verifiedResult = await this.#withVerifiedReadAdapter(state, release, sessionId, async (adapter) => {
       const res = await adapter.query({
@@ -3015,7 +3706,7 @@ export class V2PublicToolRouter {
         consistency: sessionId ? "session-strong" : "project-strong",
         minimumEventPosition: "0",
         budgetMs: 5000,
-        parameters: { limit: Math.max(1, Math.min(10, Math.trunc(limit))) },
+        parameters: { limit: Math.max(1, Math.min(10, limit)) },
       });
       const content = res.content as NativeCanonicalPageResult;
       const items = content.items.map((entry) => ({
@@ -3032,7 +3723,9 @@ export class V2PublicToolRouter {
 
     const allProjectNotes = await this.#listProjectNotesFromProjection();
     const noteMap = new Map(allProjectNotes.map((n) => [n.id, n]));
-    const items = (verifiedResult.items as Array<Record<string, unknown>>).map((i) => {
+    const fullMerged: Array<Record<string, unknown>> = (
+      verifiedResult.items as Array<Record<string, unknown>>
+    ).map((i) => {
       const enriched = noteMap.get(String(i.id ?? i.recordId ?? ""));
       return enriched
         ? {
@@ -3047,39 +3740,49 @@ export class V2PublicToolRouter {
             sessionId: enriched.sessionId,
             filePaths: enriched.filePaths,
             symbols: enriched.symbols,
+            wikilinks: enriched.wikilinks,
+            supersedesRecordId: enriched.supersedesRecordId,
+            supersedesRecordIds: enriched.supersedesRecordIds,
           }
         : i;
     });
-    const seenIds = new Set<string>(items.map((i) => String(i.id ?? "")));
-    if (items.length < limit) {
-      for (const note of allProjectNotes) {
-        if (items.length >= limit) break;
-        if (seenIds.has(note.id)) continue;
-        seenIds.add(note.id);
-        items.push({
-          id: note.id,
-          recordId: note.recordId,
-          kind: note.recordKind,
-          recordKind: note.recordKind,
-          normalizedKey: note.normalizedKey,
-          title: note.title,
-          summary: note.summary,
-          body: note.body,
-          status: note.status,
-          confidence: note.confidence,
-          validFrom: note.validFrom,
-          validTo: note.validTo,
-          sessionId: note.sessionId,
-          sourceEventPosition: note.sourceEventPosition.toString(),
-          filePaths: note.filePaths,
-          symbols: note.symbols,
-        });
-      }
+    const seenIds = new Set<string>(fullMerged.map((i) => String(i.id ?? i.recordId ?? "")));
+    for (const note of allProjectNotes) {
+      if (seenIds.has(note.id)) continue;
+      seenIds.add(note.id);
+      fullMerged.push({
+        id: note.id,
+        recordId: note.recordId,
+        kind: note.recordKind,
+        recordKind: note.recordKind,
+        normalizedKey: note.normalizedKey,
+        title: note.title,
+        summary: note.summary,
+        body: note.body,
+        status: note.status,
+        confidence: note.confidence,
+        validFrom: note.validFrom,
+        validTo: note.validTo,
+        sessionId: note.sessionId,
+        sourceEventPosition: note.sourceEventPosition.toString(),
+        filePaths: note.filePaths,
+        symbols: note.symbols,
+        wikilinks: note.wikilinks,
+        supersedesRecordId: note.supersedesRecordId,
+        supersedesRecordIds: note.supersedesRecordIds,
+      });
     }
+
+    const items = fullMerged.slice(offset, offset + limit);
+    const hasMore = offset + items.length < fullMerged.length;
+    const nextCursor = hasMore ? String(offset + items.length) : null;
 
     return {
       ...verifiedResult,
       items,
+      hasMore,
+      nextCursor,
+      totalCount: fullMerged.length,
     };
   }
 
@@ -3172,11 +3875,17 @@ export class V2PublicToolRouter {
     const query =
       String(args.area ?? args.contextArea ?? args.query ?? args.task ?? "context").trim() ||
       "context";
-    const plannedFiles = Array.isArray(args.plannedFiles)
+    const explicitPlanned = Array.isArray(args.plannedFiles)
       ? args.plannedFiles.filter((f): f is string => typeof f === "string" && f.trim().length > 0)
       : Array.isArray(args.filesTouched)
         ? args.filesTouched.filter((f): f is string => typeof f === "string" && f.trim().length > 0)
         : [];
+    const autoDetectedFiles =
+      explicitPlanned.length === 0 && args.autoDetectFiles !== false
+        ? this.#resolveAutoDetectedWorkspaceFiles()
+        : [];
+    const plannedFiles =
+      explicitPlanned.length > 0 ? explicitPlanned : [...autoDetectedFiles];
     const sessionId = this.#resolveReadSessionId(args.sessionId);
     const verifiedPack = await this.#withVerifiedReadAdapter(state, release, sessionId, async (adapter) => {
       const res = await adapter.query({
@@ -3194,11 +3903,17 @@ export class V2PublicToolRouter {
     });
 
     const allProjectNotes = await this.#listProjectNotesFromProjection();
-    const rankedHybrid = allProjectNotes
-      .map((note) => ({
-        note,
-        score: this.#scoreHybridNoteMatch(note, query, plannedFiles, allProjectNotes),
-      }))
+    const packTokens = this.#computeQueryTokens(query, plannedFiles);
+    const packIdf = this.#computeCorpusTokenIdf(packTokens, allProjectNotes);
+    const initialScored = allProjectNotes.map((note) => ({
+      note,
+      score: this.#scoreHybridNoteMatch(note, query, plannedFiles, allProjectNotes, packIdf, packTokens),
+    }));
+    const { boostedEntries, causalTriads } = this.#buildCausalTriads(
+      initialScored,
+      allProjectNotes,
+    );
+    const rankedHybrid = boostedEntries
       .sort((a, b) => b.score - a.score || b.note.sourceEventPosition - a.note.sourceEventPosition)
       .slice(0, 12)
       .map(({ note, score }) => ({
@@ -3238,6 +3953,8 @@ export class V2PublicToolRouter {
       ...verifiedPack,
       relevantProjectNotes: rankedHybrid,
       fileMatchedNotes,
+      autoDetectedFiles,
+      causalTriads,
     };
   }
 
@@ -3246,21 +3963,133 @@ export class V2PublicToolRouter {
     state: FreshStartState,
     release: FreshStartRelease,
   ): Promise<Record<string, unknown>> {
-    const limit = typeof args.limit === "number" ? args.limit : 10;
+    const limit = typeof args.limit === "number" ? Math.max(1, Math.min(50, Math.trunc(args.limit))) : 10;
     const sessionId = this.#resolveReadSessionId(args.sessionId);
-    return this.#withVerifiedReadAdapter(state, release, sessionId, async (adapter) => {
+    const verifiedRadar = await this.#withVerifiedReadAdapter(state, release, sessionId, async (adapter) => {
       const res = await adapter.query({
         operation: "follow-up-radar",
         consistency: sessionId ? "session-strong" : "project-strong",
         minimumEventPosition: "0",
         budgetMs: 5000,
-        parameters: { limit: Math.max(1, Math.min(10, Math.trunc(limit))) },
+        parameters: { limit: Math.max(1, Math.min(10, limit)) },
       });
       return {
         ok: true,
         ...res.content,
       };
     });
+
+    const cpRows = this.#connection
+      .prepare(
+        `SELECT session_id, branch_ref, occurred_at, payload_json
+         FROM events
+         WHERE project_id = $projectId AND event_type = 'SessionCheckpointRecorded'
+         ORDER BY global_position DESC LIMIT 25`,
+      )
+      .all({ $projectId: this.#identity.projectId }) as Array<{
+      session_id: string | null;
+      branch_ref: string | null;
+      occurred_at: string;
+      payload_json: string;
+    }>;
+
+    const latestBySession = new Map<
+      string,
+      {
+        readonly sessionId: string;
+        readonly branchRef: string | null;
+        readonly occurredAt: string;
+        readonly taskSummary: string;
+        readonly nextActions: readonly string[];
+        readonly blockers: readonly string[];
+      }
+    >();
+    for (const row of cpRows) {
+      const sid = row.session_id ?? "";
+      if (!sid || latestBySession.has(sid)) continue;
+      try {
+        const parsed = JSON.parse(row.payload_json) as {
+          checkpoint?: {
+            taskSummary?: string;
+            nextActions?: Array<{ summary?: string }>;
+            blockers?: Array<{ summary?: string }>;
+          };
+        };
+        const cp = parsed.checkpoint;
+        if (!cp) continue;
+        const nextActions = (cp.nextActions ?? [])
+          .map((i) => (typeof i?.summary === "string" ? i.summary.trim() : ""))
+          .filter((s) => s.length > 0);
+        const blockers = (cp.blockers ?? [])
+          .map((i) => (typeof i?.summary === "string" ? i.summary.trim() : ""))
+          .filter((s) => s.length > 0);
+        if (nextActions.length === 0 && blockers.length === 0) continue;
+        latestBySession.set(sid, {
+          sessionId: sid,
+          branchRef: row.branch_ref,
+          occurredAt: row.occurred_at,
+          taskSummary: String(cp.taskSummary ?? ""),
+          nextActions,
+          blockers,
+        });
+      } catch {
+        // Skip malformed checkpoint JSON
+      }
+    }
+
+    const openCheckpointFollowUps: Array<{
+      readonly kind: "blocker" | "next-action";
+      readonly action: string;
+      readonly sessionId: string;
+      readonly branchRef: string | null;
+      readonly occurredAt: string;
+      readonly taskSummary: string;
+    }> = [];
+    const seenActions = new Set<string>();
+    for (const entry of latestBySession.values()) {
+      for (const b of entry.blockers) {
+        if (seenActions.has(`blocker:${b}`)) continue;
+        seenActions.add(`blocker:${b}`);
+        openCheckpointFollowUps.push({
+          kind: "blocker",
+          action: b,
+          sessionId: entry.sessionId,
+          branchRef: entry.branchRef,
+          occurredAt: entry.occurredAt,
+          taskSummary: entry.taskSummary,
+        });
+      }
+      for (const na of entry.nextActions) {
+        if (seenActions.has(`next:${na}`)) continue;
+        seenActions.add(`next:${na}`);
+        openCheckpointFollowUps.push({
+          kind: "next-action",
+          action: na,
+          sessionId: entry.sessionId,
+          branchRef: entry.branchRef,
+          occurredAt: entry.occurredAt,
+          taskSummary: entry.taskSummary,
+        });
+      }
+    }
+
+    const allNotes = await this.#listProjectNotesFromProjection();
+    const unpromotedCandidates = allNotes
+      .filter((n) => n.status === "candidate" || n.status === "provisional")
+      .slice(0, limit)
+      .map((n) => ({
+        recordId: n.recordId,
+        kind: n.recordKind,
+        title: n.title,
+        summary: n.summary,
+        status: n.status,
+      }));
+
+    return {
+      ...verifiedRadar,
+      openCheckpointFollowUps: openCheckpointFollowUps.slice(0, limit),
+      unpromotedCandidates,
+    };
   }
 
   async #handleAwaken(
@@ -3268,10 +4097,7 @@ export class V2PublicToolRouter {
     state: FreshStartState,
     release: FreshStartRelease,
   ): Promise<Record<string, unknown>> {
-    const sessionId =
-      state.mode === "read-only-recovery"
-        ? this.#resolveActiveRootSessionId(args.sessionId)
-        : await this.#ensureActiveRootSession(args.sessionId);
+    const sessionId = this.#resolveActiveRootSessionId(args.sessionId);
     const contextPack = await this.#handleContextPack(
       sessionId ? { ...args, sessionId } : args,
       state,
@@ -3473,24 +4299,89 @@ export class V2PublicToolRouter {
 
   async #handleVerifySourceTruth(release: FreshStartRelease): Promise<Record<string, unknown>> {
     const headRow = this.#connection
-      .prepare("SELECT COUNT(*) AS count, MAX(global_position) AS pos FROM events")
-      .get() as { count?: bigint; pos?: bigint | null } | undefined;
+      .prepare(
+        `SELECT COUNT(*) AS count, MAX(global_position) AS pos
+         FROM events
+         WHERE project_id = $projectId`,
+      )
+      .get({ $projectId: this.#identity.projectId }) as
+      | { count?: bigint | number; pos?: bigint | number | null }
+      | undefined;
+
+    const evidenceRow = this.#connection
+      .prepare(
+        `SELECT COUNT(*) AS count
+         FROM retained_evidence_blobs
+         WHERE project_id = $projectId`,
+      )
+      .get({ $projectId: this.#identity.projectId }) as { count?: bigint | number } | undefined;
+
+    const integrity = new EventIntegrityService(this.#connection).quickCheck(this.#rootContext);
+    const activeNotes = await this.#listProjectNotesFromProjection();
+
+    const allReferencedFiles = new Set<string>();
+    for (const note of activeNotes) {
+      for (const fp of note.filePaths) {
+        allReferencedFiles.add(fp);
+      }
+    }
+
+    const existingFiles: string[] = [];
+    const missingFiles: string[] = [];
+    for (const fp of [...allReferencedFiles].sort((a, b) => a.localeCompare(b))) {
+      if (!isAcceptablePath(fp)) continue;
+      const contained = resolveContainedWorkspaceFile(this.#paths.projectRoot, fp, 64 * 1024 * 1024);
+      if (contained !== null) {
+        existingFiles.push(fp);
+      } else {
+        missingFiles.push(fp);
+      }
+    }
+
+    const resolver = buildWikilinkResolver(
+      activeNotes.map((n) => ({
+        path: n.normalizedKey || n.recordId,
+        title: n.title,
+        id: n.recordId,
+      })),
+    );
+
+    const resolvedWikilinks: string[] = [];
+    const brokenWikilinks: Array<{ readonly recordId: string; readonly target: string }> = [];
+    for (const note of activeNotes) {
+      for (const target of note.wikilinks) {
+        const resolved = resolver(target);
+        if (resolved) {
+          if (!resolvedWikilinks.includes(target)) resolvedWikilinks.push(target);
+        } else {
+          brokenWikilinks.push(Object.freeze({ recordId: note.recordId, target }));
+        }
+      }
+    }
+
+    const verified = integrity.ok && missingFiles.length === 0 && brokenWikilinks.length === 0;
     return {
-      ok: true,
+      ok: integrity.ok,
+      verified,
       projectId: this.#identity.projectId,
       vaultId: this.#identity.vaultId,
       storeId: this.#identity.storeId,
       workspaceId: this.#workspace.workspaceId,
       buildIdentityHash: release.buildIdentityHash,
-      eventCount: (headRow?.count ?? 0n).toString(),
-      terminalEventPosition: (headRow?.pos ?? 0n).toString(),
+      eventCount: BigInt(headRow?.count ?? 0).toString(),
+      terminalEventPosition: BigInt(headRow?.pos ?? 0).toString(),
+      retainedEvidenceCount: BigInt(evidenceRow?.count ?? 0).toString(),
+      integrityIssues: integrity.issues,
+      existingFiles,
+      missingFiles,
+      resolvedWikilinks,
+      brokenWikilinks,
     };
   }
 
   async #withProjectedImage<T>(fn: (db: DatabaseSync) => T): Promise<T> {
     const manifest = await this.#publishProjectionV3(false);
-    const projectionDir = join(this.#route.storeRoot, "projections");
-    const bytes = readFileSync(join(projectionDir, manifest.databaseFile));
+    const bytes = this.#getVerifiedProjectionBytes(manifest);
     const db = openImmutableProjectionImage(bytes);
     try {
       return fn(db);
@@ -3500,12 +4391,12 @@ export class V2PublicToolRouter {
   }
 
   async #handleFindDuplicates(): Promise<Record<string, unknown>> {
-    return this.#withProjectedImage((db) => {
+    const projectedGroups = await this.#withProjectedImage((db) => {
       const rows = db
         .prepare(
           `SELECT item_id, normalized_key, summary, content_hash
            FROM canonical_items
-           WHERE status NOT IN ('retracted', 'superseded', 'erased-evidence')
+           WHERE status NOT IN ('retracted', 'superseded', 'expired', 'erased-evidence')
            ORDER BY item_id ASC`,
         )
         .all() as Array<{
@@ -3520,19 +4411,74 @@ export class V2PublicToolRouter {
         list.push(row.item_id);
         byHash.set(row.content_hash, list);
       }
-      const duplicateGroups = [...byHash.entries()]
+      return [...byHash.entries()]
         .filter(([, ids]) => ids.length > 1)
         .map(([contentHash, recordIds]) => ({ contentHash, recordIds }));
-      return {
-        ok: true,
-        duplicateGroups,
-      };
     });
+
+    const allActiveNotes = await this.#listProjectNotesFromProjection();
+    const activeIdSet = new Set(allActiveNotes.map((n) => n.recordId));
+    const mergedGroups = new Map<string, string[]>();
+
+    for (const group of projectedGroups) {
+      const activeIds = group.recordIds.filter((id) => activeIdSet.has(id));
+      if (activeIds.length > 1) {
+        mergedGroups.set(group.contentHash, [...new Set(activeIds)].sort());
+      }
+    }
+
+    const byCrossBranchBodyHash = new Map<string, string[]>();
+    const byCrossBranchNormSummary = new Map<string, string[]>();
+    for (const note of allActiveNotes) {
+      const rawContent = (note.body || note.summary).trim();
+      if (rawContent.length > 0) {
+        const bodyHash = createHash("sha256").update(rawContent, "utf8").digest("hex");
+        const list = byCrossBranchBodyHash.get(bodyHash) ?? [];
+        list.push(note.recordId);
+        byCrossBranchBodyHash.set(bodyHash, list);
+      }
+      const normSummary = note.summary.trim().toLowerCase().replace(/\s+/gu, " ");
+      if (normSummary.length >= 4) {
+        const sList = byCrossBranchNormSummary.get(normSummary) ?? [];
+        sList.push(note.recordId);
+        byCrossBranchNormSummary.set(normSummary, sList);
+      }
+    }
+
+    const addGroupIfNew = (hashKey: string, rawIds: string[]) => {
+      const uniqueSorted = [...new Set(rawIds)].sort();
+      if (uniqueSorted.length < 2) return;
+      const alreadyCovered = [...mergedGroups.values()].some(
+        (existing) =>
+          existing.length === uniqueSorted.length &&
+          uniqueSorted.every((id, idx) => existing[idx] === id),
+      );
+      if (!alreadyCovered) {
+        mergedGroups.set(hashKey, uniqueSorted);
+      }
+    };
+
+    for (const [bodyHash, ids] of byCrossBranchBodyHash.entries()) {
+      addGroupIfNew(bodyHash, ids);
+    }
+    for (const [normSummary, ids] of byCrossBranchNormSummary.entries()) {
+      const summaryHash = createHash("sha256").update(`summary:${normSummary}`, "utf8").digest("hex");
+      addGroupIfNew(summaryHash, ids);
+    }
+
+    return {
+      ok: true,
+      duplicateGroups: [...mergedGroups.entries()].map(([contentHash, recordIds]) => ({
+        contentHash,
+        recordIds,
+      })),
+    };
   }
 
   async #handleCheckStaleness(): Promise<Record<string, unknown>> {
-    return this.#withProjectedImage((db) => {
-      const rows = db
+    const nowIso = new Date().toISOString();
+    const projectedStale = await this.#withProjectedImage((db) => {
+      return db
         .prepare(
           `SELECT item_id, normalized_key, status, valid_to, summary
            FROM canonical_items
@@ -3540,25 +4486,123 @@ export class V2PublicToolRouter {
               OR (valid_to IS NOT NULL AND valid_to <= $now)
            ORDER BY item_id ASC`,
         )
-        .all({ $now: new Date().toISOString() }) as Array<{
+        .all({ $now: nowIso }) as Array<{
         item_id: string;
         normalized_key: string;
         status: string;
         valid_to: string | null;
         summary: string;
       }>;
-      return {
-        ok: true,
-        staleItems: rows.map((r) => ({
-          id: r.item_id,
-          recordId: r.item_id,
-          normalizedKey: r.normalized_key,
-          status: r.status,
-          validTo: r.valid_to,
-          summary: r.summary,
-        })),
-      };
     });
+
+    const staleById = new Map<
+      string,
+      {
+        id: string;
+        recordId: string;
+        normalizedKey: string;
+        status: string;
+        validTo: string | null;
+        summary: string;
+      }
+    >();
+    for (const r of projectedStale) {
+      staleById.set(r.item_id, {
+        id: r.item_id,
+        recordId: r.item_id,
+        normalizedKey: r.normalized_key,
+        status: r.status,
+        validTo: r.valid_to,
+        summary: r.summary,
+      });
+    }
+
+    try {
+      const eventRows = this.#connection
+        .prepare(
+          `SELECT event_type, event_schema_version, payload_json
+           FROM events
+           WHERE project_id = $projectId
+             AND (event_type = 'MemorySourceRecorded' OR stream_type = 'governed-lifecycle')
+           ORDER BY global_position ASC`,
+        )
+        .all({ $projectId: this.#identity.projectId }) as Array<{
+        event_type: string;
+        event_schema_version: number | bigint;
+        payload_json: string;
+      }>;
+      const folded = new Map<
+        string,
+        {
+          normalizedKey: string;
+          status: string;
+          validTo: string | null;
+          summary: string;
+        }
+      >();
+      for (const row of eventRows) {
+        const eventType = String(row.event_type);
+        const schemaVersion = Number(row.event_schema_version);
+        const payload = JSON.parse(String(row.payload_json)) as Record<string, unknown>;
+        if (eventType === "MemorySourceRecorded") {
+          const item = (schemaVersion >= 3 ? payload.item : payload) as Record<string, unknown> | undefined;
+          if (!item || typeof item.itemId !== "string") continue;
+          folded.set(item.itemId, {
+            normalizedKey: String(item.normalizedKey ?? `governed-note/insight/${item.itemId}`),
+            status: typeof item.status === "string" ? item.status : "candidate",
+            validTo: typeof item.validTo === "string" ? item.validTo : null,
+            summary: typeof item.summary === "string" ? item.summary : "",
+          });
+        } else if (eventType === "EvidenceErased") {
+          const erasedIds = Array.isArray(payload.erasedRecordIds)
+            ? payload.erasedRecordIds.map(String)
+            : [];
+          for (const id of [String(payload.recordId ?? ""), ...erasedIds]) {
+            if (id) {
+              folded.delete(id);
+              staleById.delete(id);
+            }
+          }
+        } else if (typeof payload.recordId === "string") {
+          const target = folded.get(payload.recordId);
+          if (target) {
+            if (typeof payload.targetStatus === "string") {
+              target.status = payload.targetStatus;
+            }
+            if (payload.validTo === null || typeof payload.validTo === "string") {
+              target.validTo = payload.validTo;
+            }
+          }
+        }
+      }
+      for (const [id, entry] of folded.entries()) {
+        const isStale =
+          entry.status === "expired" ||
+          entry.status === "superseded" ||
+          entry.status === "retracted" ||
+          entry.status === "conflicted" ||
+          (entry.validTo !== null && entry.validTo <= nowIso);
+        if (isStale) {
+          staleById.set(id, {
+            id,
+            recordId: id,
+            normalizedKey: entry.normalizedKey,
+            status: entry.status,
+            validTo: entry.validTo,
+            summary: entry.summary,
+          });
+        } else {
+          staleById.delete(id);
+        }
+      }
+    } catch {
+      // Keep projected staleness rows on fallback
+    }
+
+    return {
+      ok: true,
+      staleItems: [...staleById.values()].sort((a, b) => a.recordId.localeCompare(b.recordId)),
+    };
   }
 
   async #syncIdeMemoryRulesFile(): Promise<string | null> {
@@ -3569,8 +4613,45 @@ export class V2PublicToolRouter {
       const targetPath = join(antigravityDir, "MEMORY_RULES.md");
       if (existsSync(targetPath) && lstatSync(targetPath).isSymbolicLink()) return null;
       const notes = await this.#listProjectNotesFromProjection();
-      const adrs = notes.filter((n) => n.recordKind === "adr").slice(0, 15);
-      const mistakes = notes.filter((n) => n.recordKind === "mistake").slice(0, 15);
+      const statusRank = (status: string): number =>
+        status === "verified" ? 0 : status === "provisional" ? 1 : 2;
+      const selectCleanRules = (kind: "adr" | "mistake") => {
+        const seen = new Set<string>();
+        const sorted = notes
+          .filter(
+            (n) =>
+              n.recordKind === kind
+              && (n.status === "verified" || n.status === "provisional" || n.status === "candidate"),
+          )
+          .sort((a, b) => statusRank(a.status) - statusRank(b.status));
+        const picked: typeof sorted = [];
+        for (const item of sorted) {
+          const dedupKey = item.summary.trim().toLowerCase();
+          if (seen.has(dedupKey)) continue;
+          seen.add(dedupKey);
+          picked.push(item);
+          if (picked.length >= 15) break;
+        }
+        return picked;
+      };
+      const formatRuleLine = (item: { status: string; title: string; summary: string; recordId: string }) => {
+        const cleanTitle = item.title
+          .replace(/^(?:ADR|Mistake|Insight|Session[- ]Log)\s*:\s*/iu, "")
+          .trim() || item.title.trim();
+        let detail = item.summary
+          .replace(/^(?:ADR|Mistake|Insight|Session[- ]Log)\s*:\s*/iu, "")
+          .trim();
+        if (detail.toLowerCase().startsWith(`${cleanTitle.toLowerCase()}:`)) {
+          detail = detail.slice(cleanTitle.length + 1).trim();
+        } else if (detail.toLowerCase() === cleanTitle.toLowerCase()) {
+          detail = "";
+        }
+        return detail.length > 0
+          ? `- **[${item.status.toUpperCase()}] ${cleanTitle}**: ${detail} (\`${item.recordId}\`)`
+          : `- **[${item.status.toUpperCase()}] ${cleanTitle}** (\`${item.recordId}\`)`;
+      };
+      const adrs = selectCleanRules("adr");
+      const mistakes = selectCleanRules("mistake");
       const lines: string[] = [
         "# Project Memory V2 — Active Guardrails & Architectural Rules",
         "",
@@ -3583,7 +4664,7 @@ export class V2PublicToolRouter {
         lines.push("- _No ADRs recorded yet._");
       } else {
         for (const a of adrs) {
-          lines.push(`- **[${a.status.toUpperCase()}] ${a.title}**: ${a.summary} (\`${a.recordId}\`)`);
+          lines.push(formatRuleLine(a));
         }
       }
       lines.push("", "## Past Mistakes to Avoid", "");
@@ -3591,7 +4672,7 @@ export class V2PublicToolRouter {
         lines.push("- _No mistakes recorded yet._");
       } else {
         for (const m of mistakes) {
-          lines.push(`- **[${m.status.toUpperCase()}] ${m.title}**: ${m.summary} (\`${m.recordId}\`)`);
+          lines.push(formatRuleLine(m));
         }
       }
       lines.push("");
@@ -3706,6 +4787,8 @@ export class V2PublicToolRouter {
       validTo,
       reason,
     });
+    await this.#publishProjectionV3();
+    await this.#syncIdeMemoryRulesFile();
     return {
       ok: true,
       ...serializeMutationReceipt(receipt),
@@ -3771,6 +4854,8 @@ export class V2PublicToolRouter {
         recordIds,
         reason,
       });
+      await this.#publishProjectionV3();
+      await this.#syncIdeMemoryRulesFile();
       return {
         ok: true,
         forgotten: true,
@@ -3806,8 +4891,8 @@ export class V2PublicToolRouter {
 
   #currentGlobalPosition(): string {
     const row = this.#connection
-      .prepare("SELECT MAX(global_position) AS pos FROM events")
-      .get() as { pos?: bigint | null } | undefined;
+      .prepare("SELECT MAX(global_position) AS pos FROM events WHERE project_id = $projectId")
+      .get({ $projectId: this.#identity.projectId }) as { pos?: bigint | null } | undefined;
     return (row?.pos ?? 0n).toString();
   }
 
@@ -3824,6 +4909,7 @@ export class V2PublicToolRouter {
   }
 
   async #handleCheckpoint(args: Record<string, unknown>): Promise<Record<string, unknown>> {
+    this.#refreshLiveGitBinding();
     const sessionId = await this.#ensureActiveRootSession(args.sessionId);
     const taskSummary = String(
       args.taskSummary ?? args.summary ?? "Session lifecycle checkpoint",
@@ -3914,6 +5000,9 @@ export class V2PublicToolRouter {
     );
     const b = this.#rootContext.binding;
     const authority = this.#requireSessionAuthority(parentSessionId);
+    if (authority.ownerGeneration === null) {
+      throw new FreshStartError("FRESH_START_INPUT_INVALID");
+    }
     const childSessionId = randomUUID();
     const command = decodeLifecycleSemanticCommandDraft({
       commandType: "fork-child",
@@ -3950,7 +5039,7 @@ export class V2PublicToolRouter {
       authorizationSessionId: parentSessionId,
       targetSessionId: parentSessionId,
       capabilityKind: "root-session-handle",
-      capabilityGeneration: authority.ownerGeneration!.toString(),
+      capabilityGeneration: authority.ownerGeneration.toString(),
     });
     const proof = this.#mintProof(parentSessionId, this.#rootContext, (scope) => ({
       ...scope,
@@ -4338,11 +5427,14 @@ export class V2PublicToolRouter {
       this.#rootContext,
     );
 
-    // Record a post-recovery checkpoint so checkpointRequiredReason is cleared for subsequent session-end operations
-    await this.#handleCheckpoint({
-      sessionId,
-      taskSummary: "Post-recovery checkpoint",
-    });
+    // Record a post-recovery checkpoint when session returns to active so checkpointRequiredReason is cleared
+    const recoveredBeforeCheckpoint = this.#authorityRepo.get(this.#connection, b.projectId, sessionId)!;
+    if (recoveredBeforeCheckpoint.semanticState === "active") {
+      await this.#handleCheckpoint({
+        sessionId,
+        taskSummary: "Post-recovery checkpoint",
+      });
+    }
     const recoveredAuthority = this.#authorityRepo.get(this.#connection, b.projectId, sessionId)!;
     return {
       ok: true,
@@ -4352,14 +5444,501 @@ export class V2PublicToolRouter {
     };
   }
 
-  async #handleSessionEnd(args: Record<string, unknown>): Promise<Record<string, unknown>> {
-    const sessionId = await this.#ensureActiveRootSession(args.sessionId);
+  async #finalizeSessionEndWorkflow(
+    sessionId: string,
+    workflowId: string,
+  ): Promise<{ readonly phase: string; readonly state: string }> {
+    const coordinator = this.#sessionEndCoordinator;
+    if (!coordinator) {
+      throw new FreshStartError("FRESH_START_STORAGE_FAILURE");
+    }
+    this.#refreshLiveGitBinding();
     const b = this.#rootContext.binding;
+    const authority = this.#authorityRepo.get(this.#connection, b.projectId, sessionId);
+    if (!authority || authority.ownerGeneration === null) {
+      throw new FreshStartError("FRESH_START_INPUT_INVALID");
+    }
+
+    // 1. Seal the evidence window on the requested workflow generation so coordinator can freeze final checkpoint
+    const workflowRepo = new SessionEndWorkflowRepository(this.#connection);
+    const currentWf = workflowRepo.read(b.projectId, workflowId);
+    if (currentWf && currentWf.evidenceWindowState !== "sealed" && currentWf.phase !== "completed") {
+      const sealCommand = decodeLifecycleSemanticCommandDraft({
+        commandType: "amend-session-end",
+        commandId: randomUUID(),
+        idempotencyKey: randomUUID(),
+        agentId: "v2-mcp-agent",
+        expectedProjectId: b.projectId,
+        expectedVaultId: b.vaultId,
+        expectedWorkspaceId: b.workspaceId,
+        expectedBranchRef: this.#projectionBinding.branchRef,
+        sessionId,
+        workflowId,
+        expectedStreamVersion: this.#currentSessionStreamVersion(sessionId),
+        amendment: {
+          amendmentVersion: 2,
+          childEndPolicy: null,
+          finalCheckpoint: null,
+          validationProfileIds: null,
+          requestedQualityThreshold: null,
+          requireFullEvidence: null,
+          requireMaterialization: null,
+          evidenceWindowAction: "seal",
+        },
+      });
+      const sealWitness = buildLifecycleIntentWitness(sealCommand, {
+        projectId: b.projectId,
+        vaultId: b.vaultId,
+        storeId: b.storeId,
+        workspaceId: b.workspaceId,
+        clientNamespace: b.clientNamespace,
+        presentingActorRole: "primary",
+        presentingClientInstanceId: b.clientInstanceId,
+        targetActorRole: "primary",
+        targetClientInstanceId: b.clientInstanceId,
+        internalWorkflowId: null,
+        internalWorkflowGeneration: null,
+        internalPlannedWorkId: null,
+        authorizationKind: "protected",
+        authorizationSessionId: sessionId,
+        targetSessionId: sessionId,
+        capabilityKind: "root-session-handle",
+        capabilityGeneration: authority.ownerGeneration.toString(),
+      });
+      const sealProof = this.#mintProof(sessionId, this.#rootContext, (scope) => ({
+        ...scope,
+        proofVersion: 1,
+        target: "semantic-command",
+        commandId: sealCommand.commandId,
+        idempotencyKey: sealCommand.idempotencyKey,
+        intentHash: sealWitness.intentHash,
+        proofNonce: randomUUID(),
+      }));
+      await this.#lifecycleRuntime.execute(
+        decodeLifecycleWorkerOperationWire({
+          kind: "semantic",
+          operation: "amend-session-end",
+          prepared: {
+            command: sealCommand,
+            candidateIntentHash: sealWitness.intentHash,
+            authorization: {
+              kind: "protected",
+              authoritySessionId: sessionId as SessionId,
+              targetSessionId: sessionId as SessionId,
+              proof: sealProof,
+              approval: null,
+              childBindingGrant: null,
+            },
+          },
+        }),
+        this.#rootContext,
+      );
+    }
+
+    const ownerId = "00000000-0000-4000-8000-000000000002";
+    const leaseDurationMs = 30_000n;
+    const ensureWorkflowClaim = () => {
+      const nowMs = BigInt(Date.now());
+      const wf = workflowRepo.read(b.projectId, workflowId);
+      if (!wf) throw new FreshStartError("FRESH_START_INPUT_INVALID");
+      if (
+        wf.coordinatorOwnerId !== null &&
+        wf.coordinatorClaimToken !== null &&
+        wf.coordinatorClaimExpiresAt !== null &&
+        Date.parse(wf.coordinatorClaimExpiresAt) > Number(nowMs)
+      ) {
+        return {
+          wf,
+          claim: {
+            projectId: wf.projectId,
+            workflowId: wf.workflowId,
+            sessionId: wf.sessionId,
+            workflowGeneration: wf.generation,
+            phase: wf.phase,
+            ownerId: wf.coordinatorOwnerId,
+            claimToken: wf.coordinatorClaimToken,
+            claimExpiresAt: wf.coordinatorClaimExpiresAt,
+            triggeringEventPosition: wf.triggeringEventPosition,
+            attemptCount: Number(wf.coordinatorAttemptCount),
+          },
+        };
+      }
+      const claimed = workflowRepo.claim({
+        projectId: b.projectId,
+        workflowId,
+        workflowGeneration: wf.generation,
+        ownerId,
+        observedNowMs: nowMs,
+        leaseDurationMs,
+      });
+      if (!claimed) throw new FreshStartError("FRESH_START_STORAGE_FAILURE");
+      return {
+        wf: workflowRepo.read(b.projectId, workflowId)!,
+        claim: claimed,
+      };
+    };
+
+    // 2. Drive requested -> children-resolved -> final-checkpoint-recorded -> ending-materialization-queued -> validating
+    for (let step = 0; step < 8; step += 1) {
+      const snapshot = workflowRepo.read(b.projectId, workflowId);
+      if (!snapshot || snapshot.phase === "validating" || snapshot.phase === "completed") break;
+      const { claim } = ensureWorkflowClaim();
+      coordinator.driveOnce({
+        context: this.#rootContext,
+        ownerId: claim.ownerId,
+        observedNowMs: BigInt(Date.now()),
+        leaseDurationMs,
+        claim,
+      });
+    }
+
+    // 3. Record validation attempt results & verification passed (validating -> verification-passed)
+    const validatingSnapshot = workflowRepo.read(b.projectId, workflowId);
+    if (validatingSnapshot && validatingSnapshot.phase === "validating") {
+      const { wf, claim } = ensureWorkflowClaim();
+      const persisted = workflowRepo.readPersistedValidationAttemptPlansV1(b.projectId, workflowId);
+      const rootRow = this.#authorityRepo.get(this.#connection, b.projectId, sessionId);
+      if (
+        !persisted ||
+        !rootRow ||
+        rootRow.latestCheckpointId === null ||
+        rootRow.latestCheckpointFingerprint === null ||
+        wf.evidenceFrozenCheckpointEventPosition === null
+      ) {
+        throw new FreshStartError("FRESH_START_STORAGE_FAILURE");
+      }
+      const checkpoint = this.#authorityRepo.requireCheckpointAtEventPosition(this.#connection, {
+        projectId: b.projectId,
+        sessionId: sessionId as SessionId,
+        checkpointId: rootRow.latestCheckpointId as CheckpointId,
+        checkpointEventPosition: wf.evidenceFrozenCheckpointEventPosition,
+      });
+      const beginValidationIdentity = sessionEndPhaseIdentityV1({
+        projectId: b.projectId,
+        workflowId: wf.workflowId as WorkflowId,
+        workflowGeneration: wf.generation,
+        sourcePhase: "ending-materialization-queued",
+        action: { action: "begin-validation" },
+      });
+      const expectedConfigHashes = new Map(
+        this.#validationProfileRegistry.list().map((profile) => [
+          `${profile.profileId}\u0000${profile.profileVersion}`,
+          profile.configurationHash,
+        ] as const),
+      );
+      const expandedPlans = expandValidationAttemptPlans(
+        {
+          plans: persisted.plans,
+          context: {
+            projectId: b.projectId,
+            vaultId: b.vaultId,
+            storeId: b.storeId,
+            workspaceId: b.workspaceId,
+            sessionId,
+            workflowId: wf.workflowId,
+            workflowGeneration: wf.generation,
+            plannedWorkId: beginValidationIdentity.plannedWorkId,
+            finalCheckpointId: checkpoint.checkpointId,
+            finalCheckpointFingerprint: rootRow.latestCheckpointFingerprint,
+          },
+          expectedProfileConfigurationHashes: expectedConfigHashes,
+        },
+        this.#validationProfileRegistry,
+      );
+      const validationRunner = new ValidationProfileRunner({
+        registry: this.#validationProfileRegistry,
+        keyProvider: this.#custody.capability,
+      });
+      for (const attemptPlan of expandedPlans) {
+        const validationResult = await validationRunner.run({
+          attemptPlan,
+          sourceStateAtStart: checkpoint.sourceState,
+          sourceStateAtCompletion: checkpoint.sourceState,
+        });
+        const validationCommand: InternalValidationResultCommand = Object.freeze({
+          commandType: "internal-validation-result" as const,
+          commandId: attemptPlan.resultCommandId,
+          idempotencyKey: attemptPlan.resultIdempotencyKey,
+          agentId: claim.ownerId,
+          expectedProjectId: b.projectId,
+          expectedVaultId: b.vaultId,
+          expectedWorkspaceId: b.workspaceId,
+          expectedBranchRef: this.#projectionBinding.branchRef,
+          workflowId: wf.workflowId as WorkflowId,
+          workflowGeneration: wf.generation,
+          plannedWorkId: attemptPlan.plannedWorkId,
+          attemptPlan,
+          claim: {
+            workflowId: wf.workflowId as WorkflowId,
+            workflowGeneration: wf.generation,
+            claimOwnerId: claim.ownerId,
+            claimToken: claim.claimToken.toString(),
+            claimExpiresAt: claim.claimExpiresAt,
+          },
+          result: validationResult,
+        });
+        coordinator.execute(this.#rootContext, validationCommand);
+      }
+
+      const verifyAction = Object.freeze({
+        action: "record-verification-passed" as const,
+        validationResultIds: Object.freeze(expandedPlans.map((p) => p.resultId)),
+        qualityScore: 100,
+      });
+      const verifyIdentity = sessionEndPhaseIdentityV1({
+        projectId: b.projectId,
+        workflowId: wf.workflowId as WorkflowId,
+        workflowGeneration: wf.generation,
+        sourcePhase: "validating",
+        action: verifyAction as unknown as JsonValue,
+      });
+      const verifyPlan: InternalRootWorkflowPhasePlan = Object.freeze({
+        commandType: "internal-workflow-phase" as const,
+        commandId: verifyIdentity.commandId,
+        idempotencyKey: verifyIdentity.idempotencyKey,
+        agentId: claim.ownerId,
+        expectedProjectId: b.projectId,
+        expectedVaultId: b.vaultId,
+        expectedWorkspaceId: b.workspaceId,
+        expectedBranchRef: this.#projectionBinding.branchRef,
+        workflowId: wf.workflowId as WorkflowId,
+        workflowGeneration: wf.generation,
+        sourcePhase: "validating" as const,
+        plannedWorkId: verifyIdentity.plannedWorkId,
+        claim: {
+          workflowId: wf.workflowId as WorkflowId,
+          workflowGeneration: wf.generation,
+          claimOwnerId: claim.ownerId,
+          claimToken: claim.claimToken.toString(),
+          claimExpiresAt: claim.claimExpiresAt,
+        },
+        plannedAction: verifyAction,
+      });
+      coordinator.execute(this.#rootContext, verifyPlan);
+    }
+
+    // 4. Release the root session lease BEFORE terminal completion sets terminal_event_position
+    const leaseRepo = new SessionLeaseRepository();
+    const currentLease = leaseRepo.current(this.#connection, b.projectId, sessionId);
+    if (currentLease && currentLease.releasedAtMs === null) {
+      leaseRepo.releaseCurrent(this.#connection, {
+        projectId: b.projectId,
+        sessionId,
+        ownerGeneration: currentLease.ownerGeneration,
+        ownerClientInstanceId: currentLease.ownerClientInstanceId,
+        expectedLastObservedAtMs: currentLease.lastObservedAtMs,
+        expectedExpiresAtMs: currentLease.expiresAtMs,
+        observedNowMs: BigInt(Date.now()),
+      });
+    }
+
+    // 5. Append terminal SessionEnded event (verification-passed -> completion-appended, semanticState -> ended)
+    const verifiedSnapshot = workflowRepo.read(this.#rootContext.binding.projectId, workflowId);
+    if (verifiedSnapshot && verifiedSnapshot.phase === "verification-passed") {
+      const { wf, claim } = ensureWorkflowClaim();
+      const rootRow = this.#authorityRepo.get(this.#connection, b.projectId, sessionId)!;
+      const fold = this.#authorityRepo.requireFoldMatch(this.#connection, rootRow);
+      if (fold.kind !== "root" || fold.verificationPassedEventPosition === null) {
+        throw new FreshStartError("FRESH_START_STORAGE_FAILURE");
+      }
+      const completeAction = Object.freeze({
+        action: "append-terminal-completion" as const,
+        verificationEventPosition: fold.verificationPassedEventPosition.toString(),
+        materializationTarget: "memory/session-end.md",
+      });
+      const completeIdentity = sessionEndPhaseIdentityV1({
+        projectId: b.projectId,
+        workflowId: wf.workflowId as WorkflowId,
+        workflowGeneration: wf.generation,
+        sourcePhase: "verification-passed",
+        action: completeAction as unknown as JsonValue,
+      });
+      const completePlan: InternalRootWorkflowPhasePlan = Object.freeze({
+        commandType: "internal-workflow-phase" as const,
+        commandId: completeIdentity.commandId,
+        idempotencyKey: completeIdentity.idempotencyKey,
+        agentId: claim.ownerId,
+        expectedProjectId: b.projectId,
+        expectedVaultId: b.vaultId,
+        expectedWorkspaceId: b.workspaceId,
+        expectedBranchRef: this.#projectionBinding.branchRef,
+        workflowId: wf.workflowId as WorkflowId,
+        workflowGeneration: wf.generation,
+        sourcePhase: "verification-passed" as const,
+        plannedWorkId: completeIdentity.plannedWorkId,
+        claim: {
+          workflowId: wf.workflowId as WorkflowId,
+          workflowGeneration: wf.generation,
+          claimOwnerId: claim.ownerId,
+          claimToken: claim.claimToken.toString(),
+          claimExpiresAt: claim.claimExpiresAt,
+        },
+        plannedAction: completeAction,
+      });
+      coordinator.execute(this.#rootContext, completePlan);
+    }
+
+    // 6. Complete workflow (completion-appended -> completed)
+    const preFinalSnapshot = workflowRepo.read(b.projectId, workflowId);
+    if (preFinalSnapshot && preFinalSnapshot.phase === "completion-appended") {
+      const { claim } = ensureWorkflowClaim();
+      coordinator.driveOnce({
+        context: this.#rootContext,
+        ownerId: claim.ownerId,
+        observedNowMs: BigInt(Date.now()),
+        leaseDurationMs,
+        claim,
+      });
+    }
+
+    const finalWf = workflowRepo.read(b.projectId, workflowId);
+    const finalAuth = this.#authorityRepo.get(this.#connection, b.projectId, sessionId);
+    if ((finalAuth?.semanticState ?? "ended") === "ended") {
+      this.#sessionTaskSummaries.delete(sessionId);
+    }
+    return {
+      phase: finalWf?.phase ?? "completed",
+      state: finalAuth?.semanticState ?? "ended",
+    };
+  }
+
+  async #collectSessionCurationSummary(
+    sessionId: string,
+    args: Record<string, unknown>,
+  ): Promise<{
+    readonly sessionNoteCount: number;
+    readonly candidateCountBeforeClose: number;
+    readonly autoPromotedCount: number;
+    readonly autoPromotedIds: readonly string[];
+    readonly learningReminder: string | null;
+  }> {
+    const allNotes = await this.#listProjectNotesFromProjection();
+    const sessionNotes = allNotes.filter((n) => n.sessionId === sessionId);
+    const candidateNotes = sessionNotes.filter(
+      (n) => n.status === "candidate" || n.status === "provisional",
+    );
+    const autoPromotedIds: string[] = [];
+    if (args.autoPromote === true || args.autoCurate === true) {
+      const seenSummaries = new Set<string>();
+      for (const cand of candidateNotes) {
+        const normSummary = cand.summary.trim().toLowerCase();
+        if (seenSummaries.has(normSummary)) continue;
+        seenSummaries.add(normSummary);
+        try {
+          const promoted = await this.#handlePromote({
+            recordId: cand.recordId,
+            targetStatus: "verified",
+            verificationMethod: "user-confirmed",
+            verificationAnchor: `session-end-curation:${sessionId}`,
+            reason: "Auto-promoted during session end curation",
+          });
+          if (promoted.ok) {
+            autoPromotedIds.push(cand.recordId);
+          }
+        } catch {
+          // Skip high-risk or non-promotable candidates gracefully.
+        }
+      }
+    }
+    return Object.freeze({
+      sessionNoteCount: sessionNotes.length,
+      candidateCountBeforeClose: candidateNotes.length,
+      autoPromotedCount: autoPromotedIds.length,
+      autoPromotedIds: Object.freeze(autoPromotedIds),
+      learningReminder:
+        sessionNotes.length === 0
+          ? "เซสชันนี้ยังไม่มีการบันทึก ADR / Insight / Mistake — แนะนำให้บันทึกบทเรียนสำคัญในเซสชันถัดไป"
+          : null,
+    });
+  }
+
+  async #handleSessionEnd(args: Record<string, unknown>): Promise<Record<string, unknown>> {
+    this.#refreshLiveGitBinding();
+    const sessionId =
+      this.#resolveOpenOrEndingRootSessionId(args.sessionId)
+      ?? (await this.#ensureActiveRootSession(args.sessionId));
+    const b = this.#rootContext.binding;
+    let authority = this.#authorityRepo.get(this.#connection, b.projectId, sessionId);
+    if (!authority) {
+      throw new FreshStartError("FRESH_START_INPUT_INVALID");
+    }
+    if (authority.semanticState === "ended" || authority.terminalAt !== null) {
+      this.#sessionTaskSummaries.delete(sessionId);
+      const curationSummary = await this.#collectSessionCurationSummary(sessionId, args);
+      return {
+        ok: true,
+        sessionId,
+        phase: "completed",
+        state: authority.semanticState,
+        curationSummary,
+      };
+    }
+
+    const leaseRepo = new SessionLeaseRepository();
+    const currentLease = leaseRepo.current(this.#connection, b.projectId, sessionId);
+    const nowMs = BigInt(Date.now());
+    const needsRecovery =
+      !currentLease
+      || currentLease.releasedAtMs !== null
+      || leaseRepo.isExpired(currentLease, nowMs)
+      || currentLease.ownerClientInstanceId !== b.clientInstanceId
+      || (authority.ownerGeneration !== null && currentLease.ownerGeneration !== authority.ownerGeneration);
+    if (needsRecovery && authority.latestCheckpointId !== null) {
+      await this.#handleRecoverSession({
+        sessionId,
+        reasonCode: "explicit-user-approval",
+      });
+      authority = this.#authorityRepo.get(this.#connection, b.projectId, sessionId)!;
+    }
+
+    if (authority.semanticState === "ending") {
+      const explicitWfId = typeof args.workflowId === "string" ? args.workflowId.trim() : "";
+      const wfRow = explicitWfId
+        ? { workflow_id: explicitWfId, phase: "requested" }
+        : (this.#connection
+            .prepare(
+              `SELECT workflow_id, phase FROM workflow_instances
+               WHERE project_id = $projectId AND session_id = $sessionId AND workflow_type = 'session-end'
+               ORDER BY generation DESC LIMIT 1`,
+            )
+            .get({
+              $projectId: b.projectId,
+              $sessionId: sessionId,
+            }) as { workflow_id?: string; phase?: string } | undefined);
+      const workflowId = String(wfRow?.workflow_id ?? "").trim();
+      if (!workflowId) {
+        throw new FreshStartError("FRESH_START_STORAGE_FAILURE");
+      }
+      const curationSummary = await this.#collectSessionCurationSummary(sessionId, args);
+      if (args.finalize === true || args.complete === true) {
+        const finalized = await this.#finalizeSessionEndWorkflow(sessionId, workflowId);
+        return {
+          ok: true,
+          sessionId,
+          workflowId,
+          phase: finalized.phase,
+          state: finalized.state,
+          curationSummary,
+        };
+      }
+      return {
+        ok: true,
+        sessionId,
+        workflowId,
+        phase: wfRow?.phase ?? "requested",
+        state: "ending",
+        curationSummary,
+      };
+    }
+
     await this.#handleCheckpoint({
       sessionId,
       taskSummary: String(args.summary ?? "Pre-session-end checkpoint"),
     });
-    const authority = this.#authorityRepo.get(this.#connection, b.projectId, sessionId)!;
+    authority = this.#authorityRepo.get(this.#connection, b.projectId, sessionId);
+    if (!authority || authority.ownerGeneration === null) {
+      throw new FreshStartError("FRESH_START_INPUT_INVALID");
+    }
 
     const summary = String(args.summary ?? "Requesting session end");
     const { draft: finalCheckpoint } = checkpointDraftFromArgs(
@@ -4404,7 +5983,7 @@ export class V2PublicToolRouter {
       authorizationSessionId: sessionId,
       targetSessionId: sessionId,
       capabilityKind: "root-session-handle",
-      capabilityGeneration: authority.ownerGeneration!.toString(),
+      capabilityGeneration: authority.ownerGeneration.toString(),
     });
     const proof = this.#mintProof(sessionId, this.#rootContext, (scope) => ({
       ...scope,
@@ -4439,18 +6018,42 @@ export class V2PublicToolRouter {
         publicResult: Record<string, unknown>;
       }
     ).publicResult;
+
+    const curationSummary = await this.#collectSessionCurationSummary(sessionId, args);
+
+    if (args.finalize === true || args.complete === true) {
+      const workflowId = String(pub.workflowId ?? "").trim();
+      if (!workflowId) {
+        throw new FreshStartError("FRESH_START_STORAGE_FAILURE");
+      }
+      const finalized = await this.#finalizeSessionEndWorkflow(sessionId, workflowId);
+      return {
+        ok: true,
+        ...pub,
+        phase: finalized.phase,
+        state: finalized.state,
+        curationSummary,
+      };
+    }
+
     return {
       ok: true,
       ...pub,
+      curationSummary,
     };
   }
 
   async #handleAmendSessionEnd(args: Record<string, unknown>): Promise<Record<string, unknown>> {
-    const sessionId = await this.#ensureActiveRootSession(args.sessionId);
+    const sessionId =
+      this.#resolveOpenOrEndingRootSessionId(args.sessionId)
+      ?? (await this.#ensureActiveRootSession(args.sessionId));
     const workflowId = String(args.workflowId ?? "").trim();
     if (!workflowId) throw new FreshStartError("FRESH_START_INPUT_INVALID");
     const b = this.#rootContext.binding;
-    const authority = this.#authorityRepo.get(this.#connection, b.projectId, sessionId)!;
+    const authority = this.#authorityRepo.get(this.#connection, b.projectId, sessionId);
+    if (!authority || authority.ownerGeneration === null) {
+      throw new FreshStartError("FRESH_START_INPUT_INVALID");
+    }
     const summary = String(args.summary ?? "Amended final checkpoint summary");
     const { draft: finalCheckpoint } = checkpointDraftFromArgs(
       summary,
@@ -4497,7 +6100,7 @@ export class V2PublicToolRouter {
       authorizationSessionId: sessionId,
       targetSessionId: sessionId,
       capabilityKind: "root-session-handle",
-      capabilityGeneration: authority.ownerGeneration!.toString(),
+      capabilityGeneration: authority.ownerGeneration.toString(),
     });
     const proof = this.#mintProof(sessionId, this.#rootContext, (scope) => ({
       ...scope,
@@ -4532,18 +6135,42 @@ export class V2PublicToolRouter {
         publicResult: Record<string, unknown>;
       }
     ).publicResult;
+
+    const curationSummary = await this.#collectSessionCurationSummary(sessionId, args);
+
+    if (args.finalize === true || args.complete === true) {
+      const workflowId = String(pub.workflowId ?? "").trim();
+      if (!workflowId) {
+        throw new FreshStartError("FRESH_START_STORAGE_FAILURE");
+      }
+      const finalized = await this.#finalizeSessionEndWorkflow(sessionId, workflowId);
+      return {
+        ok: true,
+        ...pub,
+        phase: finalized.phase,
+        state: finalized.state,
+        curationSummary,
+      };
+    }
+
     return {
       ok: true,
       ...pub,
+      curationSummary,
     };
   }
 
   async #handleCancelSessionEnd(args: Record<string, unknown>): Promise<Record<string, unknown>> {
-    const sessionId = await this.#ensureActiveRootSession(args.sessionId);
+    const sessionId =
+      this.#resolveOpenOrEndingRootSessionId(args.sessionId)
+      ?? (await this.#ensureActiveRootSession(args.sessionId));
     const workflowId = String(args.workflowId ?? "").trim();
     if (!workflowId) throw new FreshStartError("FRESH_START_INPUT_INVALID");
     const b = this.#rootContext.binding;
-    const authority = this.#authorityRepo.get(this.#connection, b.projectId, sessionId)!;
+    const authority = this.#authorityRepo.get(this.#connection, b.projectId, sessionId);
+    if (!authority || authority.ownerGeneration === null || !authority.latestCheckpointId) {
+      throw new FreshStartError("FRESH_START_INPUT_INVALID");
+    }
     const command = decodeLifecycleSemanticCommandDraft({
       commandType: "cancel-session-end",
       commandId: randomUUID(),
@@ -4556,7 +6183,7 @@ export class V2PublicToolRouter {
       sessionId,
       workflowId,
       expectedStreamVersion: this.#currentSessionStreamVersion(sessionId),
-      preTransitionCheckpointId: authority.latestCheckpointId!,
+      preTransitionCheckpointId: authority.latestCheckpointId,
     });
     const witness = buildLifecycleIntentWitness(command, {
       projectId: b.projectId,
@@ -4575,7 +6202,7 @@ export class V2PublicToolRouter {
       authorizationSessionId: sessionId,
       targetSessionId: sessionId,
       capabilityKind: "root-session-handle",
-      capabilityGeneration: authority.ownerGeneration!.toString(),
+      capabilityGeneration: authority.ownerGeneration.toString(),
     });
     const proof = this.#mintProof(sessionId, this.#rootContext, (scope) => ({
       ...scope,
@@ -4610,9 +6237,16 @@ export class V2PublicToolRouter {
         publicResult: Record<string, unknown>;
       }
     ).publicResult;
+
+    const curationSummary = await this.#collectSessionCurationSummary(sessionId, {
+      autoPromote: false,
+      autoCurate: false,
+    });
+
     return {
       ok: true,
       ...pub,
+      curationSummary,
     };
   }
 }

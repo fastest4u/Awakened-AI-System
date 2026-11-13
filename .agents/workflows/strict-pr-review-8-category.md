@@ -1,8 +1,4 @@
 ---
-description: strict-pr-review-8-category
----
-
----
 name: strict-pr-review-8-category
 description: ดำเนิน workflow ตรวจโค้ดแบบเข้มงวดผ่าน Pull Request โดยอัตโนมัติ — ตรวจ uncommitted/unpushed commits, จัดการ branch strategy, push, สร้าง PR ผ่าน GitHub MCP, รีวิวโค้ด 8 หมวดพร้อมจัดระดับ P0-P3, แก้ไขอัตโนมัติ, สรุปผลภาษาไทย, และ merge เฉพาะเมื่อไม่มีประเด็นค้าง. ใช้สำหรับโปรเจกต์ Awakened-AI-System (MCP Server).
 ---
@@ -23,7 +19,7 @@ description: ดำเนิน workflow ตรวจโค้ดแบบเข
 - เมื่อพบ P0-P3 ต้อง **หยุดกระบวนการ Merge ทันที แล้วทำการแก้ไขอัตโนมัติ (Auto-Fix)** โดยไม่ต้องถาม user — ยกเว้นมี business ambiguity ที่ไม่สามารถอนุมานจากโค้ดได้
 - หลังแก้ไขแล้ว → ดำเนินการ commit, push, แล้ว **รีวิวรอบใหม่ทั้งหมด** จนกว่าจะเคลียร์ทุกประเด็นจนสะอาด (สูงสุด 3 รอบ) ถึงจะอนุญาตให้ Merge ได้
 - ตรวจเฉพาะ code ใน diff — ห้ามยก issue ของ pre-existing code ที่ไม่ได้แก้
-- สำหรับ Awakened-AI-System: แก้ไขเฉพาะในโฟลเดอร์ `src/` เป็นหลัก ห้ามแก้ไขไฟล์ใน `dist/` หรือ `memory/` โดยตรงหากไม่ได้รับอนุญาต และห้ามยุ่งกับตัวแปร Secret ใน `.env` เด็ดขาด
+- สำหรับ Awakened-AI-System: แก้ไขเฉพาะในโฟลเดอร์ `src/` เป็นหลัก ห้ามแก้ไขไฟล์ใน `dist/` โดยตรง, ห้ามเขียนหรือแตะต้อง `memory/` (frozen read-only V1 archive `0o444`) โดยเด็ดขาด (ใช้ `memory-v2/` ผ่าน Project Memory V2 MCP เท่านั้น), และห้ามยุ่งกับตัวแปร Secret ใน `.env` เด็ดขาด
 
 ---
 
@@ -115,7 +111,7 @@ git push
 
 ### 4) Performance
 
-- ตรวจสอบระบบอ่านเขียนไฟล์ผ่าน Obsidian-first memory vault ไม่เกิดลูปหรือโหลดไฟล์ซ้ำซ้อนโดยไม่จำเป็น
+- ตรวจสอบระบบอ่านเขียนผ่าน Project Memory V2 (`memory-v2/` event-sourced SQLite projections) ไม่เกิดลูปหรือเปิด/สแกนฐานข้อมูลซ้ำซ้อนโดยไม่จำเป็น
 - ไม่เก็บข้อมูล File System จำนวนมากลงใน memory หลีกเลี่ยงการดึงไฟล์ทั้งโฟลเดอร์หากไม่จำเป็น
 
 ### 5) Maintainability & Readability
@@ -125,13 +121,13 @@ git push
 
 ### 6) Architecture & Design (MCP Server Rules)
 
-- **P0**: มีการแก้ไขโครงสร้างการจัดเก็บไฟล์ Memory โดยไม่ใช้รูปแบบ Markdown/Obsidian ที่ถูกต้อง หรือตั้งชื่อไฟล์ผิดกฎ (ใช้จุดแทน underscore เป็นต้น)
-- **P1**: เขียนทับไฟล์เก่าแบบทำลายข้อมูลเดิมโดยไม่จำเป็น (ควรใช้ append หรือสร้างไฟล์ใหม่)
-- โครงสร้างของ MCP Server (`controllers/`, `services/`) ถูกจัดวางเป็นสัดส่วนชัดเจนตามหลัก OOP
+- **P0**: มีการเขียนหรือแก้ไขโฟลเดอร์ `memory/` (frozen read-only V1 archive `0o444`) โดยตรง หรือละเมิด schema/append-only event log ของ `memory-v2/`
+- **P1**: ข้ามขั้นตอน governed lifecycle ของ Project Memory V2 (`memory_sessionStart`, `memory_selfCheck`, `memory_sessionEnd`, `memory_verifyVault`)
+- โครงสร้างของ Project Memory V2 (`src/v2/`, `src/orchestrator/`) แยกส่วนงานระหว่าง public MCP tools, composition, curator และ WebUI อย่างชัดเจน
 
 ### 7) Testing & Quality Gates
 
-- ตรวจสอบ logic เชิงลึกด้วยตา เนื่องจากการขาด automated test ในระบบส่วนใหญ่
+- ตรวจสอบและรัน automated test suite (`npm run typecheck`, `npm run build`, `npm test`) ก่อนสรุปผลเสมอ
 - ระมัดระวังการเปลี่ยนโครงสร้างข้อมูลใน SQL migrations ที่อาจกระทบโค้ด runtime
 
 ### 8) Compatibility & Deployment Risk

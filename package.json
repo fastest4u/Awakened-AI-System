@@ -3,19 +3,23 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "MCP server for an Obsidian-based memory vault",
-  "main": "dist/index.js",
+  "description": "Project Memory V2 MCP server, governed SQLite event store, and WebUI Mission Control",
+  "main": "dist/v2.js",
   "bin": {
-    "memory-vault": "dist/cli.js"
+    "memory-vault": "dist/cli.js",
+    "project-memory-v2": "dist/v2.js",
+    "project-memory-v2-admin": "dist/v2-admin.js"
   },
   "engines": {
     "node": ">=24.16.0"
   },
   "scripts": {
+    "test:v2": "npm run test:build && node --test --test-concurrency=1 --test-reporter=spec dist-test/tests/v2-public-mcp-tools.test.js dist-test/tests/v2-ai-ide-acceleration.test.js dist-test/tests/v2-webui-and-curator.test.js dist-test/tests/v2-admin-cutover-and-release-gate.test.js",
     "test:v2-full-body-notes": "node scripts/run-v2-full-body-notes.js",
     "test:v2-governed-summary-commands": "node scripts/run-v2-governed-summary-commands.js",
-    "dev": "npm run build && node dist/index.js",
-    "start": "node dist/index.js",
+    "dev": "npm run build && node dist/v2.js",
+    "start": "node dist/v2.js",
+    "start:v1": "node dist/index.js",
     "start:v2": "npm run check:runtime && node dist/v2.js",
     "v2-admin": "npm run check:runtime && node dist/v2-admin.js",
     "webui": "npm run check:runtime && node dist/v2-admin.js webui",

@@ -66,13 +66,16 @@ function measuredIdentity(manifest: Record<string, unknown>, runtime: Record<str
   return measured;
 }
 
+let cachedExecSha256: string | undefined;
+
 /** Independent local integrity measurement, not production release attestation. */
 export function inspectV2Build(entryUrl: string = import.meta.url): string {
   try {
     const root = deploymentRoot(entryUrl);
     const manifest = manifestBody(bytes(join(root, "v2-build.json"), 16384).toString("utf8"));
     const runtime = runtimePolicy(manifest);
-    if (runtime.executableSha256 !== digest(readFileSync(process.execPath))) fail();
+    cachedExecSha256 ??= digest(readFileSync(process.execPath));
+    if (runtime.executableSha256 !== cachedExecSha256) fail();
     const artifacts = artifactDescriptors(manifest);
     artifacts.forEach((artifact, index) => {
       const actual = bytes(join(root, artifactNames[index]!), 32 * 1024 * 1024);

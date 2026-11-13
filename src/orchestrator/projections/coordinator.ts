@@ -5,6 +5,7 @@ import {
   readFileSync,
   realpathSync,
   readdirSync,
+  unlinkSync,
 } from "node:fs";
 import { basename, isAbsolute, join, normalize, resolve } from "node:path";
 
@@ -590,6 +591,132 @@ export class V2ProjectionBuildCoordinator {
     return this.#ensureProfile(3, binding, requiredEventPosition, deadlineMs) as Promise<PublishedProjectionGenerationV3>;
   }
 
+  async rotateScopeIfMismatched(binding: ProjectBinding): Promise<boolean> {
+    return this.#serialized(binding.projectId, async () => {
+      if (!this.#assertProjectionDirectorySafe()) return false;
+      const identity = this.#requiredDirectoryIdentity();
+      const lease = acquireProjectionManifestPublicationLease(this.#projectionDirectory);
+      if (!sameProjectionDirectoryIdentity(identity, lease.directoryIdentity)) {
+        lease.release(true);
+        throw new Error("PROJECTION_PATH_INVALID");
+      }
+      let retainLock = false;
+      let primary: unknown;
+      try {
+        const snapshot = filesystemStableProjectionDirectoryOperations.captureManifest(
+          this.#projectionDirectory,
+          identity,
+        );
+        if (snapshot.state === "missing") return false;
+        let existing: Record<string, unknown>;
+        try {
+          const parsed = JSON.parse(
+            Buffer.from(snapshot.bytesBase64, "base64").toString("utf8"),
+          ) as unknown;
+          if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+            return false;
+          }
+          existing = parsed as Record<string, unknown>;
+        } catch {
+          return false;
+        }
+
+        if (
+          existing.projectId !== binding.projectId
+          || existing.vaultId !== binding.vaultId
+          || existing.storeId !== binding.storeId
+        ) {
+          return false;
+        }
+        if (existing.schemaVersion !== 2 && existing.schemaVersion !== 3) {
+          return false;
+        }
+        if (
+          existing.workspaceId === binding.workspaceId
+          && (existing.branchScopeId ?? null) === binding.branchScopeId
+          && (existing.branchRef ?? null) === binding.branchRef
+        ) {
+          return false;
+        }
+        if (typeof existing.workspaceId !== "string" || existing.workspaceId.length === 0) {
+          throw new Error("PROJECTION_PUBLICATION_RECOVERY_REQUIRED");
+        }
+        const existingBinding: ProjectBinding = Object.freeze({
+          projectId: binding.projectId,
+          vaultId: binding.vaultId,
+          storeId: binding.storeId,
+          workspaceId: existing.workspaceId as ProjectBinding["workspaceId"],
+          branchScopeId: (typeof existing.branchScopeId === "string"
+            ? existing.branchScopeId
+            : null) as ProjectBinding["branchScopeId"],
+          branchRef: typeof existing.branchRef === "string" ? existing.branchRef : null,
+          sessionId: null,
+        });
+        const parsedExisting = parseRichProjectionManifest(existing, existingBinding);
+
+        const leased = new Set(this.#leasedFilenames());
+        const preScanFilenames = readdirSync(this.#projectionDirectory).sort();
+        for (const filename of preScanFilenames) {
+          if (V2_GENERATION_FILE.test(filename) && leased.has(filename)) {
+            throw new V2ProjectionLeaseUnavailableError();
+          }
+        }
+
+        retainLock = true;
+        this.#cleanupKnownTemps();
+        let maxObserved = Math.max(
+          parsedExisting.generation,
+          parsedExisting.highestObservedGeneration,
+        );
+        for (const filename of preScanFilenames) {
+          const match = V2_GENERATION_FILE.exec(filename);
+          if (match !== null) {
+            maxObserved = Math.max(maxObserved, Number(match[1]));
+          }
+        }
+        this.#reconciliationJournal.reserveAtLeast(
+          this.#projectionDirectory,
+          identity,
+          lease.lockToken,
+          maxObserved,
+        );
+
+        // Reconcile prior retirement intents and retire all old-scope generation
+        // files FIRST while projection-manifest.json still records existingBinding.
+        this.#reconcileUnpublished(null, identity, lease.lockToken, existingBinding);
+
+        for (const filename of readdirSync(this.#projectionDirectory)) {
+          if (V2_GENERATION_FILE.test(filename)) {
+            throw new V2ProjectionLeaseUnavailableError();
+          }
+        }
+
+        const manifestPath = join(this.#projectionDirectory, PROJECTION_MANIFEST_FILENAME);
+        try {
+          const mStat = lstatSync(manifestPath);
+          if (mStat.isSymbolicLink() || !mStat.isFile()) {
+            throw new Error("PROJECTION_PATH_INVALID");
+          }
+          unlinkSync(manifestPath);
+        } catch (err) {
+          if (!notFound(err)) throw err;
+        }
+
+        retainLock = false;
+        return true;
+      } catch (error) {
+        primary = error;
+        throw error;
+      } finally {
+        try {
+          lease.release(retainLock);
+        } catch (error) {
+          if (primary === undefined) throw error;
+        }
+      }
+    });
+  }
+
   async #ensureProfile(profile: 2 | 3, binding: ProjectBinding, requiredEventPosition: bigint, deadlineMs: number): Promise<RichPublished> {
     if (
       typeof requiredEventPosition !== "bigint"
@@ -1072,10 +1199,13 @@ export class V2ProjectionBuildCoordinator {
     const filenames = readdirSync(this.#projectionDirectory).sort();
     const filenamesPresent = new Set(filenames);
     assertStrictRetirementEvidence(filenamesPresent);
+    const needsFullRescan =
+      this.#faultInjector !== undefined || records.some((r) => r.state !== "retired");
     for (const record of resolvedRecords) {
       if (record.state !== "retired" || !filenamesPresent.has(record.retiredFilename)) {
         throw new Error("PROJECTION_PUBLICATION_RECOVERY_REQUIRED");
       }
+      if (!needsFullRescan) continue;
       let retired: StableProjectionGenerationIdentity | null;
       try {
         retired = filesystemStableProjectionDirectoryOperations.captureRetiredGeneration(

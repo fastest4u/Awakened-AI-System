@@ -432,10 +432,25 @@ export function renderShadcnThemeCss(): string {
     grid-template-columns: repeat(3, 1fr);
     gap: 1rem;
   }
+  .pm-mobile-nav {
+    display: none;
+  }
   @media (max-width: 1024px) {
     .pm-shell { grid-template-columns: 1fr; }
     .pm-sidebar { display: none; }
     .pm-kanban-grid { grid-template-columns: 1fr; }
+    .pm-topbar { padding: 0.7rem 1rem; }
+    .pm-content { padding: 1rem 1rem 2rem; }
+    .pm-mobile-nav {
+      display: flex;
+      align-items: center;
+      gap: 0.35rem;
+      overflow-x: auto;
+      padding: 0.5rem 1rem;
+      border-bottom: 1px solid hsl(var(--border));
+      background-color: hsla(var(--card), 0.92);
+      backdrop-filter: blur(10px);
+    }
   }
   `;
 }
@@ -760,6 +775,34 @@ export function renderShadcnUiJs(): string {
     terminal: [
       ["polyline", { points: "4 17 10 11 4 5" }],
       ["line", { x1: "12", x2: "20", y1: "19", y2: "19" }],
+    ],
+    crosshair: [
+      ["circle", { cx: "12", cy: "12", r: "10" }],
+      ["line", { x1: "22", x2: "18", y1: "12", y2: "12" }],
+      ["line", { x1: "6", x2: "2", y1: "12", y2: "12" }],
+      ["line", { x1: "12", x2: "12", y1: "6", y2: "2" }],
+      ["line", { x1: "12", x2: "12", y1: "22", y2: "18" }],
+    ],
+    "map-pin": [
+      ["path", { d: "M20 10c0 6-8 12-8 12s-8-6-8-12a8 8 0 0 1 16 0Z" }],
+      ["circle", { cx: "12", cy: "10", r: "3" }],
+    ],
+    "link-2": [
+      ["path", { d: "M9 17H7A5 5 0 0 1 7 7h2" }],
+      ["path", { d: "M15 7h2a5 5 0 1 1 0 10h-2" }],
+      ["line", { x1: "8", x2: "16", y1: "12", y2: "12" }],
+    ],
+    "external-link": [
+      ["path", { d: "M15 3h6v6" }],
+      ["path", { d: "M10 14 21 3" }],
+      ["path", { d: "M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" }],
+    ],
+    "share-2": [
+      ["circle", { cx: "18", cy: "5", r: "3" }],
+      ["circle", { cx: "6", cy: "12", r: "3" }],
+      ["circle", { cx: "18", cy: "19", r: "3" }],
+      ["line", { x1: "8.59", x2: "15.42", y1: "13.51", y2: "17.49" }],
+      ["line", { x1: "15.41", x2: "8.59", y1: "6.51", y2: "10.49" }],
     ],
     circle: [["circle", { cx: "12", cy: "12", r: "8" }]],
   };

@@ -938,3 +938,323 @@ test("read-only-recovery mode, coordinator V3 reconciliation journal, and govern
     fixture.cleanup();
   }
 });
+
+test("MCP stdio server exposes resource templates, note/session/graph resources, ?projectRoot= routing, and session-handoff prompt with read-only purity", async () => {
+  const fixture = await createStoreFixture({ productionProfile: true, promoteMode: "active" });
+  try {
+    await withMcpClient(fixture, async (client) => {
+      const started = parseToolJson(
+        await client.callTool({
+          name: "memory_sessionStart",
+          arguments: {
+            agentName: "mcp-resource-tester",
+            taskSummary: "Seed note for MCP resource template verification",
+            includeContext: false,
+          },
+        }),
+      );
+      const sessionId = String(started.sessionId);
+      const created = parseToolJson(
+        await client.callTool({
+          name: "memory_writeADR",
+          arguments: {
+            sessionId,
+            title: "Resource Template Exposure Policy",
+            summary: "Expose governed notes and sessions via MCP URI templates.",
+            autoVerify: true,
+          },
+        }),
+      );
+      const recordId = String(created.recordId);
+
+      // Snapshot event count BEFORE resource & prompt reads
+      const roBefore = new DatabaseSync(fixture.eventsPath, { readOnly: true });
+      const eventsBefore = Number(
+        (roBefore.prepare("SELECT COUNT(*) AS cnt FROM events").get() as { cnt: number | bigint }).cnt,
+      );
+      roBefore.close();
+
+      const templates = await client.listResourceTemplates();
+      const templateUris = templates.resourceTemplates.map((t) => t.uriTemplate);
+      assert.ok(templateUris.includes("memory://notes/{recordId}"), "Missing memory://notes/{recordId} template");
+      assert.ok(templateUris.includes("memory://sessions/{sessionId}"), "Missing memory://sessions/{sessionId} template");
+
+      const resources = await client.listResources();
+      const resourceUris = resources.resources.map((r) => r.uri);
+      assert.ok(resourceUris.includes("memory://current/adrs"));
+      assert.ok(resourceUris.includes("memory://current/mistakes"));
+      assert.ok(resourceUris.includes("memory://graph"));
+
+      const readText = (res: Awaited<ReturnType<Client["readResource"]>>): string => {
+        const first = res.contents[0];
+        return first && "text" in first ? first.text : "";
+      };
+
+      const noteRes = await client.readResource({ uri: `memory://notes/${recordId}` });
+      assert.ok(readText(noteRes).includes("Resource Template Exposure Policy"));
+
+      const sessionRes = await client.readResource({ uri: `memory://sessions/${sessionId}` });
+      assert.ok(readText(sessionRes).includes(sessionId));
+
+      const graphRes = await client.readResource({
+        uri: `memory://graph?projectRoot=${encodeURIComponent(fixture.projectRoot)}`,
+      });
+      const graphPayload = JSON.parse(readText(graphRes) || "{}") as {
+        nodes?: Array<{ id: string }>;
+      };
+      assert.ok(graphPayload.nodes?.some((n) => n.id === `note:${recordId}`));
+
+      const radarStaticRes = await client.readResource({ uri: "memory://current/radar" });
+      assert.ok(readText(radarStaticRes).length > 2);
+
+      const unencodedRoot = fixture.projectRoot.replace(/\\/gu, "/");
+      const projStatusRes = await client.readResource({
+        uri: `memory://projects/${unencodedRoot}/status`,
+      });
+      assert.equal((JSON.parse(readText(projStatusRes)) as { ok?: boolean }).ok, true);
+
+      const projRadarRes = await client.readResource({
+        uri: `memory://projects/${unencodedRoot}/radar`,
+      });
+      assert.ok(readText(projRadarRes).length > 2);
+
+      const unregDir = mkdtempSync(join(tmpdir(), "pm-v2-unreg-res-"));
+      try {
+        await assert.rejects(
+          () =>
+            client.readResource({
+              uri: `memory://graph?projectRoot=${encodeURIComponent(unregDir)}`,
+            }),
+        );
+        assert.equal(
+          existsSync(join(unregDir, "memory-v2")),
+          false,
+          "Read-only resource lookup must not auto-bootstrap an uninitialized projectRoot",
+        );
+      } finally {
+        rmSync(unregDir, { recursive: true, force: true });
+      }
+
+      const prompts = await client.listPrompts();
+      assert.ok(prompts.prompts.some((p) => p.name === "session-handoff"));
+      const handoff = await client.getPrompt({
+        name: "session-handoff",
+        arguments: { sessionId },
+      });
+      assert.ok(handoff.messages.length >= 1);
+
+      const roAfter = new DatabaseSync(fixture.eventsPath, { readOnly: true });
+      const eventsAfter = Number(
+        (roAfter.prepare("SELECT COUNT(*) AS cnt FROM events").get() as { cnt: number | bigint }).cnt,
+      );
+      roAfter.close();
+      assert.equal(eventsAfter, eventsBefore, "Reading MCP resources and prompts must append 0 events");
+
+      // Verify finalizing an already-'ending' session & forgetEvidence MEMORY_RULES.md refresh
+      mkdirSync(join(fixture.projectRoot, ".antigravity"), { recursive: true });
+      const rulesAdr = parseToolJson(
+        await client.callTool({
+          name: "memory_writeADR",
+          arguments: {
+            sessionId,
+            title: "Clean Rules Sync Title",
+            summary: "Ensure MEMORY_RULES.md never duplicates titles and refreshes on forgetEvidence.",
+            body: "# Clean Rules Sync Title\n\nGoverned body.\n",
+            autoVerify: true,
+          },
+        }),
+      );
+      const rulesFilePath = join(fixture.projectRoot, ".antigravity", "MEMORY_RULES.md");
+      const rulesBeforeErase = readFileSync(rulesFilePath, "utf8");
+      assert.ok(rulesBeforeErase.includes("Clean Rules Sync Title"));
+      assert.equal(
+        rulesBeforeErase.includes("Clean Rules Sync Title**: ADR: Clean Rules Sync Title"),
+        false,
+        "MEMORY_RULES.md must not repeat the title verbatim in the summary",
+      );
+
+      await client.callTool({
+        name: "memory_forgetEvidence",
+        arguments: {
+          recordIds: [String(rulesAdr.recordId)],
+          reason: "Test immediate projection and MEMORY_RULES.md refresh on erasure",
+        },
+      });
+      const rulesAfterErase = readFileSync(rulesFilePath, "utf8");
+      assert.equal(
+        rulesAfterErase.includes(String(rulesAdr.recordId)),
+        false,
+        "Erased ADR must be removed immediately from MEMORY_RULES.md",
+      );
+
+      const endStep1 = parseToolJson(
+        await client.callTool({
+          name: "memory_sessionEnd",
+          arguments: {
+            sessionId,
+            summary: "Request session end first",
+          },
+        }),
+      );
+      assert.equal(endStep1.phase, "requested");
+
+      // Finalize the already-'ending' session when sessionId is omitted
+      const endStep2 = parseToolJson(
+        await client.callTool({
+          name: "memory_sessionEnd",
+          arguments: {
+            finalize: true,
+            summary: "Finalize already-ending root session",
+          },
+        }),
+      );
+      assert.equal(endStep2.sessionId, sessionId);
+      assert.equal(endStep2.state, "ended");
+    });
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("Strict PR #17 regressions: complete tool schemas, non-mutating routed reads on prepared stores, cross-project status releaseId, malformed URI errors, and non-promoting cancelSessionEnd", async () => {
+  const hostFixture = await createStoreFixture({ productionProfile: true, promoteMode: "active" });
+  const preparedTarget = await createStoreFixture({ productionProfile: true, promoteMode: "prepared" });
+  const distinctActiveTarget = await createStoreFixture({ productionProfile: true, promoteMode: "active" });
+  assert.notEqual(
+    hostFixture.config.releaseId,
+    distinctActiveTarget.config.releaseId,
+    "Secondary active project must have its own distinct releaseId",
+  );
+
+  try {
+    await withMcpClient(hostFixture, async (client) => {
+      // 1. F7.4: PUBLIC_TOOL_SCHEMA_CATALOG exposes all handler-accepted properties
+      const listedTools = await client.listTools();
+      const schemaProps = (toolName: string) =>
+        ((
+          listedTools.tools.find((t) => t.name === toolName)?.inputSchema as
+            | { properties?: Record<string, unknown> }
+            | undefined
+        )?.properties ?? {});
+
+      assert.ok("autoDetectFiles" in schemaProps("memory_sessionStart"));
+      assert.ok("autoDetectFiles" in schemaProps("memory_contextPack"));
+      assert.ok("filesTouched" in schemaProps("memory_contextPack"));
+      assert.ok("autoDetectFiles" in schemaProps("memory_selfCheck"));
+      assert.ok("autoCurate" in schemaProps("memory_sessionEnd"));
+      assert.ok("workflowId" in schemaProps("memory_sessionEnd"));
+      assert.ok("finalize" in schemaProps("memory_amendSessionEnd"));
+      assert.ok("autoPromote" in schemaProps("memory_amendSessionEnd"));
+      assert.ok("recordIds" in schemaProps("memory_forgetEvidence"));
+      assert.ok("evidenceIds" in schemaProps("memory_forgetEvidence"));
+
+      // 2. F4.3: Malformed percent-encoded URI returns FRESH_START_INPUT_INVALID (never raw URIError)
+      await assert.rejects(
+        () => client.readResource({ uri: "memory://notes/%E0%A4%A" }),
+        /FRESH_START_INPUT_INVALID/u,
+      );
+
+      // 3. F4.2: Cross-project status resource succeeds when target project has a distinct releaseId
+      const targetStatusRes = await client.readResource({
+        uri: `memory://projects/${encodeURIComponent(distinctActiveTarget.projectRoot)}/status`,
+      });
+      const targetStatusJson = JSON.parse(
+        (targetStatusRes.contents[0] as { text?: string } | undefined)?.text ?? "{}",
+      ) as { projectId?: string; mode?: string };
+      assert.equal(targetStatusJson.projectId, distinctActiveTarget.release.projectId);
+      assert.equal(targetStatusJson.mode, "active");
+
+      // 4. F3.2 & R2-3: Both read-only AND mutating routed tools against an already-initialized 'prepared' store must fail closed and NEVER promote it to 'active'
+      await assert.rejects(
+        () =>
+          client.callTool({
+            name: "memory_list",
+            arguments: { projectRoot: preparedTarget.projectRoot, limit: 5 },
+          }),
+        /FRESH_START_RELEASE_NOT_READY/u,
+      );
+      await assert.rejects(
+        () =>
+          client.callTool({
+            name: "memory_sessionStart",
+            arguments: {
+              projectRoot: preparedTarget.projectRoot,
+              agentName: "mutating-probe",
+              includeContext: false,
+            },
+          }),
+        /FRESH_START_RELEASE_NOT_READY/u,
+      );
+      const driver = new NodeSqliteDriver({ DatabaseSync });
+      const preparedConn = driver.open(preparedTarget.eventsPath, { mode: "existing", busyTimeoutMs: 1_000 });
+      try {
+        const preparedRepo = new SqliteFreshStartRepository(preparedConn);
+        const stateRow = preparedRepo.transact(
+          {
+            projectId: preparedTarget.release.projectId,
+            vaultId: preparedTarget.release.vaultId,
+            storeId: preparedTarget.release.storeId,
+          },
+          (tx) => tx.state(),
+        );
+        assert.equal(
+          stateRow?.mode,
+          "prepared",
+          "Neither read-only nor mutating routed MCP tools may silently promote an initialized prepared store to active",
+        );
+      } finally {
+        preparedConn.close();
+      }
+
+      // 5. F7.2: memory_cancelSessionEnd must NOT promote candidate notes even if autoPromote: true is passed
+      const started = parseToolJson(
+        await client.callTool({
+          name: "memory_sessionStart",
+          arguments: { agentName: "cancel-guard-agent", includeContext: false },
+        }),
+      );
+      const sessionId = String(started.sessionId);
+      const candidateInsight = parseToolJson(
+        await client.callTool({
+          name: "memory_writeInsight",
+          arguments: {
+            sessionId,
+            title: "Unverified Candidate Insight Before Cancel",
+            summary: "Candidate note must remain candidate if session end is cancelled.",
+          },
+        }),
+      );
+      const endReq = parseToolJson(
+        await client.callTool({
+          name: "memory_sessionEnd",
+          arguments: { sessionId, summary: "Requesting end before cancel" },
+        }),
+      );
+      const cancelled = parseToolJson(
+        await client.callTool({
+          name: "memory_cancelSessionEnd",
+          arguments: {
+            sessionId,
+            workflowId: String(endReq.workflowId),
+          },
+        }),
+      );
+      assert.equal(cancelled.phase, "cancelled");
+      assert.equal(
+        (cancelled.curationSummary as { autoPromotedCount?: number } | undefined)?.autoPromotedCount,
+        0,
+      );
+      const fetchedCandidate = parseToolJson(
+        await client.callTool({
+          name: "memory_get",
+          arguments: { id: String(candidateInsight.recordId) },
+        }),
+      );
+      assert.equal(fetchedCandidate.status, "candidate");
+    });
+  } finally {
+    hostFixture.cleanup();
+    preparedTarget.cleanup();
+    distinctActiveTarget.cleanup();
+  }
+});

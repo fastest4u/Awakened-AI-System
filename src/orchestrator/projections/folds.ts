@@ -875,6 +875,7 @@ export function foldProjectionEvent(state: ProjectionFoldState, event: Projectio
 class ProjectionFoldAccumulatorCore {
   #binding: ProjectBinding | null = null;
   #terminalEventPosition: bigint | null = null;
+  readonly #crossScopeItemIds: ReadonlySet<string> | undefined;
   readonly #sessionTree = new Map<string, SessionTreeProjection>();
   readonly #openChildCounts = new Map<string, number>();
   readonly #sessionCheckpoints: SessionCheckpointProjection[] = [];
@@ -890,6 +891,10 @@ class ProjectionFoldAccumulatorCore {
   readonly #checkpointChunks = new Map<string, Set<string>>();
   readonly #retrievalFeedback = new Map<string, RetrievalFeedbackProjection>();
   readonly #canonicalConflicts = new Map<string, CanonicalConflictProjectionRowV1>();
+
+  constructor(crossScopeItemIds?: ReadonlySet<string>) {
+    this.#crossScopeItemIds = crossScopeItemIds;
+  }
 
   canonicalConflicts(): readonly CanonicalConflictProjectionRowV1[] {
     return Object.freeze([...this.#canonicalConflicts.values()]);
@@ -1198,7 +1203,16 @@ class ProjectionFoldAccumulatorCore {
     }
 
     const current = this.#canonicalItems.get(event.recordId);
-    if (current === undefined) return integrity();
+    // In a branch-scoped git projection, skip ONLY known cross-scope itemIds recorded in the same project store.
+    if (current === undefined) {
+      if (
+        (this.#binding?.branchScopeId ?? null) !== null
+        && this.#crossScopeItemIds?.has(event.recordId) === true
+      ) {
+        return;
+      }
+      return integrity();
+    }
     if (
       current.status !== event.targetStatus
       && !GOVERNED_LIFECYCLE_STATUS_TRANSITIONS[current.status].includes(event.targetStatus)
@@ -1477,10 +1491,14 @@ export class ProjectionFoldAccumulator extends ProjectionFoldAccumulatorCore {
 }
 
 export class ProjectionFoldAccumulatorV3 {
-  readonly #core = new ProjectionFoldAccumulatorCore();
+  readonly #core: ProjectionFoldAccumulatorCore;
   readonly #governedNotes = new Map<string, GovernedNoteProjectionRowV1>();
   #lastSourcePosition: bigint | null = null;
   #binding: ProjectBinding | null = null;
+
+  constructor(crossScopeItemIds?: ReadonlySet<string>) {
+    this.#core = new ProjectionFoldAccumulatorCore(crossScopeItemIds);
+  }
 
   append(source: ProjectionSourceDisposition): void {
     const decoded = decodeProjectionSourceV3(source);

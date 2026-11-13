@@ -5,10 +5,14 @@ export function renderVendorRuntimeJs(): string {
 // Exports: window.React, window.ReactDOM, window.TanStackQuery, window.TanStackTable
 // ============================================================================
 (function (global) {
-  const SVG_TAGS = new Set(["svg", "g", "line", "circle", "text", "path", "rect", "defs", "marker", "linearGradient", "stop", "polyline", "polygon"]);
+  const SVG_TAGS = new Set(["svg", "g", "line", "circle", "text", "path", "rect", "defs", "marker", "linearGradient", "stop", "polyline", "polygon", "title"]);
   const Fragment = Symbol("React.Fragment");
 
+  const sharedComponentHooks = new Map();
+  const activeRoots = new Set();
+  let mountCounter = 0;
   let currentRoot = null;
+  let currentComponentKey = "root";
   let hookCursor = 0;
 
   function createElement(type, props, ...children) {
@@ -44,8 +48,21 @@ export function renderVendorRuntimeJs(): string {
 
   function getHookSlot() {
     if (!currentRoot) throw new Error("React Hook called outside render");
+    const rootId = currentRoot.mountId || currentRoot.rootTag || "ROOT";
+    const projScope =
+      currentRoot.container && currentRoot.container.getAttribute
+        ? currentRoot.container.getAttribute("project-root") ||
+          currentRoot.container.getAttribute("default-project") ||
+          ""
+        : "";
+    const key = rootId + "::" + projScope + "::" + (currentComponentKey || "root");
+    let hooks = sharedComponentHooks.get(key);
+    if (!hooks) {
+      hooks = [];
+      sharedComponentHooks.set(key, hooks);
+    }
+    currentRoot.ownedHookKeys.add(key);
     const idx = hookCursor++;
-    const hooks = currentRoot.hooks;
     return { hooks, idx };
   }
 
@@ -56,6 +73,9 @@ export function renderVendorRuntimeJs(): string {
       hooks[idx] = typeof initialValue === "function" ? initialValue() : initialValue;
     }
     const setState = (updater) => {
+      if (rootRef.unmounted) {
+        return;
+      }
       const prev = hooks[idx];
       const next = typeof updater === "function" ? updater(prev) : updater;
       if (!Object.is(prev, next)) {
@@ -117,7 +137,7 @@ export function renderVendorRuntimeJs(): string {
     }
   }
 
-  function renderVNodeToDom(vnode, isSvg = false) {
+  function renderVNodeToDom(vnode, isSvg = false, path = "0") {
     if (vnode === null || vnode === undefined || typeof vnode === "boolean") {
       return document.createTextNode("");
     }
@@ -126,26 +146,49 @@ export function renderVendorRuntimeJs(): string {
     }
     if (Array.isArray(vnode)) {
       const frag = document.createDocumentFragment();
-      vnode.forEach((child) => frag.appendChild(renderVNodeToDom(child, isSvg)));
+      vnode.forEach((child, i) => frag.appendChild(renderVNodeToDom(child, isSvg, path + "." + i)));
       return frag;
     }
     if (vnode.type === Fragment) {
       const frag = document.createDocumentFragment();
-      (vnode.props.children || []).forEach((child) => frag.appendChild(renderVNodeToDom(child, isSvg)));
+      (vnode.props.children || []).forEach((child, i) => frag.appendChild(renderVNodeToDom(child, isSvg, path + ".f" + i)));
       return frag;
     }
     if (typeof vnode.type === "function") {
-      const subTree = vnode.type(vnode.props || {});
-      return renderVNodeToDom(subTree, isSvg);
+      const prevCompKey = currentComponentKey;
+      const prevCursor = hookCursor;
+      const compName = vnode.type.displayName || vnode.type.name || "Component";
+      const explicitKey = vnode.props && vnode.props.key != null ? String(vnode.props.key) : "";
+      currentComponentKey = path + ":" + compName + ":" + explicitKey;
+      hookCursor = 0;
+      let subTree;
+      try {
+        subTree = vnode.type(vnode.props || {});
+      } finally {
+        currentComponentKey = prevCompKey;
+        hookCursor = prevCursor;
+      }
+      return renderVNodeToDom(subTree, isSvg, path + ":" + compName);
     }
 
     const tag = String(vnode.type);
     const svgMode = isSvg || SVG_TAGS.has(tag);
-    const el = svgMode
-      ? document.createElementNS("http://www.w3.org/2000/svg", tag)
-      : document.createElement(tag);
+    const isCustomEl = !svgMode && tag.includes("-");
+    let reusedCustomEl = null;
+    if (isCustomEl && currentRoot && currentRoot.reusableCustomElements) {
+      const bucket = currentRoot.reusableCustomElements.get(tag.toLowerCase());
+      if (bucket && bucket.length > 0) {
+        reusedCustomEl = bucket.shift();
+      }
+    }
+    const el =
+      reusedCustomEl ||
+      (svgMode
+        ? document.createElementNS("http://www.w3.org/2000/svg", tag)
+        : document.createElement(tag));
 
     const props = vnode.props || {};
+    const nextAttrNames = isCustomEl ? new Set(["data-pm-mount-id"]) : null;
     for (const [key, val] of Object.entries(props)) {
       if (key === "children" || key === "key" || val === undefined || val === null || val === false) {
         continue;
@@ -155,6 +198,7 @@ export function renderVendorRuntimeJs(): string {
         continue;
       }
       if (key === "className" || key === "class") {
+        if (nextAttrNames) nextAttrNames.add("class");
         if (svgMode) {
           el.setAttribute("class", String(val));
         } else {
@@ -163,13 +207,16 @@ export function renderVendorRuntimeJs(): string {
         continue;
       }
       if (key === "style" && typeof val === "object") {
+        if (nextAttrNames) nextAttrNames.add("style");
         Object.assign(el.style, val);
         continue;
       }
       if (key.startsWith("on") && typeof val === "function") {
-        const evt = key.slice(2).toLowerCase();
-        const domEvent = evt === "change" && (tag === "input" || tag === "textarea") ? "input" : evt;
-        el.addEventListener(domEvent, val);
+        if (!reusedCustomEl) {
+          const evt = key.slice(2).toLowerCase();
+          const domEvent = evt === "change" && (tag === "input" || tag === "textarea") ? "input" : evt;
+          el.addEventListener(domEvent, val);
+        }
         continue;
       }
       if (key === "value" && (tag === "input" || tag === "textarea" || tag === "select")) {
@@ -182,14 +229,32 @@ export function renderVendorRuntimeJs(): string {
         continue;
       }
       if (key === "disabled") {
-        if (val) el.setAttribute("disabled", "disabled");
+        if (val) {
+          if (nextAttrNames) nextAttrNames.add("disabled");
+          el.setAttribute("disabled", "disabled");
+        }
         continue;
       }
-      el.setAttribute(key, String(val));
+      if (nextAttrNames) nextAttrNames.add(key);
+      const nextStr = String(val);
+      if (!reusedCustomEl || el.getAttribute(key) !== nextStr) {
+        el.setAttribute(key, nextStr);
+      }
+    }
+    if (reusedCustomEl && nextAttrNames && el.getAttributeNames) {
+      for (const attrName of el.getAttributeNames()) {
+        if (!nextAttrNames.has(attrName)) {
+          el.removeAttribute(attrName);
+        }
+      }
+      if (el._root && typeof el._root.scheduleRender === "function") {
+        el._root.scheduleRender();
+      }
+      return el;
     }
 
-    (props.children || []).forEach((child) => {
-      el.appendChild(renderVNodeToDom(child, svgMode));
+    (props.children || []).forEach((child, i) => {
+      el.appendChild(renderVNodeToDom(child, svgMode, path + "." + i));
     });
 
     if (tag === "select" && props.value !== undefined) {
@@ -199,42 +264,154 @@ export function renderVendorRuntimeJs(): string {
     return el;
   }
 
+  function collectOwnedCustomElements(rootContainer, outMap) {
+    if (!rootContainer || !rootContainer.childNodes) return;
+    const walk = (parent) => {
+      const children = parent.childNodes;
+      if (!children) return;
+      for (let i = 0; i < children.length; i++) {
+        const child = children[i];
+        if (!child || child.nodeType !== 1 || !child.tagName) continue;
+        const tagLower = String(child.tagName).toLowerCase();
+        if (tagLower.includes("-")) {
+          let list = outMap.get(tagLower);
+          if (!list) {
+            list = [];
+            outMap.set(tagLower, list);
+          }
+          list.push(child);
+        } else {
+          walk(child);
+        }
+      }
+    };
+    walk(rootContainer);
+  }
+
+  function cleanupHooksByPrefix(rootInst, prefix) {
+    for (const key of [...rootInst.ownedHookKeys]) {
+      if (!key.startsWith(prefix)) continue;
+      const hooks = sharedComponentHooks.get(key);
+      if (hooks) {
+        hooks.forEach((h) => {
+          if (h && typeof h.cleanup === "function") {
+            try {
+              h.cleanup();
+            } catch (_e) {}
+            h.cleanup = null;
+            h.deps = null;
+          }
+        });
+        sharedComponentHooks.delete(key);
+      }
+      rootInst.ownedHookKeys.delete(key);
+    }
+  }
+
   function createRoot(container) {
+    if (container && container.getAttribute && !container.getAttribute("data-pm-mount-id")) {
+      mountCounter += 1;
+      container.setAttribute("data-pm-mount-id", "pm-m" + mountCounter);
+    }
+    const assignedMountId =
+      (container && container.getAttribute && container.getAttribute("data-pm-mount-id")) ||
+      "pm-m" + ++mountCounter;
+
     const rootInstance = {
       container,
+      mountId: assignedMountId,
+      rootTag: container && container.tagName ? container.tagName : "ROOT",
       hooks: [],
+      ownedHookKeys: new Set(),
+      reusableCustomElements: null,
+      lastProjScope: null,
+      unmounted: false,
       pendingEffects: [],
       element: null,
       scheduled: false,
       scheduleRender() {
-        if (this.scheduled) return;
+        if (this.scheduled || this.unmounted) return;
         this.scheduled = true;
         queueMicrotask(() => {
           this.scheduled = false;
-          this.flushRender();
+          if (!this.unmounted) {
+            this.flushRender();
+          }
         });
       },
       flushRender() {
-        if (!this.element) return;
+        if (!this.element || this.unmounted) return;
+        const rootId = this.mountId || this.rootTag || "ROOT";
+        const nextProjScope =
+          this.container && this.container.getAttribute
+            ? this.container.getAttribute("project-root") ||
+              this.container.getAttribute("default-project") ||
+              ""
+            : "";
+        if (this.lastProjScope !== null && this.lastProjScope !== nextProjScope) {
+          cleanupHooksByPrefix(this, rootId + "::" + this.lastProjScope + "::");
+        }
+        this.lastProjScope = nextProjScope;
+
         const activeEl = document.activeElement;
         const focusId = activeEl && activeEl.id ? activeEl.id : null;
         const selStart = activeEl && typeof activeEl.selectionStart === "number" ? activeEl.selectionStart : null;
         const selEnd = activeEl && typeof activeEl.selectionEnd === "number" ? activeEl.selectionEnd : null;
 
+        const savedScroll = new Map();
+        if (this.container) {
+          if (this.container.scrollTop || this.container.scrollLeft) {
+            savedScroll.set("__root__", [this.container.scrollTop || 0, this.container.scrollLeft || 0]);
+          }
+          if (this.container.querySelectorAll) {
+            const subEls = this.container.querySelectorAll("[id]");
+            for (let i = 0; i < subEls.length; i++) {
+              const node = subEls[i];
+              if (node.id && (node.scrollTop || node.scrollLeft)) {
+                savedScroll.set(node.id, [node.scrollTop || 0, node.scrollLeft || 0]);
+              }
+            }
+          }
+        }
+
+        const reusableMap = new Map();
+        collectOwnedCustomElements(this.container, reusableMap);
+
         const prevRoot = currentRoot;
+        const prevCompKey = currentComponentKey;
+        const prevCursor = hookCursor;
         currentRoot = this;
+        currentComponentKey = "root";
         hookCursor = 0;
         this.pendingEffects = [];
+        this.reusableCustomElements = reusableMap;
 
         let domNode;
         try {
-          domNode = renderVNodeToDom(this.element, false);
+          domNode = renderVNodeToDom(this.element, false, "0");
         } finally {
+          this.reusableCustomElements = null;
           currentRoot = prevRoot;
+          currentComponentKey = prevCompKey;
+          hookCursor = prevCursor;
         }
 
         this.container.innerHTML = "";
         this.container.appendChild(domNode);
+
+        if (savedScroll.has("__root__")) {
+          const [st, sl] = savedScroll.get("__root__");
+          this.container.scrollTop = st;
+          this.container.scrollLeft = sl;
+        }
+        for (const [elId, coords] of savedScroll.entries()) {
+          if (elId === "__root__") continue;
+          const targetEl = document.getElementById(elId);
+          if (targetEl) {
+            targetEl.scrollTop = coords[0];
+            targetEl.scrollLeft = coords[1];
+          }
+        }
 
         if (focusId) {
           const restored = document.getElementById(focusId);
@@ -253,17 +430,30 @@ export function renderVendorRuntimeJs(): string {
         effects.forEach((fn) => fn());
       },
       render(element) {
+        this.unmounted = false;
+        activeRoots.add(this);
         this.element = element;
         this.flushRender();
       },
       unmount() {
-        this.hooks.forEach((h) => {
-          if (h && typeof h.cleanup === "function") {
-            try {
-              h.cleanup();
-            } catch (_e) {}
+        this.unmounted = true;
+        activeRoots.delete(this);
+        for (const key of this.ownedHookKeys) {
+          const hooks = sharedComponentHooks.get(key);
+          if (hooks) {
+            hooks.forEach((h) => {
+              if (h && typeof h.cleanup === "function") {
+                try {
+                  h.cleanup();
+                } catch (_e) {}
+                h.cleanup = null;
+                h.deps = null;
+              }
+            });
+            sharedComponentHooks.delete(key);
           }
-        });
+        }
+        this.ownedHookKeys.clear();
         this.container.innerHTML = "";
         this.element = null;
       },
