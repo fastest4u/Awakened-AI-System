@@ -11,7 +11,6 @@ import {
   readSync,
   readdirSync,
   realpathSync,
-  rmSync,
   statSync,
   writeFileSync,
 } from "node:fs";
@@ -894,26 +893,6 @@ export async function runV2Admin(argv: readonly string[]): Promise<unknown> {
       sessionId: null,
     });
     const projectionDirectory = join(info.storeRoot, "projections");
-    if (existsSync(join(projectionDirectory, "projection-manifest.json"))) {
-      try {
-        const existingManifest = JSON.parse(
-          readFileSync(join(projectionDirectory, "projection-manifest.json"), "utf8"),
-        ) as {
-          workspaceId?: string;
-          branchScopeId?: string | null;
-          branchRef?: string | null;
-        };
-        if (
-          existingManifest.workspaceId !== projectionBinding.workspaceId ||
-          (existingManifest.branchScopeId ?? null) !== projectionBinding.branchScopeId ||
-          (existingManifest.branchRef ?? null) !== projectionBinding.branchRef
-        ) {
-          rmSync(projectionDirectory, { recursive: true, force: true });
-        }
-      } catch {
-        rmSync(projectionDirectory, { recursive: true, force: true });
-      }
-    }
     mkdirSync(projectionDirectory, { recursive: true });
     const eventReader = new SqliteProjectionEventReader({
       driver,
@@ -934,6 +913,7 @@ export async function runV2Admin(argv: readonly string[]): Promise<unknown> {
         builder,
       },
     });
+    await coordinator.rotateScopeIfMismatched(projectionBinding);
     const published = await coordinator.ensurePublishedV3(
       projectionBinding,
       terminalPosition,
@@ -975,9 +955,13 @@ export async function runV2Admin(argv: readonly string[]): Promise<unknown> {
     assertAllowedFlags(
       values,
       ["--project-root", "--v2-vault-root", "--v1-archive-root", releaseFlag],
-      ["--output-dir"],
-      releaseFlag === "--release-id" ? ["--release-id"] : [],
+      ["--output-dir", "--auto-sync-build"],
+      [...(releaseFlag === "--release-id" ? ["--release-id"] : []), "--auto-sync-build"],
     );
+    const rawAutoSync = values["--auto-sync-build"] ?? "0";
+    if (rawAutoSync !== "0" && rawAutoSync !== "1") {
+      throw new FreshStartError("FRESH_START_CONFIG_INVALID");
+    }
     inspectV2Build();
     const roots = loadV2LaunchConfig({
       MEMORY_PROJECT_ROOT: values["--project-root"],
@@ -1002,7 +986,7 @@ export async function runV2Admin(argv: readonly string[]): Promise<unknown> {
       MEMORY_V2_VAULT_PATH: explicit.v2VaultRoot,
       MEMORY_V1_ARCHIVE_PATH: explicit.v1ArchiveRoot,
       MEMORY_V2_RELEASE_ID: explicit.releaseId,
-      MEMORY_V2_AUTO_SYNC_BUILD: "1",
+      MEMORY_V2_AUTO_SYNC_BUILD: rawAutoSync,
     });
     loadV2LaunchConfig(env);
 
@@ -1222,7 +1206,7 @@ export async function runV2Admin(argv: readonly string[]): Promise<unknown> {
             MEMORY_V2_VAULT_PATH: "<PROJECT_ROOT>/memory-v2",
             MEMORY_V1_ARCHIVE_PATH: "<PROJECT_ROOT>/memory",
             MEMORY_V2_RELEASE_ID: "<RELEASE_UUID>",
-            MEMORY_V2_AUTO_SYNC_BUILD: "1",
+            MEMORY_V2_AUTO_SYNC_BUILD: rawAutoSync,
           },
         },
       },

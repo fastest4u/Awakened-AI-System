@@ -73,15 +73,14 @@ export function renderVendorRuntimeJs(): string {
       hooks[idx] = typeof initialValue === "function" ? initialValue() : initialValue;
     }
     const setState = (updater) => {
+      if (rootRef.unmounted) {
+        return;
+      }
       const prev = hooks[idx];
       const next = typeof updater === "function" ? updater(prev) : updater;
       if (!Object.is(prev, next)) {
         hooks[idx] = next;
-        if (rootRef.unmounted) {
-          activeRoots.forEach((r) => r.scheduleRender());
-        } else {
-          rootRef.scheduleRender();
-        }
+        rootRef.scheduleRender();
       }
     };
     return [hooks[idx], setState];
@@ -174,11 +173,22 @@ export function renderVendorRuntimeJs(): string {
 
     const tag = String(vnode.type);
     const svgMode = isSvg || SVG_TAGS.has(tag);
-    const el = svgMode
-      ? document.createElementNS("http://www.w3.org/2000/svg", tag)
-      : document.createElement(tag);
+    const isCustomEl = !svgMode && tag.includes("-");
+    let reusedCustomEl = null;
+    if (isCustomEl && currentRoot && currentRoot.reusableCustomElements) {
+      const bucket = currentRoot.reusableCustomElements.get(tag.toLowerCase());
+      if (bucket && bucket.length > 0) {
+        reusedCustomEl = bucket.shift();
+      }
+    }
+    const el =
+      reusedCustomEl ||
+      (svgMode
+        ? document.createElementNS("http://www.w3.org/2000/svg", tag)
+        : document.createElement(tag));
 
     const props = vnode.props || {};
+    const nextAttrNames = isCustomEl ? new Set(["data-pm-mount-id"]) : null;
     for (const [key, val] of Object.entries(props)) {
       if (key === "children" || key === "key" || val === undefined || val === null || val === false) {
         continue;
@@ -188,6 +198,7 @@ export function renderVendorRuntimeJs(): string {
         continue;
       }
       if (key === "className" || key === "class") {
+        if (nextAttrNames) nextAttrNames.add("class");
         if (svgMode) {
           el.setAttribute("class", String(val));
         } else {
@@ -196,13 +207,16 @@ export function renderVendorRuntimeJs(): string {
         continue;
       }
       if (key === "style" && typeof val === "object") {
+        if (nextAttrNames) nextAttrNames.add("style");
         Object.assign(el.style, val);
         continue;
       }
       if (key.startsWith("on") && typeof val === "function") {
-        const evt = key.slice(2).toLowerCase();
-        const domEvent = evt === "change" && (tag === "input" || tag === "textarea") ? "input" : evt;
-        el.addEventListener(domEvent, val);
+        if (!reusedCustomEl) {
+          const evt = key.slice(2).toLowerCase();
+          const domEvent = evt === "change" && (tag === "input" || tag === "textarea") ? "input" : evt;
+          el.addEventListener(domEvent, val);
+        }
         continue;
       }
       if (key === "value" && (tag === "input" || tag === "textarea" || tag === "select")) {
@@ -215,10 +229,28 @@ export function renderVendorRuntimeJs(): string {
         continue;
       }
       if (key === "disabled") {
-        if (val) el.setAttribute("disabled", "disabled");
+        if (val) {
+          if (nextAttrNames) nextAttrNames.add("disabled");
+          el.setAttribute("disabled", "disabled");
+        }
         continue;
       }
-      el.setAttribute(key, String(val));
+      if (nextAttrNames) nextAttrNames.add(key);
+      const nextStr = String(val);
+      if (!reusedCustomEl || el.getAttribute(key) !== nextStr) {
+        el.setAttribute(key, nextStr);
+      }
+    }
+    if (reusedCustomEl && nextAttrNames && el.getAttributeNames) {
+      for (const attrName of el.getAttributeNames()) {
+        if (!nextAttrNames.has(attrName)) {
+          el.removeAttribute(attrName);
+        }
+      }
+      if (el._root && typeof el._root.scheduleRender === "function") {
+        el._root.scheduleRender();
+      }
+      return el;
     }
 
     (props.children || []).forEach((child, i) => {
@@ -230,6 +262,50 @@ export function renderVendorRuntimeJs(): string {
     }
 
     return el;
+  }
+
+  function collectOwnedCustomElements(rootContainer, outMap) {
+    if (!rootContainer || !rootContainer.childNodes) return;
+    const walk = (parent) => {
+      const children = parent.childNodes;
+      if (!children) return;
+      for (let i = 0; i < children.length; i++) {
+        const child = children[i];
+        if (!child || child.nodeType !== 1 || !child.tagName) continue;
+        const tagLower = String(child.tagName).toLowerCase();
+        if (tagLower.includes("-")) {
+          let list = outMap.get(tagLower);
+          if (!list) {
+            list = [];
+            outMap.set(tagLower, list);
+          }
+          list.push(child);
+        } else {
+          walk(child);
+        }
+      }
+    };
+    walk(rootContainer);
+  }
+
+  function cleanupHooksByPrefix(rootInst, prefix) {
+    for (const key of [...rootInst.ownedHookKeys]) {
+      if (!key.startsWith(prefix)) continue;
+      const hooks = sharedComponentHooks.get(key);
+      if (hooks) {
+        hooks.forEach((h) => {
+          if (h && typeof h.cleanup === "function") {
+            try {
+              h.cleanup();
+            } catch (_e) {}
+            h.cleanup = null;
+            h.deps = null;
+          }
+        });
+        sharedComponentHooks.delete(key);
+      }
+      rootInst.ownedHookKeys.delete(key);
+    }
   }
 
   function createRoot(container) {
@@ -247,20 +323,36 @@ export function renderVendorRuntimeJs(): string {
       rootTag: container && container.tagName ? container.tagName : "ROOT",
       hooks: [],
       ownedHookKeys: new Set(),
+      reusableCustomElements: null,
+      lastProjScope: null,
       unmounted: false,
       pendingEffects: [],
       element: null,
       scheduled: false,
       scheduleRender() {
-        if (this.scheduled) return;
+        if (this.scheduled || this.unmounted) return;
         this.scheduled = true;
         queueMicrotask(() => {
           this.scheduled = false;
-          this.flushRender();
+          if (!this.unmounted) {
+            this.flushRender();
+          }
         });
       },
       flushRender() {
-        if (!this.element) return;
+        if (!this.element || this.unmounted) return;
+        const rootId = this.mountId || this.rootTag || "ROOT";
+        const nextProjScope =
+          this.container && this.container.getAttribute
+            ? this.container.getAttribute("project-root") ||
+              this.container.getAttribute("default-project") ||
+              ""
+            : "";
+        if (this.lastProjScope !== null && this.lastProjScope !== nextProjScope) {
+          cleanupHooksByPrefix(this, rootId + "::" + this.lastProjScope + "::");
+        }
+        this.lastProjScope = nextProjScope;
+
         const activeEl = document.activeElement;
         const focusId = activeEl && activeEl.id ? activeEl.id : null;
         const selStart = activeEl && typeof activeEl.selectionStart === "number" ? activeEl.selectionStart : null;
@@ -282,6 +374,9 @@ export function renderVendorRuntimeJs(): string {
           }
         }
 
+        const reusableMap = new Map();
+        collectOwnedCustomElements(this.container, reusableMap);
+
         const prevRoot = currentRoot;
         const prevCompKey = currentComponentKey;
         const prevCursor = hookCursor;
@@ -289,11 +384,13 @@ export function renderVendorRuntimeJs(): string {
         currentComponentKey = "root";
         hookCursor = 0;
         this.pendingEffects = [];
+        this.reusableCustomElements = reusableMap;
 
         let domNode;
         try {
           domNode = renderVNodeToDom(this.element, false, "0");
         } finally {
+          this.reusableCustomElements = null;
           currentRoot = prevRoot;
           currentComponentKey = prevCompKey;
           hookCursor = prevCursor;

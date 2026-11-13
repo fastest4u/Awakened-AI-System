@@ -2,7 +2,12 @@ import { existsSync, readFileSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
 import type { V2Foundation } from "../composition.js";
 import { V2MemoryCuratorAgent } from "../curator.js";
-import { computeCausalTriads, type CausalTriadNoteInput } from "../entity-extractor.js";
+import {
+  computeCausalTriads,
+  isAcceptablePath,
+  normalizeCandidatePath,
+  type CausalTriadNoteInput,
+} from "../entity-extractor.js";
 import { V2_PUBLIC_TOOL_DEFINITIONS } from "../public-tools.js";
 import {
   buildMemoryKnowledgeGraph,
@@ -165,23 +170,11 @@ export class ProjectModel {
 }
 
 export class MemoryNoteModel {
-  static async listEnrichedNotes(
-    foundation: V2Foundation,
-    query?: string,
-    limit = 100,
+  static enrichRawItems(
+    items: readonly Record<string, unknown>[],
     projectRoot?: string,
-  ): Promise<Array<Record<string, unknown>>> {
-    const rawResult =
-      query && query.trim().length > 0
-        ? ((await foundation.content.invoke("memory_search", {
-            query: query.trim(),
-            limit,
-          })) as { items?: Array<Record<string, unknown>> })
-        : ((await foundation.content.invoke("memory_list", {
-            limit,
-          })) as { items?: Array<Record<string, unknown>> });
-
-    return (rawResult.items ?? []).map((item) => {
+  ): Array<Record<string, unknown>> {
+    return items.map((item) => {
       const recordId = String(item.recordId ?? item.id ?? "");
       const summary = String(item.summary ?? item.text ?? "");
       const { title } = deriveCleanNoteTitle(item, recordId);
@@ -190,14 +183,13 @@ export class MemoryNoteModel {
         `${title}\n${summary}\n${body}`,
         projectRoot,
       );
-      const filePaths = [
-        ...new Set([
-          ...(Array.isArray(item.filePaths)
-            ? item.filePaths.filter((p): p is string => typeof p === "string")
-            : []),
-          ...extracted.filePaths,
-        ]),
-      ];
+      const safeRawFilePaths = Array.isArray(item.filePaths)
+        ? item.filePaths
+            .filter((p): p is string => typeof p === "string")
+            .map((p) => normalizeCandidatePath(p))
+            .filter((p) => isAcceptablePath(p, projectRoot))
+        : [];
+      const filePaths = [...new Set([...safeRawFilePaths, ...extracted.filePaths])];
       const symbols = [
         ...new Set([
           ...(Array.isArray(item.symbols)
@@ -230,6 +222,25 @@ export class MemoryNoteModel {
     });
   }
 
+  static async listEnrichedNotes(
+    foundation: V2Foundation,
+    query?: string,
+    limit = 100,
+    projectRoot?: string,
+  ): Promise<Array<Record<string, unknown>>> {
+    const rawResult =
+      query && query.trim().length > 0
+        ? ((await foundation.content.invoke("memory_search", {
+            query: query.trim(),
+            limit,
+          })) as { items?: Array<Record<string, unknown>> })
+        : ((await foundation.content.invoke("memory_list", {
+            limit,
+          })) as { items?: Array<Record<string, unknown>> });
+
+    return MemoryNoteModel.enrichRawItems(rawResult.items ?? [], projectRoot);
+  }
+
   static async getNoteById(foundation: V2Foundation, noteId: string): Promise<unknown> {
     return foundation.content.invoke("memory_get", { id: noteId });
   }
@@ -241,15 +252,20 @@ export class OverviewModel {
     foundation: V2Foundation,
   ): Promise<Record<string, unknown>> {
     const curator = new V2MemoryCuratorAgent(foundation);
-    const [status, lifecycle, audit, notes] = await Promise.all([
+    let collectedRawItems: readonly Record<string, unknown>[] = [];
+    const [status, lifecycle, audit] = await Promise.all([
       foundation.status(),
       foundation.content.invoke("memory_lifecycleStatus", {}) as Promise<{
         sessions?: Array<Record<string, unknown>>;
         latestCheckpoint?: unknown;
       }>,
-      curator.auditVault(),
-      MemoryNoteModel.listEnrichedNotes(foundation, undefined, 100, projectRoot),
+      curator.auditVault({
+        onCollectedItems: (items) => {
+          collectedRawItems = items;
+        },
+      }),
     ]);
+    const notes = MemoryNoteModel.enrichRawItems(collectedRawItems.slice(0, 100), projectRoot);
 
     const triadInputs: CausalTriadNoteInput[] = notes.map((n) => ({
       id: String(n.recordId ?? n.id ?? ""),

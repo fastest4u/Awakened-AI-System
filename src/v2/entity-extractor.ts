@@ -1,4 +1,4 @@
-import { existsSync } from "node:fs";
+import { lstatSync, realpathSync } from "node:fs";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { extractWikilinks } from "../utils/links.js";
@@ -334,7 +334,7 @@ const STOP_SYMBOLS = new Set([
 const WORKSPACE_PATH_RE =
   /(?:^|[\s`'":(\[<])((?:\.[\\/])?(?:(?:src|tests|scripts|docs|app|routes|config|packages|lib|\.github|\.agents|\.cursor|\.windsurf|\.antigravity|\.claude|\.vscode|\.codex|\.zed|\.superpowers|dist|build|out|coverage)[\\/][A-Za-z0-9_./\\-]+\.[A-Za-z0-9]{1,10}|[A-Za-z0-9_.-]+\.(?:ts|tsx|js|jsx|mjs|cjs|json|md|mdc|sql|sqlite|py|php|go|rs|java|toml|yaml|yml|css|html|sh|ps1)))(?=$|[\s`'");,\]>!?]|:\d|\.(?:\s|$))/gu;
 
-function normalizeCandidatePath(raw: string): string {
+export function normalizeCandidatePath(raw: string): string {
   return raw
     .trim()
     .replace(/\\/gu, "/")
@@ -344,35 +344,127 @@ function normalizeCandidatePath(raw: string): string {
     .trim();
 }
 
-function isAcceptablePath(candidate: string, projectRoot?: string): boolean {
-  if (candidate.length < 3 || candidate.length > 180) return false;
+const SENSITIVE_BASENAME_SET = new Set([
+  ".env",
+  "id_rsa",
+  "id_ed25519",
+  "id_ecdsa",
+  "id_dsa",
+  "credentials.json",
+  ".npmrc",
+  ".netrc",
+]);
+
+const SENSITIVE_EXTENSION_SUFFIXES = [".pem", ".key", ".pfx", ".p12", ".kdbx"] as const;
+
+function hasSafeWorkspaceSegments(candidate: string): boolean {
+  if (
+    candidate.length < 3 ||
+    candidate.length > 180 ||
+    candidate.includes("\0") ||
+    candidate.includes("\\")
+  ) {
+    return false;
+  }
   if (candidate.startsWith("/") || candidate.startsWith("..") || candidate.includes("//")) {
     return false;
+  }
+  const segments = candidate.split("/");
+  for (const seg of segments) {
+    if (!seg || seg === "." || seg === "..") return false;
+    const segLower = seg.toLowerCase();
+    if (SENSITIVE_BASENAME_SET.has(segLower) || segLower.startsWith(".env.")) {
+      return false;
+    }
+    if (SENSITIVE_EXTENSION_SUFFIXES.some((ext) => segLower.endsWith(ext))) {
+      return false;
+    }
   }
   const lower = candidate.toLowerCase();
   if (PROSE_FALSE_POSITIVE_PATHS.has(lower)) return false;
   if (/^v?\d+(?:\.\d+)+$/iu.test(candidate)) return false;
   if (/^\d{1,3}(?:\.\d{1,3}){3}$/u.test(candidate)) return false;
   if (IGNORED_PATH_PREFIXES.some((prefix) => lower.startsWith(prefix))) return false;
+  return true;
+}
+
+export function resolveContainedWorkspaceFile(
+  projectRoot: string,
+  rawRelPath: string,
+  maxBytes = 512 * 1024,
+): { readonly absPath: string; readonly size: number } | null {
+  if (!projectRoot || projectRoot.includes("\0")) return null;
+  const candidate = normalizeCandidatePath(rawRelPath);
+  if (!hasSafeWorkspaceSegments(candidate)) return null;
+
+  try {
+    const resolvedRoot = resolve(projectRoot);
+    const rootStat = lstatSync(resolvedRoot);
+    if (!rootStat.isDirectory()) return null;
+    const canonicalRoot = realpathSync.native(resolvedRoot);
+
+    const segments = candidate.split("/");
+    let cursor = canonicalRoot;
+    let leafStat: ReturnType<typeof lstatSync> | null = null;
+    for (let i = 0; i < segments.length; i += 1) {
+      cursor = join(cursor, segments[i]!);
+      const st = lstatSync(cursor);
+      if (st.isSymbolicLink()) return null;
+      if (i < segments.length - 1) {
+        if (!st.isDirectory()) return null;
+      } else {
+        leafStat = st;
+      }
+    }
+    if (!leafStat || !leafStat.isFile()) return null;
+    if (leafStat.size > maxBytes) return null;
+
+    const canonicalFile = realpathSync.native(cursor);
+    const normRoot = process.platform === "win32" ? canonicalRoot.toLowerCase() : canonicalRoot;
+    const normFile = process.platform === "win32" ? canonicalFile.toLowerCase() : canonicalFile;
+    const relCheck = relative(normRoot, normFile);
+    if (!relCheck || relCheck === "." || relCheck.startsWith("..") || isAbsolute(relCheck)) {
+      return null;
+    }
+    return { absPath: canonicalFile, size: leafStat.size };
+  } catch {
+    return null;
+  }
+}
+
+export function isAcceptablePath(candidate: string, projectRoot?: string): boolean {
+  if (!hasSafeWorkspaceSegments(candidate)) return false;
+  const lower = candidate.toLowerCase();
 
   if (BUILD_OUTPUT_PREFIXES.some((prefix) => lower.startsWith(prefix))) {
     if (!projectRoot) return false;
-    try {
-      return existsSync(join(projectRoot, ...candidate.split("/")));
-    } catch {
-      return false;
-    }
+    return resolveContainedWorkspaceFile(projectRoot, candidate, 16 * 1024 * 1024) !== null;
   }
 
   if (!candidate.includes("/")) {
     if (projectRoot) {
-      try {
-        return existsSync(join(projectRoot, candidate));
-      } catch {
-        return false;
-      }
+      return resolveContainedWorkspaceFile(projectRoot, candidate, 16 * 1024 * 1024) !== null;
     }
     return WELL_KNOWN_ROOT_FILES.has(lower);
+  }
+
+  if (projectRoot) {
+    try {
+      const canonicalRoot = realpathSync.native(resolve(projectRoot));
+      let cursor = canonicalRoot;
+      for (const segment of candidate.split("/")) {
+        cursor = join(cursor, segment);
+        try {
+          const st = lstatSync(cursor);
+          if (st.isSymbolicLink()) return false;
+        } catch {
+          // Non-existent historical path segment is allowed (reported as missingFile by verifySourceTruth)
+          break;
+        }
+      }
+    } catch {
+      return false;
+    }
   }
 
   return true;

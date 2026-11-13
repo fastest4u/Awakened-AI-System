@@ -1,5 +1,5 @@
 import { existsSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { join } from "node:path";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
@@ -14,7 +14,7 @@ import {
   ReadResourceRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import { FreshStartError } from "../orchestrator/fresh-start/contracts.js";
-import { createV2Foundation } from "./composition.js";
+import { createV2Foundation, validateRoutedProjectRoot } from "./composition.js";
 import { diagnosticCode, loadV2LaunchConfig } from "./config.js";
 import { STATUS_TOOL_DEFINITION } from "./public-tools.js";
 import { buildMemoryKnowledgeGraph } from "./webui.js";
@@ -28,12 +28,6 @@ export async function runV2Server(): Promise<void> {
   );
   const transport = new StdioServerTransport(process.stdin, process.stdout, { maxBufferSize: 1024 * 1024 });
 
-  const isSameProjectRoot = (candidate: string): boolean => {
-    const a = resolve(candidate);
-    const b = resolve(launchConfig.projectRoot);
-    return process.platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b;
-  };
-
   const resolveReadOnlyRoutedProject = (rawProjectRoot: string | null): {
     readonly effectiveRoot: string;
     readonly routedArgs: Record<string, string>;
@@ -41,8 +35,8 @@ export async function runV2Server(): Promise<void> {
     if (!rawProjectRoot || rawProjectRoot.trim().length === 0) {
       return { effectiveRoot: launchConfig.projectRoot, routedArgs: {} };
     }
-    const targetRoot = resolve(rawProjectRoot.trim());
-    if (isSameProjectRoot(targetRoot)) {
+    const targetRoot = validateRoutedProjectRoot(rawProjectRoot, launchConfig);
+    if (!targetRoot) {
       return { effectiveRoot: launchConfig.projectRoot, routedArgs: {} };
     }
     const identityFile = join(targetRoot, "memory-v2", ".memory-mcp", "project-identity.json");
@@ -177,10 +171,15 @@ export async function runV2Server(): Promise<void> {
       }
 
       const routeHost = parsedUrl.host.toLowerCase();
-      const rawPathSegments = parsedUrl.pathname
-        .split("/")
-        .filter((s) => s.length > 0)
-        .map((s) => decodeURIComponent(s));
+      let rawPathSegments: string[];
+      try {
+        rawPathSegments = parsedUrl.pathname
+          .split("/")
+          .filter((s) => s.length > 0)
+          .map((s) => decodeURIComponent(s));
+      } catch {
+        throw new FreshStartError("FRESH_START_INPUT_INVALID");
+      }
 
       let queryProjectRoot = parsedUrl.searchParams.get("projectRoot");
       let effectiveRoute =
@@ -203,42 +202,19 @@ export async function runV2Server(): Promise<void> {
       const { effectiveRoot, routedArgs } = resolveReadOnlyRoutedProject(queryProjectRoot);
 
       if (effectiveRoute === "current/status") {
-        if (!routedArgs.projectRoot) {
-          return {
-            contents: [
-              {
-                uri,
-                mimeType: "application/json",
-                text: JSON.stringify({ ok: true, ...(await foundation.status()) }, null, 2),
-              },
-            ],
-          };
-        }
-        const resolvedV1Archive = existsSync(join(effectiveRoot, "memory"))
-          ? join(effectiveRoot, "memory")
-          : existsSync(join(effectiveRoot, "archive"))
-            ? join(effectiveRoot, "archive")
-            : join(effectiveRoot, "memory");
-        const targetCfg = loadV2LaunchConfig({
-          MEMORY_PROJECT_ROOT: effectiveRoot,
-          MEMORY_V2_VAULT_PATH: join(effectiveRoot, "memory-v2"),
-          MEMORY_V1_ARCHIVE_PATH: resolvedV1Archive,
-          MEMORY_V2_RELEASE_ID: launchConfig.releaseId,
-        });
-        const tempFoundation = await createV2Foundation(targetCfg);
-        try {
-          return {
-            contents: [
-              {
-                uri,
-                mimeType: "application/json",
-                text: JSON.stringify({ ok: true, ...(await tempFoundation.status()) }, null, 2),
-              },
-            ],
-          };
-        } finally {
-          await tempFoundation.close();
-        }
+        const statusPayload =
+          routedArgs.projectRoot && foundation.statusForProject
+            ? await foundation.statusForProject(routedArgs.projectRoot)
+            : await foundation.status();
+        return {
+          contents: [
+            {
+              uri,
+              mimeType: "application/json",
+              text: JSON.stringify({ ok: true, ...statusPayload }, null, 2),
+            },
+          ],
+        };
       }
 
       if (effectiveRoute === "current/radar") {

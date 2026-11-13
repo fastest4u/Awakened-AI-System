@@ -279,7 +279,6 @@ function runStableMutation(
     }
     return join(directory, name);
   };
-  let verifiedRealpath = false;
   const assertDirectory = () => {
     if (
       typeof directory !== "string"
@@ -297,11 +296,8 @@ function runStableMutation(
     ) {
       return invalid();
     }
-    if (!verifiedRealpath) {
-      if (normalizedPath(realpathSync.native(directory)) !== normalizedPath(expectedPath)) {
-        return invalid();
-      }
-      verifiedRealpath = true;
+    if (normalizedPath(realpathSync.native(directory)) !== normalizedPath(expectedPath)) {
+      return invalid();
     }
     return dirStat;
   };

@@ -7,6 +7,7 @@ import {
   assertFreshStartOwnedDirectory,
   assertFreshStartPaths,
   freshStartPathContains,
+  type FreshStartPaths,
 } from "../orchestrator/fresh-start/fresh-start-paths.js";
 import { FreshStartError, type FreshStartIdentity, type FreshStartMode, type FreshStartRelease } from "../orchestrator/fresh-start/contracts.js";
 import { SqliteFreshStartRepository } from "../orchestrator/fresh-start/fresh-start.repository.js";
@@ -59,8 +60,81 @@ export interface V2ContentAdapters {
 
 export interface V2Foundation {
   status(): Promise<FreshStartStatus>;
+  statusForProject?(projectRoot: string): Promise<FreshStartStatus>;
   close(): Promise<void>;
   readonly content: V2ContentAdapters;
+}
+
+export function validateRoutedProjectRoot(
+  rawTargetProjectRoot: string,
+  hostPaths: FreshStartPaths,
+): string | null {
+  const trimmed = rawTargetProjectRoot.trim();
+  if (!trimmed) return null;
+  if (trimmed.includes("\0") || !isAbsolute(trimmed)) {
+    throw new FreshStartError("FRESH_START_INPUT_INVALID");
+  }
+  const resolvedTarget = resolve(trimmed);
+  const resolvedHome = resolve(hostPaths.projectRoot);
+  if (
+    resolvedTarget === resolvedHome ||
+    (process.platform === "win32" && resolvedTarget.toLowerCase() === resolvedHome.toLowerCase())
+  ) {
+    return null;
+  }
+  if (
+    freshStartPathContains(hostPaths.v1ArchiveRoot, resolvedTarget) ||
+    freshStartPathContains(resolvedTarget, hostPaths.v1ArchiveRoot) ||
+    freshStartPathContains(hostPaths.v2VaultRoot, resolvedTarget) ||
+    freshStartPathContains(resolvedTarget, hostPaths.v2VaultRoot)
+  ) {
+    throw new FreshStartError("FRESH_START_PATH_OVERLAP");
+  }
+  if (!existsSync(resolvedTarget)) {
+    throw new FreshStartError("FRESH_START_INPUT_INVALID");
+  }
+  let targetStat;
+  try {
+    targetStat = lstatSync(resolvedTarget);
+  } catch {
+    throw new FreshStartError("FRESH_START_INPUT_INVALID");
+  }
+  if (!targetStat.isDirectory() && !targetStat.isSymbolicLink()) {
+    throw new FreshStartError("FRESH_START_INPUT_INVALID");
+  }
+  let canonicalTarget: string;
+  try {
+    canonicalTarget = realpathSync.native(resolvedTarget);
+  } catch {
+    throw new FreshStartError("FRESH_START_INPUT_INVALID");
+  }
+  let canonicalStat;
+  try {
+    canonicalStat = statSync(canonicalTarget);
+  } catch {
+    throw new FreshStartError("FRESH_START_INPUT_INVALID");
+  }
+  if (!canonicalStat.isDirectory()) {
+    throw new FreshStartError("FRESH_START_INPUT_INVALID");
+  }
+  const canonicalHome = existsSync(resolvedHome)
+    ? realpathSync.native(resolvedHome)
+    : resolvedHome;
+  if (
+    canonicalTarget === canonicalHome ||
+    (process.platform === "win32" && canonicalTarget.toLowerCase() === canonicalHome.toLowerCase())
+  ) {
+    return null;
+  }
+  if (
+    freshStartPathContains(hostPaths.v1ArchiveRoot, canonicalTarget) ||
+    freshStartPathContains(canonicalTarget, hostPaths.v1ArchiveRoot) ||
+    freshStartPathContains(hostPaths.v2VaultRoot, canonicalTarget) ||
+    freshStartPathContains(canonicalTarget, hostPaths.v2VaultRoot)
+  ) {
+    throw new FreshStartError("FRESH_START_PATH_OVERLAP");
+  }
+  return canonicalTarget;
 }
 
 export function assertPreparedRelease(
@@ -89,33 +163,38 @@ export async function ensureProjectV2StoreReady(options: {
   readonly v1ArchiveRoot?: string;
   readonly releaseId?: string;
   readonly entryUrl?: string;
+  readonly allowBootstrap?: boolean;
   readonly syncBuild?: boolean;
   readonly ensureActive?: boolean;
 }): Promise<V2LaunchConfig> {
-  if (!isAbsolute(options.projectRoot)) {
+  if (!isAbsolute(options.projectRoot) || options.projectRoot.includes("\0")) {
     throw new FreshStartError("FRESH_START_CONFIG_INVALID");
   }
-  mkdirSync(options.projectRoot, { recursive: true });
+  const allowBootstrap = options.allowBootstrap !== false;
+  if (allowBootstrap) {
+    mkdirSync(options.projectRoot, { recursive: true });
+  } else if (!existsSync(options.projectRoot)) {
+    throw new FreshStartError("FRESH_START_INPUT_INVALID");
+  }
   const canonicalProjectRoot = realpathSync.native(resolve(options.projectRoot));
   const rawV2VaultRoot = options.v2VaultRoot
     ? resolve(options.v2VaultRoot)
     : join(canonicalProjectRoot, "memory-v2");
-  const defaultArchiveCandidate =
-    !existsSync(join(canonicalProjectRoot, "memory"))
-    && existsSync(join(canonicalProjectRoot, "archive"))
-      ? join(canonicalProjectRoot, "archive")
-      : join(canonicalProjectRoot, "memory");
+  const memoryArchiveDir = join(canonicalProjectRoot, "memory");
+  const altArchiveDir = join(canonicalProjectRoot, "archive");
+  const placeholderArchiveDir = join(canonicalProjectRoot, ".v1-archive-placeholder");
+  const defaultArchiveCandidate = existsSync(memoryArchiveDir)
+    ? memoryArchiveDir
+    : existsSync(altArchiveDir)
+      ? altArchiveDir
+      : placeholderArchiveDir;
   const rawV1ArchiveRoot = options.v1ArchiveRoot
     ? resolve(options.v1ArchiveRoot)
     : defaultArchiveCandidate;
 
-  if (!existsSync(rawV1ArchiveRoot)) {
-    mkdirSync(rawV1ArchiveRoot, { recursive: true });
-    writeFileSync(
-      join(rawV1ArchiveRoot, ".v1-archive-sentinel"),
-      "Project Memory V1 Archive Sentinel (Frozen for V2)\n",
-      "utf8",
-    );
+  // Never create or write inside legacy `memory/` (frozen read-only V1 archive).
+  if (!existsSync(rawV1ArchiveRoot) && allowBootstrap && rawV1ArchiveRoot === placeholderArchiveDir) {
+    mkdirSync(placeholderArchiveDir, { recursive: true });
   }
 
   const measuredBuild = inspectV2Build(options.entryUrl);
@@ -124,6 +203,9 @@ export async function ensureProjectV2StoreReady(options: {
   const isInitialized = existsSync(descriptorFile);
 
   if (!isInitialized) {
+    if (!allowBootstrap) {
+      throw new FreshStartError("FRESH_START_INPUT_INVALID");
+    }
     const releaseId = options.releaseId ?? DEFAULT_BOOTSTRAP_RELEASE_ID;
     const explicit = loadV2LaunchConfig({
       MEMORY_PROJECT_ROOT: canonicalProjectRoot,
@@ -358,7 +440,15 @@ export async function createV2Foundation(
   let closed = false;
   let router: V2PublicToolRouter | undefined;
   let routerActiveGeneration: bigint | undefined;
-  const routedFoundations = new Map<string, Promise<V2Foundation>>();
+  interface RoutedFoundationEntry {
+    promise: Promise<V2Foundation>;
+    activeCalls: number;
+    pendingClose: boolean;
+    bootstrappedActive: boolean;
+  }
+  const routedFoundations = new Map<string, RoutedFoundationEntry>();
+  const autoHealEnabled =
+    options?.autoHealBuildSync === true || process.env.MEMORY_V2_AUTO_SYNC_BUILD === "1";
 
   const READ_ONLY_ROUTED_TOOLS = new Set<string>([
     "memory_v2Status",
@@ -378,101 +468,100 @@ export async function createV2Foundation(
     "memory_checkStaleness",
   ]);
 
-  const resolveRoutedFoundation = async (
+  const releaseEvictedEntry = (entry: RoutedFoundationEntry): void => {
+    entry.pendingClose = true;
+    if (entry.activeCalls === 0) {
+      void entry.promise.then((f) => f.close()).catch(() => undefined);
+    }
+  };
+
+  const withRoutedFoundation = async <T>(
     rawTargetProjectRoot: string,
-    allowAutoBootstrap = true,
-  ): Promise<V2Foundation | null> => {
-    const trimmed = rawTargetProjectRoot.trim();
-    if (!trimmed) return null;
-    if (!isAbsolute(trimmed)) {
-      throw new FreshStartError("FRESH_START_INPUT_INVALID");
-    }
-    const resolvedTarget = resolve(trimmed);
-    const resolvedHome = resolve(paths.projectRoot);
-    if (
-      resolvedTarget === resolvedHome ||
-      (process.platform === "win32" && resolvedTarget.toLowerCase() === resolvedHome.toLowerCase())
-    ) {
-      return null;
+    allowAutoBootstrap: boolean,
+    fn: (routed: V2Foundation) => Promise<T>,
+  ): Promise<{ readonly routed: true; readonly value: T } | { readonly routed: false }> => {
+    const canonicalTarget = validateRoutedProjectRoot(rawTargetProjectRoot, paths);
+    if (!canonicalTarget) {
+      return { routed: false };
     }
     if (
-      freshStartPathContains(paths.v1ArchiveRoot, resolvedTarget) ||
-      freshStartPathContains(resolvedTarget, paths.v1ArchiveRoot) ||
-      freshStartPathContains(paths.v2VaultRoot, resolvedTarget)
-    ) {
-      throw new FreshStartError("FRESH_START_PATH_OVERLAP");
-    }
-    if (!existsSync(resolvedTarget)) {
-      throw new FreshStartError("FRESH_START_INPUT_INVALID");
-    }
-    let targetStat;
-    try {
-      targetStat = lstatSync(resolvedTarget);
-    } catch {
-      throw new FreshStartError("FRESH_START_INPUT_INVALID");
-    }
-    if (!targetStat.isDirectory() && !targetStat.isSymbolicLink()) {
-      throw new FreshStartError("FRESH_START_INPUT_INVALID");
-    }
-    const canonicalTarget = realpathSync.native(resolvedTarget);
-    let canonicalStat;
-    try {
-      canonicalStat = statSync(canonicalTarget);
-    } catch {
-      throw new FreshStartError("FRESH_START_INPUT_INVALID");
-    }
-    if (!canonicalStat.isDirectory()) {
-      throw new FreshStartError("FRESH_START_INPUT_INVALID");
-    }
-    if (
-      canonicalTarget === paths.projectRoot ||
-      (process.platform === "win32" &&
-        canonicalTarget.toLowerCase() === paths.projectRoot.toLowerCase())
-    ) {
-      return null;
-    }
-    if (
-      freshStartPathContains(paths.v1ArchiveRoot, canonicalTarget) ||
-      freshStartPathContains(paths.v2VaultRoot, canonicalTarget)
-    ) {
-      throw new FreshStartError("FRESH_START_PATH_OVERLAP");
-    }
-    if (
-      !allowAutoBootstrap
-      && !existsSync(join(canonicalTarget, "memory-v2", ".memory-mcp", "project-identity.json"))
+      !allowAutoBootstrap &&
+      !existsSync(join(canonicalTarget, "memory-v2", ".memory-mcp", "project-identity.json"))
     ) {
       throw new FreshStartError("FRESH_START_INPUT_INVALID");
     }
-    let pending = routedFoundations.get(canonicalTarget);
-    if (pending) {
-      // Refresh LRU insertion order
-      routedFoundations.delete(canonicalTarget);
-      routedFoundations.set(canonicalTarget, pending);
+
+    const cacheKey =
+      process.platform === "win32" ? canonicalTarget.toLowerCase() : canonicalTarget;
+    let entry = routedFoundations.get(cacheKey);
+    if (entry && allowAutoBootstrap && !entry.bootstrappedActive) {
+      routedFoundations.delete(cacheKey);
+      releaseEvictedEntry(entry);
+      entry = undefined;
+    }
+
+    if (entry) {
+      routedFoundations.delete(cacheKey);
+      routedFoundations.set(cacheKey, entry);
     } else {
       if (routedFoundations.size >= 16) {
-        const oldestKey = routedFoundations.keys().next().value;
-        if (oldestKey !== undefined) {
-          const evicted = routedFoundations.get(oldestKey);
-          routedFoundations.delete(oldestKey);
-          void evicted?.then((f) => f.close()).catch(() => undefined);
+        let victimKey: string | undefined;
+        for (const [k, candidate] of routedFoundations.entries()) {
+          if (candidate.activeCalls === 0) {
+            victimKey = k;
+            break;
+          }
+        }
+        if (victimKey === undefined) {
+          victimKey = routedFoundations.keys().next().value;
+        }
+        if (victimKey !== undefined) {
+          const evicted = routedFoundations.get(victimKey);
+          routedFoundations.delete(victimKey);
+          if (evicted) releaseEvictedEntry(evicted);
         }
       }
-      pending = (async () => {
+      const shouldSync = allowAutoBootstrap && autoHealEnabled;
+      const promise = (async () => {
         const targetConfig = await ensureProjectV2StoreReady({
           projectRoot: canonicalTarget,
           ...(options?.entryUrl ? { entryUrl: options.entryUrl } : {}),
-          syncBuild: true,
-          ensureActive: true,
+          allowBootstrap: allowAutoBootstrap,
+          syncBuild: shouldSync,
+          ensureActive: allowAutoBootstrap,
         });
-        return createV2Foundation(targetConfig, options);
+        return createV2Foundation(targetConfig, {
+          ...(options?.entryUrl ? { entryUrl: options.entryUrl } : {}),
+          autoHealBuildSync: shouldSync,
+        });
       })();
-      routedFoundations.set(canonicalTarget, pending);
+      entry = {
+        promise,
+        activeCalls: 0,
+        pendingClose: false,
+        bootstrappedActive: allowAutoBootstrap,
+      };
+      routedFoundations.set(cacheKey, entry);
+    }
+
+    entry.activeCalls += 1;
+    let instance: V2Foundation;
+    try {
+      instance = await entry.promise;
+    } catch (err) {
+      entry.activeCalls -= 1;
+      if (routedFoundations.get(cacheKey) === entry) {
+        routedFoundations.delete(cacheKey);
+      }
+      throw err;
     }
     try {
-      return await pending;
-    } catch (err) {
-      routedFoundations.delete(canonicalTarget);
-      throw err;
+      return { routed: true, value: await fn(instance) };
+    } finally {
+      entry.activeCalls -= 1;
+      if (entry.pendingClose && entry.activeCalls === 0) {
+        void entry.promise.then((f) => f.close()).catch(() => undefined);
+      }
     }
   };
 
@@ -508,9 +597,6 @@ export async function createV2Foundation(
     return router;
   };
 
-  const autoHealEnabled =
-    options?.autoHealBuildSync === true || process.env.MEMORY_V2_AUTO_SYNC_BUILD === "1";
-
   const inspectActiveStateAndRelease = () => {
     if (closed) throw new FreshStartError("FRESH_START_STORAGE_FAILURE");
     if (inspectV2Build(options?.entryUrl) !== measuredBuild) throw new FreshStartError("FRESH_START_BUILD_MISMATCH");
@@ -518,9 +604,18 @@ export async function createV2Foundation(
       const preCheck = repository.transact(identity, (tx) => {
         const st = tx.state();
         if (!st) return null;
-        return tx.release(st.releaseId);
+        const rel = tx.release(st.releaseId);
+        return rel ? { state: st, release: rel } : null;
       });
-      if (preCheck && preCheck.buildIdentityHash !== measuredBuild) {
+      if (
+        preCheck &&
+        preCheck.state.mode === "active" &&
+        preCheck.release.releaseId === config.releaseId &&
+        preCheck.release.schemaIdentityHash === expectedSchemaFingerprint(PROJECT_STORE_MIGRATIONS) &&
+        preCheck.release.configurationHash === configurationDigest(config) &&
+        isProductionReleaseManifest(preCheck.release) &&
+        preCheck.release.buildIdentityHash !== measuredBuild
+      ) {
         connection.exec("BEGIN IMMEDIATE");
         try {
           connection.exec("DROP TRIGGER IF EXISTS fresh_start_releases_no_update");
@@ -581,6 +676,16 @@ export async function createV2Foundation(
         productionReady: isProdProfile && state.mode === "active",
       });
     },
+    async statusForProject(targetProjectRoot: string): Promise<FreshStartStatus> {
+      inspectActiveStateAndRelease();
+      const outcome = await withRoutedFoundation(targetProjectRoot, false, (routed) =>
+        routed.status(),
+      );
+      if (outcome.routed) {
+        return outcome.value;
+      }
+      return foundation.status();
+    },
     content: Object.freeze({
       async listTools(): Promise<readonly McpToolDefinition[]> {
         const { state, release } = inspectActiveStateAndRelease();
@@ -611,13 +716,14 @@ export async function createV2Foundation(
                 ? argObj.workspaceRoot
                 : "";
           if (rawProjectRoot.trim().length > 0) {
-            const routed = await resolveRoutedFoundation(
+            const { projectRoot: _p, workspaceRoot: _w, ...forwardedArgs } = argObj;
+            const outcome = await withRoutedFoundation(
               rawProjectRoot,
               !READ_ONLY_ROUTED_TOOLS.has(name),
+              (routed) => routed.content.invoke(name, forwardedArgs),
             );
-            if (routed) {
-              const { projectRoot: _p, workspaceRoot: _w, ...forwardedArgs } = argObj;
-              return routed.content.invoke(name, forwardedArgs);
+            if (outcome.routed) {
+              return outcome.value;
             }
           }
         }
@@ -626,12 +732,13 @@ export async function createV2Foundation(
     }),
     async close(): Promise<void> {
       if (!closed) {
-        const childFoundations = [...routedFoundations.values()];
+        const childEntries = [...routedFoundations.values()];
         routedFoundations.clear();
         await Promise.allSettled(
-          childFoundations.map(async (fPromise) => {
+          childEntries.map(async (entry) => {
+            entry.pendingClose = true;
             try {
-              const f = await fPromise;
+              const f = await entry.promise;
               await f.close();
             } catch {
               // Ignore child close failure

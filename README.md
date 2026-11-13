@@ -97,7 +97,7 @@ node dist/v2-admin.js generate-client-configs \
 ```
 
 คำสั่งนี้สร้างและอัปเดต:
-- MCP Configs (พร้อม `MEMORY_V2_AUTO_SYNC_BUILD="1"`): `.antigravity/mcp.json`, `.cursor/mcp.json`, `.windsurf/mcp.json`, `.mcp.json`, `.claude/settings.local.json`, `.codex/config.toml`, `opencode.json`, `.zed/settings.json`
+- MCP Configs (ค่าเริ่มต้น `MEMORY_V2_AUTO_SYNC_BUILD="0"` เพื่อรักษาความเข้มงวดของ Release Seal; เปิดแบบ opt-in ได้ด้วย `--auto-sync-build 1`): `.antigravity/mcp.json`, `.cursor/mcp.json`, `.windsurf/mcp.json`, `.mcp.json`, `.claude/settings.local.json`, `.codex/config.toml`, `opencode.json`, `.zed/settings.json`
 - Example Configs: `.antigravity/mcp.example.json`, `.windsurf/mcp_config.example.json`
 - Synchronized V2 Rules: `CLAUDE.md`, `.cursor/rules/project-memory.mdc`, `.windsurf/rules/project-memory.md`, `.rules`, `.windsurfrules`, `.github/copilot-instructions.md`
 

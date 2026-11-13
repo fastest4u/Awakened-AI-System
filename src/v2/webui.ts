@@ -1,7 +1,7 @@
 import { randomBytes, timingSafeEqual } from "node:crypto";
-import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { dirname, isAbsolute, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { buildWikilinkResolver } from "../utils/links.js";
 import {
@@ -13,6 +13,9 @@ import {
   computeCausalTriads,
   deriveCleanNoteTitleFromFields,
   extractMemoryEntities,
+  isAcceptablePath,
+  normalizeCandidatePath,
+  resolveContainedWorkspaceFile,
   type CausalTriadNoteInput,
   type CausalTriadSummary,
 } from "./entity-extractor.js";
@@ -112,22 +115,32 @@ export function buildMemoryKnowledgeGraph(
   const edgeKeys = new Set<string>();
   const fileContentsCache = new Map<string, string | null>();
 
+  const cacheFileEntry = (key: string, value: string | null): void => {
+    if (!fileContentsCache.has(key) && fileContentsCache.size >= 256) {
+      const oldest = fileContentsCache.keys().next().value;
+      if (oldest !== undefined) {
+        fileContentsCache.delete(oldest);
+      }
+    }
+    fileContentsCache.set(key, value);
+  };
+
   const readRepoFileCached = (relPath: string): string | null => {
     if (!options?.projectRoot) return null;
     if (fileContentsCache.has(relPath)) {
       return fileContentsCache.get(relPath) ?? null;
     }
     try {
-      const abs = join(options.projectRoot, ...relPath.split("/"));
-      if (!existsSync(abs) || !statSync(abs).isFile()) {
-        fileContentsCache.set(relPath, null);
+      const contained = resolveContainedWorkspaceFile(options.projectRoot, relPath, 512 * 1024);
+      if (!contained) {
+        cacheFileEntry(relPath, null);
         return null;
       }
-      const content = readFileSync(abs, "utf8");
-      fileContentsCache.set(relPath, content);
+      const content = readFileSync(contained.absPath, "utf8");
+      cacheFileEntry(relPath, content);
       return content;
     } catch {
-      fileContentsCache.set(relPath, null);
+      cacheFileEntry(relPath, null);
       return null;
     }
   };
@@ -240,23 +253,19 @@ export function buildMemoryKnowledgeGraph(
       `${title}\n${summary}\n${String(raw.body ?? "")}`,
       options?.projectRoot ? { projectRoot: options.projectRoot } : undefined,
     );
-    const mergedFilePaths = [
-      ...new Set([
-        ...(Array.isArray(raw.filePaths)
-          ? raw.filePaths.filter((p): p is string => typeof p === "string")
-          : []),
-        ...extracted.filePaths,
-      ]),
-    ];
+    const safeRawFilePaths = Array.isArray(raw.filePaths)
+      ? raw.filePaths
+          .filter((p): p is string => typeof p === "string")
+          .map((p) => normalizeCandidatePath(p))
+          .filter((p) => isAcceptablePath(p, options?.projectRoot))
+      : [];
+    const mergedFilePaths = [...new Set([...safeRawFilePaths, ...extracted.filePaths])];
     const filePaths =
       options?.filterMissingRepoFiles && options.projectRoot
-        ? mergedFilePaths.filter((fp) => {
-            try {
-              return existsSync(join(options.projectRoot!, ...fp.split("/")));
-            } catch {
-              return false;
-            }
-          })
+        ? mergedFilePaths.filter(
+            (fp) =>
+              resolveContainedWorkspaceFile(options.projectRoot!, fp, 16 * 1024 * 1024) !== null,
+          )
         : mergedFilePaths;
 
     const symbols = [
@@ -510,8 +519,13 @@ const WEBUI_SECURITY_HEADERS: Readonly<Record<string, string>> = Object.freeze({
   "referrer-policy": "no-referrer",
 });
 
+const WILDCARD_BIND_HOSTS = new Set(["0.0.0.0", "::", "[::]", "::0", "[::0]", "*"]);
+
 function isAllowedHostName(hostname: string, extraHost?: string): boolean {
   const lower = hostname.trim().toLowerCase();
+  if (!lower || WILDCARD_BIND_HOSTS.has(lower)) {
+    return false;
+  }
   if (
     lower === "127.0.0.1"
     || lower === "localhost"
@@ -520,10 +534,41 @@ function isAllowedHostName(hostname: string, extraHost?: string): boolean {
   ) {
     return true;
   }
-  if (extraHost && lower === extraHost.trim().toLowerCase()) {
-    return true;
+  if (extraHost) {
+    const normalizedExtra = extraHost.trim().toLowerCase();
+    if (
+      normalizedExtra &&
+      !WILDCARD_BIND_HOSTS.has(normalizedExtra) &&
+      (lower === normalizedExtra ||
+        (normalizedExtra.includes(":") && !normalizedExtra.startsWith("[") && lower === `[${normalizedExtra}]`))
+    ) {
+      return true;
+    }
   }
   return false;
+}
+
+function pathContainsOrEquals(root: string, target: string): boolean {
+  const norm = (p: string) => (process.platform === "win32" ? p.toLowerCase() : p);
+  const rel = relative(norm(root), norm(target));
+  return rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
+}
+
+function canonicalizeProjectRoot(projectRoot: string): string {
+  const resolved = resolve(projectRoot);
+  try {
+    if (existsSync(resolved)) {
+      return realpathSync.native(resolved);
+    }
+  } catch {
+    // Fall back to resolved path when target is missing
+  }
+  return resolved;
+}
+
+function canonicalProjectKey(projectRoot: string): string {
+  const canonical = canonicalizeProjectRoot(projectRoot);
+  return process.platform === "win32" ? canonical.toLowerCase() : canonical;
 }
 
 function extractHostnameFromHostHeader(hostHeader: string): string {
@@ -589,71 +634,89 @@ export interface V2WebUiOptions {
 }
 
 export function createV2WebUiHandler(options: V2WebUiOptions) {
-  const defaultProjectRoot = resolve(options.defaultProjectRoot);
+  const defaultProjectRoot = canonicalizeProjectRoot(options.defaultProjectRoot);
   const entryUrl = options.entryUrl ?? resolveDefaultEntryUrl();
   const csrfToken = randomBytes(24).toString("hex");
   const foundationCache = new Map<string, V2Foundation>();
   const foundationPromiseCache = new Map<string, Promise<V2Foundation>>();
   const ownedFoundations = new Set<V2Foundation>();
-  const knownProjects = new Set<string>(
-    discoverV2Projects(defaultProjectRoot, options.extraProjectRoots ?? []),
-  );
-  knownProjects.add(defaultProjectRoot);
+  const knownProjects = new Set<string>();
+  const addKnownProject = (root: string): void => {
+    const canonical = canonicalizeProjectRoot(root);
+    const key = canonicalProjectKey(canonical);
+    for (const existing of knownProjects) {
+      if (canonicalProjectKey(existing) === key) return;
+    }
+    knownProjects.add(canonical);
+  };
+  for (const p of discoverV2Projects(defaultProjectRoot, options.extraProjectRoots ?? [])) {
+    addKnownProject(p);
+  }
+  addKnownProject(defaultProjectRoot);
 
   if (options.foundations) {
     for (const [root, foundation] of options.foundations.entries()) {
-      const resolvedRoot = resolve(root);
-      foundationCache.set(resolvedRoot, foundation);
-      knownProjects.add(resolvedRoot);
+      const canonical = canonicalizeProjectRoot(root);
+      foundationCache.set(canonicalProjectKey(canonical), foundation);
+      addKnownProject(canonical);
     }
   }
 
   function isRegisteredOrInitializedProject(projectRoot: string): boolean {
-    const resolvedRoot = resolve(projectRoot);
-    if (process.platform === "win32") {
-      const lower = resolvedRoot.toLowerCase();
-      for (const known of knownProjects) {
-        if (resolve(known).toLowerCase() === lower) return true;
-      }
-      for (const cached of foundationCache.keys()) {
-        if (resolve(cached).toLowerCase() === lower) return true;
-      }
-    } else if (knownProjects.has(resolvedRoot) || foundationCache.has(resolvedRoot)) {
-      return true;
+    const canonical = canonicalizeProjectRoot(projectRoot);
+    const key = canonicalProjectKey(canonical);
+    if (foundationCache.has(key)) return true;
+    for (const known of knownProjects) {
+      if (canonicalProjectKey(known) === key) return true;
     }
-    const identityFile = join(resolvedRoot, "memory-v2", ".memory-mcp", "project-identity.json");
+    const identityFile = join(canonical, "memory-v2", ".memory-mcp", "project-identity.json");
     if (existsSync(identityFile)) {
-      knownProjects.add(resolvedRoot);
+      addKnownProject(canonical);
       return true;
     }
     return false;
   }
 
   async function getFoundationForProject(projectRoot: string): Promise<V2Foundation> {
-    const resolvedRoot = resolve(projectRoot);
-    const cached = foundationCache.get(resolvedRoot);
-    if (cached) return cached;
-    const inflight = foundationPromiseCache.get(resolvedRoot);
+    const canonicalRoot = canonicalizeProjectRoot(projectRoot);
+    const cacheKey = canonicalProjectKey(canonicalRoot);
+    const cached = foundationCache.get(cacheKey);
+    if (cached) {
+      foundationCache.delete(cacheKey);
+      foundationCache.set(cacheKey, cached);
+      return cached;
+    }
+    const inflight = foundationPromiseCache.get(cacheKey);
     if (inflight) return inflight;
 
     const initPromise = (async () => {
       const config = await ensureProjectV2StoreReady({
-        projectRoot: resolvedRoot,
+        projectRoot: canonicalRoot,
         entryUrl,
         syncBuild: true,
         ensureActive: true,
       });
       const foundation = await createV2Foundation(config, { entryUrl });
-      foundationCache.set(resolvedRoot, foundation);
+      if (ownedFoundations.size >= 32) {
+        for (const [oldKey, oldFoundation] of foundationCache.entries()) {
+          if (ownedFoundations.has(oldFoundation)) {
+            foundationCache.delete(oldKey);
+            ownedFoundations.delete(oldFoundation);
+            void oldFoundation.close().catch(() => undefined);
+            break;
+          }
+        }
+      }
+      foundationCache.set(cacheKey, foundation);
       ownedFoundations.add(foundation);
-      knownProjects.add(resolvedRoot);
+      addKnownProject(canonicalRoot);
       return foundation;
     })();
-    foundationPromiseCache.set(resolvedRoot, initPromise);
+    foundationPromiseCache.set(cacheKey, initPromise);
     try {
       return await initPromise;
     } finally {
-      foundationPromiseCache.delete(resolvedRoot);
+      foundationPromiseCache.delete(cacheKey);
     }
   }
 
@@ -661,17 +724,19 @@ export function createV2WebUiHandler(options: V2WebUiOptions) {
     try {
       const method = (req.method ?? "GET").toUpperCase();
 
-      // 0a. DNS-Rebinding defense: enforce loopback / configured Host header
-      const rawHostHeader = typeof req.headers.host === "string" ? req.headers.host : "";
-      if (rawHostHeader) {
-        const hostOnly = extractHostnameFromHostHeader(rawHostHeader);
-        if (!isAllowedHostName(hostOnly, options.allowedHost)) {
-          sendJson(res, 403, { ok: false, error: "FORBIDDEN_HOST" });
-          return;
-        }
+      // 0a. DNS-Rebinding defense: strictly require & validate Host header
+      const rawHostHeader = typeof req.headers.host === "string" ? req.headers.host.trim() : "";
+      if (!rawHostHeader) {
+        sendJson(res, 403, { ok: false, error: "FORBIDDEN_HOST" });
+        return;
+      }
+      const hostOnly = extractHostnameFromHostHeader(rawHostHeader);
+      if (!isAllowedHostName(hostOnly, options.allowedHost)) {
+        sendJson(res, 403, { ok: false, error: "FORBIDDEN_HOST" });
+        return;
       }
 
-      // 0b. Mutating request security: Content-Type + Origin/Sec-Fetch-Site + X-PM-CSRF-Token
+      // 0b. Mutating request security: Content-Type + Origin/Sec-Fetch-Site + Unconditional X-PM-CSRF-Token
       if (method !== "GET" && method !== "HEAD" && method !== "OPTIONS") {
         const contentType = String(req.headers["content-type"] ?? "").toLowerCase();
         if (!contentType.startsWith("application/json")) {
@@ -701,11 +766,13 @@ export function createV2WebUiHandler(options: V2WebUiOptions) {
             sendJson(res, 403, { ok: false, error: "CSRF_ORIGIN_DENIED" });
             return;
           }
+          const originPort =
+            parsedOrigin.port || (parsedOrigin.protocol === "https:" ? "443" : "80");
           const closeBracket = rawHostHeader.indexOf("]");
           const colonIdx = rawHostHeader.lastIndexOf(":");
-          if (rawHostHeader && colonIdx > closeBracket) {
+          if (colonIdx > closeBracket) {
             const reqPort = rawHostHeader.slice(colonIdx + 1).trim();
-            if (reqPort && parsedOrigin.port && parsedOrigin.port !== reqPort) {
+            if (reqPort && originPort !== reqPort) {
               sendJson(res, 403, { ok: false, error: "CSRF_ORIGIN_DENIED" });
               return;
             }
@@ -716,17 +783,14 @@ export function createV2WebUiHandler(options: V2WebUiOptions) {
           typeof req.headers["x-pm-csrf-token"] === "string"
             ? req.headers["x-pm-csrf-token"].trim()
             : "";
-        const isBrowserContext = Boolean(originHeader || secFetchSite);
-        if (isBrowserContext || providedCsrf.length > 0) {
-          const expectedBuf = Buffer.from(csrfToken, "utf8");
-          const providedBuf = Buffer.from(providedCsrf, "utf8");
-          if (
-            providedBuf.byteLength !== expectedBuf.byteLength
-            || !timingSafeEqual(providedBuf, expectedBuf)
-          ) {
-            sendJson(res, 403, { ok: false, error: "CSRF_TOKEN_INVALID" });
-            return;
-          }
+        const expectedBuf = Buffer.from(csrfToken, "utf8");
+        const providedBuf = Buffer.from(providedCsrf, "utf8");
+        if (
+          providedBuf.byteLength !== expectedBuf.byteLength
+          || !timingSafeEqual(providedBuf, expectedBuf)
+        ) {
+          sendJson(res, 403, { ok: false, error: "CSRF_TOKEN_INVALID" });
+          return;
         }
       }
 
@@ -788,7 +852,7 @@ export function createV2WebUiHandler(options: V2WebUiOptions) {
           options.extraProjectRoots ?? [],
           knownProjects,
           getFoundationForProject,
-          (root) => foundationCache.has(resolve(root)),
+          (root) => foundationCache.has(canonicalProjectKey(root)),
         );
         sendJson(res, 200, payload);
         return;
@@ -800,15 +864,46 @@ export function createV2WebUiHandler(options: V2WebUiOptions) {
           typeof body.projectRoot === "string" ? body.projectRoot : null,
           "",
         );
-        if (!candidate) {
+        if (!candidate || !existsSync(candidate)) {
           sendJson(res, 400, { ok: false, error: "INVALID_PROJECT_ROOT" });
           return;
         }
-        const foundation = await getFoundationForProject(candidate);
+        let candidateStat: ReturnType<typeof lstatSync>;
+        try {
+          candidateStat = lstatSync(candidate);
+        } catch {
+          sendJson(res, 400, { ok: false, error: "INVALID_PROJECT_ROOT" });
+          return;
+        }
+        if (candidateStat.isSymbolicLink() || !candidateStat.isDirectory()) {
+          sendJson(res, 400, { ok: false, error: "INVALID_PROJECT_ROOT" });
+          return;
+        }
+        let canonicalCandidate: string;
+        try {
+          canonicalCandidate = realpathSync.native(candidate);
+        } catch {
+          sendJson(res, 400, { ok: false, error: "INVALID_PROJECT_ROOT" });
+          return;
+        }
+        if (canonicalProjectKey(canonicalCandidate) !== canonicalProjectKey(defaultProjectRoot)) {
+          const defaultMemory = join(defaultProjectRoot, "memory");
+          const defaultVaultV2 = join(defaultProjectRoot, "memory-v2");
+          if (
+            pathContainsOrEquals(defaultMemory, canonicalCandidate) ||
+            pathContainsOrEquals(canonicalCandidate, defaultMemory) ||
+            pathContainsOrEquals(defaultVaultV2, canonicalCandidate) ||
+            pathContainsOrEquals(canonicalCandidate, defaultVaultV2)
+          ) {
+            sendJson(res, 400, { ok: false, error: "PROJECT_PATH_OVERLAP" });
+            return;
+          }
+        }
+        const foundation = await getFoundationForProject(canonicalCandidate);
         const st = await foundation.status();
         sendJson(res, 200, {
           ok: true,
-          projectRoot: candidate,
+          projectRoot: canonicalCandidate,
           status: st,
         });
         return;
@@ -1117,7 +1212,8 @@ export async function startV2WebUiServer(
 
   const addr = server.address();
   const actualPort = typeof addr === "object" && addr ? addr.port : requestedPort;
-  const url = `http://${host}:${actualPort}`;
+  const formattedHost = host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
+  const url = `http://${formattedHost}:${actualPort}`;
 
   return {
     url,

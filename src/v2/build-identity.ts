@@ -67,7 +67,6 @@ function measuredIdentity(manifest: Record<string, unknown>, runtime: Record<str
 }
 
 let cachedExecSha256: string | undefined;
-const cachedArtifactDigest = new Map<string, { readonly byteLength: number; readonly sha256: string }>();
 
 /** Independent local integrity measurement, not production release attestation. */
 export function inspectV2Build(entryUrl: string = import.meta.url): string {
@@ -79,18 +78,8 @@ export function inspectV2Build(entryUrl: string = import.meta.url): string {
     if (runtime.executableSha256 !== cachedExecSha256) fail();
     const artifacts = artifactDescriptors(manifest);
     artifacts.forEach((artifact, index) => {
-      const path = join(root, artifactNames[index]!);
-      const stat = lstatSync(path, { bigint: true });
-      if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1n || stat.size > 32n * 1024n * 1024n || realpathSync.native(path) !== resolve(path)) fail();
-      const cacheKey = `${path}:${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
-      let entry = cachedArtifactDigest.get(cacheKey);
-      if (!entry) {
-        const actual = readFileSync(path);
-        if (BigInt(actual.byteLength) !== stat.size) fail();
-        entry = { byteLength: actual.byteLength, sha256: digest(actual) };
-        cachedArtifactDigest.set(cacheKey, entry);
-      }
-      artifactIdentity(artifact, entry.byteLength, entry.sha256);
+      const actual = bytes(join(root, artifactNames[index]!), 32 * 1024 * 1024);
+      artifactIdentity(artifact, actual.byteLength, digest(actual));
     });
     return measuredIdentity(manifest, runtime, artifacts);
   } catch { return fail(); }

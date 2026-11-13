@@ -59,6 +59,7 @@ export interface ProjectionEventSnapshot {
 
 export interface ProjectionEventSnapshotV3 extends ProjectionEventSnapshot {
   dispositions(): Iterable<ProjectionSourceDisposition>;
+  crossScopeItemIds?(): ReadonlySet<string>;
 }
 
 export interface ProjectionEventReaderV3 extends ProjectionEventReader {
@@ -451,6 +452,7 @@ function openBoundedProjectionEventSnapshot(
     };
     let streamRequested = false;
     let streamComplete = false;
+    const crossScopeItemIdsSet = new Set<string>();
     const dispositions = (): Iterable<ProjectionSourceDisposition> => {
         if (released || streamRequested) return integrity();
         streamRequested = true;
@@ -472,6 +474,26 @@ function openBoundedProjectionEventSnapshot(
                 yield Object.freeze({event: authenticated.event, governedNotePrior});
                 // Check before resuming SQLite's iterator after a caller closes the snapshot.
                 if (released) return integrity();
+              } else {
+                if (governedNotePrior !== null) {
+                  crossScopeItemIdsSet.add(governedNotePrior.witness.recordId);
+                }
+                if (authenticated.event.eventType === "MemorySourceRecorded") {
+                  try {
+                    const parsed = JSON.parse(authenticated.event.payloadJson) as {
+                      itemId?: unknown;
+                      item?: { itemId?: unknown };
+                    };
+                    if (typeof parsed?.itemId === "string" && parsed.itemId.length > 0) {
+                      crossScopeItemIdsSet.add(parsed.itemId);
+                    }
+                    if (typeof parsed?.item?.itemId === "string" && parsed.item.itemId.length > 0) {
+                      crossScopeItemIdsSet.add(parsed.item.itemId);
+                    }
+                  } catch {
+                    return integrity();
+                  }
+                }
               }
             }
             if (
@@ -490,6 +512,9 @@ function openBoundedProjectionEventSnapshot(
     return Object.freeze({
       binding, eventCount: bounds.eventCount, aggregateBytes: bounds.aggregateBytes,
       terminalEventPosition, terminalEventHash, dispositions,
+      crossScopeItemIds(): ReadonlySet<string> {
+        return crossScopeItemIdsSet;
+      },
       events(): Iterable<StoredEvent> {
         const sources = dispositions();
         return (function* (): IterableIterator<StoredEvent> {
@@ -532,7 +557,7 @@ export function openCommittedProjectionEventSnapshot(
 export function replayCommittedProjectionSources(
   binding: ProjectBinding,
   options: CommittedProjectionReplayOptions,
-  consume: (source: ProjectionSourceDisposition) => void,
+  consume: (source: ProjectionSourceDisposition, crossScopeItemIds: ReadonlySet<string>) => void,
 ): CommittedProjectionReplayResult {
   if (typeof consume !== "function" || typeof options.terminalEventPosition !== "bigint"
     || options.terminalEventPosition < 0n || options.terminalEventPosition > SQLITE_INT64_MAX) return integrity();
@@ -542,7 +567,8 @@ export function replayCommittedProjectionSources(
     maxAggregateBytes: boundedPositiveInteger(options.maxAggregateBytes, MAX_INTEGRITY_REPLAY_BYTES, MAX_INTEGRITY_REPLAY_BYTES),
   });
   try {
-    for (const source of snapshot.dispositions()) consume(source);
+    const crossScopeIds = snapshot.crossScopeItemIds?.() ?? new Set<string>();
+    for (const source of snapshot.dispositions()) consume(source, crossScopeIds);
     return Object.freeze({eventCount:snapshot.eventCount, aggregateBytes:snapshot.aggregateBytes,
       terminalEventPosition:snapshot.terminalEventPosition, terminalEventHash:snapshot.terminalEventHash});
   } finally { snapshot.close(); }

@@ -1,4 +1,6 @@
+import { createHash } from "node:crypto";
 import type { V2Foundation } from "./composition.js";
+import { deriveCleanNoteTitleFromFields } from "./entity-extractor.js";
 
 export interface CuratorNoteSummary {
   readonly recordId: string;
@@ -93,36 +95,19 @@ export interface CuratorChatResponse {
   readonly data: unknown;
 }
 
-function deriveCleanNoteTitle(rawTitle: unknown, summary: string, body: string, fallbackId: string): string {
-  const genericPrefixes = new Set(["adr", "insight", "mistake", "session-log", "session log", "note"]);
-  if (typeof rawTitle === "string" && rawTitle.trim().length > 0) {
-    const trimmed = rawTitle.trim();
-    if (!genericPrefixes.has(trimmed.toLowerCase())) {
-      return trimmed;
-    }
-  }
-  const headingMatch = body.match(/^\s*#\s+(.+?)\s*$/mu);
-  if (headingMatch?.[1]) {
-    return headingMatch[1].trim();
-  }
-  const colonIdx = summary.indexOf(": ");
-  if (colonIdx > 0) {
-    const prefix = summary.slice(0, colonIdx).trim();
-    if (!genericPrefixes.has(prefix.toLowerCase())) {
-      return prefix;
-    }
-    const afterPrefix = summary.slice(colonIdx + 2).trim();
-    const secondColon = afterPrefix.indexOf(": ");
-    return secondColon > 0 ? `${prefix}: ${afterPrefix.slice(0, secondColon).trim()}` : summary;
-  }
-  return summary || fallbackId;
-}
-
 function normalizeNoteItem(raw: Record<string, unknown>): CuratorNoteSummary {
   const recordId = String(raw.recordId ?? raw.id ?? "");
   const summary = String(raw.summary ?? raw.text ?? "");
   const body = typeof raw.body === "string" ? raw.body : "";
-  const title = deriveCleanNoteTitle(raw.title, summary, body, recordId);
+  const { title } = deriveCleanNoteTitleFromFields(
+    {
+      title: raw.title,
+      summary,
+      text: raw.text,
+      body,
+    },
+    recordId,
+  );
   const kind = String(raw.recordKind ?? raw.kind ?? "insight");
   const filePaths = Array.isArray(raw.filePaths)
     ? raw.filePaths.filter((p): p is string => typeof p === "string")
@@ -151,7 +136,11 @@ export class V2MemoryCuratorAgent {
     this.#foundation = foundation;
   }
 
-  async auditVault(options?: { readonly limit?: number; readonly pageSize?: number }): Promise<CuratorAuditReport> {
+  async auditVault(options?: {
+    readonly limit?: number;
+    readonly pageSize?: number;
+    readonly onCollectedItems?: (items: readonly Record<string, unknown>[]) => void;
+  }): Promise<CuratorAuditReport> {
     const maxItems = Math.max(1, options?.limit ?? 1_000);
     const pageSize = Math.max(1, Math.min(200, options?.pageSize ?? Math.min(200, maxItems)));
     const status = await this.#foundation.status();
@@ -182,6 +171,7 @@ export class V2MemoryCuratorAgent {
       }
       cursor = listRaw.nextCursor;
     }
+    options?.onCollectedItems?.(collectedRawItems);
     const dupRaw = (await this.#foundation.content.invoke("memory_findDuplicates", {})) as {
       duplicateGroups?: Array<{ contentHash: string; recordIds: string[] }>;
     };
@@ -241,7 +231,8 @@ export class V2MemoryCuratorAgent {
           uniqueIds.every((id) => existing.includes(id)) && existing.length === uniqueIds.length,
       );
       if (!alreadyCovered) {
-        seenGroups.set(`summary:${norm.slice(0, 48)}`, uniqueIds);
+        const digest = createHash("sha256").update(norm).digest("hex").slice(0, 32);
+        seenGroups.set(`summary:${digest}`, uniqueIds);
       }
     }
 
@@ -402,6 +393,7 @@ export class V2MemoryCuratorAgent {
       auditBefore.candidateQueue.map((c) => [c.recordId, c]),
     );
 
+    let primaryError: unknown;
     try {
       if (resolveDuplicates) {
         for (const group of auditBefore.duplicateGroups) {
@@ -484,12 +476,21 @@ export class V2MemoryCuratorAgent {
           expired.push(Object.freeze({ recordId: stale.recordId }));
         }
       }
+    } catch (err) {
+      primaryError = err;
+      throw err;
     } finally {
-      await this.#foundation.content.invoke("memory_sessionEnd", {
-        sessionId,
-        summary: `AI Memory Curator completed: promoted ${promoted.length}, superseded ${superseded.length}, expired ${expired.length}.`,
-        finalize: true,
-      });
+      try {
+        await this.#foundation.content.invoke("memory_sessionEnd", {
+          sessionId,
+          summary: `AI Memory Curator completed: promoted ${promoted.length}, superseded ${superseded.length}, expired ${expired.length}.`,
+          finalize: true,
+        });
+      } catch (cleanupErr) {
+        if (primaryError === undefined) {
+          throw cleanupErr;
+        }
+      }
     }
 
     const auditAfter = await this.auditVault();
@@ -598,21 +599,21 @@ export class V2MemoryCuratorAgent {
           data: previewAudit,
         });
       }
-      executedTools.push(
-        "memory_sessionStart",
-        "memory_list",
-        "memory_findDuplicates",
-        "memory_checkStaleness",
-        "memory_promote",
-        "memory_supersede",
-        "memory_expire",
-        "memory_sessionEnd",
-      );
       const receipt = await this.autoCurate({
         promoteCandidates: true,
         resolveDuplicates: true,
         expireStale: true,
       });
+      executedTools.push(
+        "memory_sessionStart",
+        "memory_list",
+        "memory_findDuplicates",
+        "memory_checkStaleness",
+      );
+      if (receipt.promoted.length > 0) executedTools.push("memory_promote");
+      if (receipt.superseded.length > 0) executedTools.push("memory_supersede");
+      if (receipt.expired.length > 0) executedTools.push("memory_expire");
+      executedTools.push("memory_sessionEnd");
       return Object.freeze({
         ok: true,
         intent: "auto_curate",

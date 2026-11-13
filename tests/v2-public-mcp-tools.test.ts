@@ -1115,3 +1115,134 @@ test("MCP stdio server exposes resource templates, note/session/graph resources,
     fixture.cleanup();
   }
 });
+
+test("Strict PR #17 regressions: complete tool schemas, non-mutating routed reads on prepared stores, cross-project status releaseId, malformed URI errors, and non-promoting cancelSessionEnd", async () => {
+  const hostFixture = await createStoreFixture({ productionProfile: true, promoteMode: "active" });
+  const preparedTarget = await createStoreFixture({ productionProfile: true, promoteMode: "prepared" });
+  const distinctActiveTarget = await createStoreFixture({ productionProfile: true, promoteMode: "active" });
+  assert.notEqual(
+    hostFixture.config.releaseId,
+    distinctActiveTarget.config.releaseId,
+    "Secondary active project must have its own distinct releaseId",
+  );
+
+  try {
+    await withMcpClient(hostFixture, async (client) => {
+      // 1. F7.4: PUBLIC_TOOL_SCHEMA_CATALOG exposes all handler-accepted properties
+      const listedTools = await client.listTools();
+      const schemaProps = (toolName: string) =>
+        ((
+          listedTools.tools.find((t) => t.name === toolName)?.inputSchema as
+            | { properties?: Record<string, unknown> }
+            | undefined
+        )?.properties ?? {});
+
+      assert.ok("autoDetectFiles" in schemaProps("memory_sessionStart"));
+      assert.ok("autoDetectFiles" in schemaProps("memory_contextPack"));
+      assert.ok("filesTouched" in schemaProps("memory_contextPack"));
+      assert.ok("autoDetectFiles" in schemaProps("memory_selfCheck"));
+      assert.ok("autoCurate" in schemaProps("memory_sessionEnd"));
+      assert.ok("workflowId" in schemaProps("memory_sessionEnd"));
+      assert.ok("finalize" in schemaProps("memory_amendSessionEnd"));
+      assert.ok("autoPromote" in schemaProps("memory_amendSessionEnd"));
+      assert.ok("recordIds" in schemaProps("memory_forgetEvidence"));
+      assert.ok("evidenceIds" in schemaProps("memory_forgetEvidence"));
+
+      // 2. F4.3: Malformed percent-encoded URI returns FRESH_START_INPUT_INVALID (never raw URIError)
+      await assert.rejects(
+        () => client.readResource({ uri: "memory://notes/%E0%A4%A" }),
+        /FRESH_START_INPUT_INVALID/u,
+      );
+
+      // 3. F4.2: Cross-project status resource succeeds when target project has a distinct releaseId
+      const targetStatusRes = await client.readResource({
+        uri: `memory://projects/${encodeURIComponent(distinctActiveTarget.projectRoot)}/status`,
+      });
+      const targetStatusJson = JSON.parse(
+        (targetStatusRes.contents[0] as { text?: string } | undefined)?.text ?? "{}",
+      ) as { projectId?: string; mode?: string };
+      assert.equal(targetStatusJson.projectId, distinctActiveTarget.release.projectId);
+      assert.equal(targetStatusJson.mode, "active");
+
+      // 4. F3.2: Read-only routed tool against a 'prepared' store must fail closed and NEVER promote it to 'active'
+      await assert.rejects(
+        () =>
+          client.callTool({
+            name: "memory_list",
+            arguments: { projectRoot: preparedTarget.projectRoot, limit: 5 },
+          }),
+        /FRESH_START_RELEASE_NOT_READY/u,
+      );
+      const driver = new NodeSqliteDriver({ DatabaseSync });
+      const preparedConn = driver.open(preparedTarget.eventsPath, { mode: "existing", busyTimeoutMs: 1_000 });
+      try {
+        const preparedRepo = new SqliteFreshStartRepository(preparedConn);
+        const stateRow = preparedRepo.transact(
+          {
+            projectId: preparedTarget.release.projectId,
+            vaultId: preparedTarget.release.vaultId,
+            storeId: preparedTarget.release.storeId,
+          },
+          (tx) => tx.state(),
+        );
+        assert.equal(
+          stateRow?.mode,
+          "prepared",
+          "Read-only routed memory_list must not silently promote a prepared store to active",
+        );
+      } finally {
+        preparedConn.close();
+      }
+
+      // 5. F7.2: memory_cancelSessionEnd must NOT promote candidate notes even if autoPromote: true is passed
+      const started = parseToolJson(
+        await client.callTool({
+          name: "memory_sessionStart",
+          arguments: { agentName: "cancel-guard-agent", includeContext: false },
+        }),
+      );
+      const sessionId = String(started.sessionId);
+      const candidateInsight = parseToolJson(
+        await client.callTool({
+          name: "memory_writeInsight",
+          arguments: {
+            sessionId,
+            title: "Unverified Candidate Insight Before Cancel",
+            summary: "Candidate note must remain candidate if session end is cancelled.",
+          },
+        }),
+      );
+      const endReq = parseToolJson(
+        await client.callTool({
+          name: "memory_sessionEnd",
+          arguments: { sessionId, summary: "Requesting end before cancel" },
+        }),
+      );
+      const cancelled = parseToolJson(
+        await client.callTool({
+          name: "memory_cancelSessionEnd",
+          arguments: {
+            sessionId,
+            workflowId: String(endReq.workflowId),
+          },
+        }),
+      );
+      assert.equal(cancelled.phase, "cancelled");
+      assert.equal(
+        (cancelled.curationSummary as { autoPromotedCount?: number } | undefined)?.autoPromotedCount,
+        0,
+      );
+      const fetchedCandidate = parseToolJson(
+        await client.callTool({
+          name: "memory_get",
+          arguments: { id: String(candidateInsight.recordId) },
+        }),
+      );
+      assert.equal(fetchedCandidate.status, "candidate");
+    });
+  } finally {
+    hostFixture.cleanup();
+    preparedTarget.cleanup();
+    distinctActiveTarget.cleanup();
+  }
+});

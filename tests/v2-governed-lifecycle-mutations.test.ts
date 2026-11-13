@@ -846,6 +846,32 @@ test("governed_lifecycle_cross_branch_promotion_publishes_and_verifies_projectio
     assert.equal(published.manifest.schemaVersion, 3);
     const verifyReport = await integrity.verify(mainProjectionBinding, published.manifest);
     assert.equal(verifyReport.status, "passed");
+
+    // Unknown/phantom recordId (not in crossScopeItemIds) MUST still throw INTEGRITY_FAILURE even on a branch-scoped binding
+    const reader = new SqliteProjectionEventReader({
+      driver: new NodeSqliteDriver({ DatabaseSync }),
+      eventStorePath: fixture.retained.path,
+    });
+    const snap = await reader.openCommittedSnapshotV3(mainProjectionBinding);
+    try {
+      const allDispositions = [...snap.dispositions()];
+      assert.ok(
+        snap.crossScopeItemIds?.().has(featureNote.recordId),
+        "Expected crossScopeItemIds() to include featureNote.recordId created on another branch",
+      );
+      const strictAccumulator = new ProjectionFoldAccumulatorV3(new Set());
+      assert.throws(
+        () => {
+          for (const d of allDispositions) {
+            strictAccumulator.append(d);
+          }
+        },
+        /INTEGRITY_FAILURE/u,
+        "Unknown recordId not present in crossScopeItemIds must throw INTEGRITY_FAILURE",
+      );
+    } finally {
+      snap.close();
+    }
   } finally {
     await fixture.cleanup();
   }

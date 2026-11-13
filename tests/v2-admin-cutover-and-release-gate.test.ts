@@ -417,7 +417,7 @@ test("v2-admin.js generate-client-configs outputs valid V2 client configurations
 
     assert.equal(payload.ok, true);
     assert.equal(payload.v2EntryPath, DIST_V2);
-    assert.equal(payload.env.MEMORY_V2_AUTO_SYNC_BUILD, "1");
+    assert.equal(payload.env.MEMORY_V2_AUTO_SYNC_BUILD, "0");
     const validatedTopEnv = loadV2LaunchConfig(payload.env);
     assert.equal(validatedTopEnv.releaseId, releaseId);
 
@@ -436,8 +436,8 @@ test("v2-admin.js generate-client-configs outputs valid V2 client configurations
       assert.ok(clientConfig.args.includes(DIST_V2), `${clientName} args must point to dist/v2.js`);
       assert.equal(
         clientConfig.env.MEMORY_V2_AUTO_SYNC_BUILD,
-        "1",
-        `${clientName} env must include MEMORY_V2_AUTO_SYNC_BUILD=1`,
+        "0",
+        `${clientName} env must default MEMORY_V2_AUTO_SYNC_BUILD=0 (fail-closed)`,
       );
       const parsedEnv = loadV2LaunchConfig(clientConfig.env);
       assert.equal(parsedEnv.projectRoot, projectRoot);
@@ -468,7 +468,33 @@ test("v2-admin.js generate-client-configs outputs valid V2 client configurations
     }
 
     const codexToml = readFileSync(join(outputDir, ".codex/config.toml"), "utf8");
-    assert.ok(codexToml.includes('MEMORY_V2_AUTO_SYNC_BUILD = "1"'));
+    assert.ok(codexToml.includes('MEMORY_V2_AUTO_SYNC_BUILD = "0"'));
+
+    // Explicit --auto-sync-build 1 opt-in emits "1"
+    const outputDirOptIn = join(rootDir, "generated-configs-optin");
+    const optInRes = spawnSync(
+      process.execPath,
+      [
+        DIST_V2_ADMIN,
+        "generate-client-configs",
+        "--project-root",
+        projectRoot,
+        "--v2-vault-root",
+        v2VaultRoot,
+        "--v1-archive-root",
+        v1ArchiveRoot,
+        "--release-id",
+        releaseId,
+        "--auto-sync-build",
+        "1",
+        "--output-dir",
+        outputDirOptIn,
+      ],
+      { cwd: ROOT, encoding: "utf8", timeout: 20_000 },
+    );
+    assert.equal(optInRes.status, 0, optInRes.stderr);
+    const optInPayload = JSON.parse(optInRes.stdout) as { env: Record<string, string> };
+    assert.equal(optInPayload.env.MEMORY_V2_AUTO_SYNC_BUILD, "1");
 
     const claudeLocal = JSON.parse(
       readFileSync(join(outputDir, ".claude/settings.local.json"), "utf8"),

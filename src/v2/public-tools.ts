@@ -63,6 +63,7 @@ import {
   type InternalValidationResultCommand,
 } from "../orchestrator/lifecycle/contracts/commands.js";
 import type { CheckpointId, SessionId, WorkflowId } from "../orchestrator/lifecycle/contracts/identifiers.js";
+import { LifecycleError } from "../orchestrator/lifecycle/errors.js";
 import { connectionBoundEvidenceCoverage } from "../orchestrator/lifecycle/lifecycle-command.store.js";
 import { buildLifecycleIntentWitness } from "../orchestrator/lifecycle/lifecycle-intent-witness.js";
 import { sessionEndPhaseIdentityV1 } from "../orchestrator/lifecycle/session-end-identifiers.js";
@@ -130,6 +131,8 @@ import {
   computeCausalTriads,
   deriveCleanNoteTitleFromFields,
   extractMemoryEntities,
+  isAcceptablePath,
+  resolveContainedWorkspaceFile,
 } from "./entity-extractor.js";
 
 export interface McpToolDefinition {
@@ -361,6 +364,10 @@ const PUBLIC_TOOL_SCHEMA_CATALOG: Readonly<
         items: Object.freeze({ type: "string" }),
         description: "Optional list of file paths planned to be inspected or modified.",
       }),
+      autoDetectFiles: Object.freeze({
+        type: "boolean",
+        description: "Automatically inspect dirty/untracked Git workspace files when plannedFiles is omitted (default true).",
+      }),
       includeContext: Object.freeze({
         type: "boolean",
         description: "Whether to bundle awaken, contextPack, and selfCheck in the startup response (default true).",
@@ -380,6 +387,15 @@ const PUBLIC_TOOL_SCHEMA_CATALOG: Readonly<
         type: "array",
         items: Object.freeze({ type: "string" }),
         description: "Optional list of file paths to match against historical ADRs, mistakes, and insights.",
+      }),
+      filesTouched: Object.freeze({
+        type: "array",
+        items: Object.freeze({ type: "string" }),
+        description: "Alias for plannedFiles.",
+      }),
+      autoDetectFiles: Object.freeze({
+        type: "boolean",
+        description: "Automatically inspect dirty/untracked Git workspace files when plannedFiles is omitted (default true).",
       }),
     }),
   }),
@@ -409,6 +425,10 @@ const PUBLIC_TOOL_SCHEMA_CATALOG: Readonly<
         items: Object.freeze({ type: "string" }),
         description: "Alias for plannedFiles.",
       }),
+      autoDetectFiles: Object.freeze({
+        type: "boolean",
+        description: "Automatically inspect dirty/untracked Git workspace files when plannedFiles is omitted (default true).",
+      }),
     }),
   }),
   memory_sessionEnd: Object.freeze({
@@ -416,6 +436,7 @@ const PUBLIC_TOOL_SCHEMA_CATALOG: Readonly<
     properties: Object.freeze({
       ...PROJECT_ROOT_PROP,
       ...SESSION_ID_PROP,
+      workflowId: Object.freeze({ type: "string", description: "Optional active session-end workflow UUID when resuming/finalizing." }),
       summary: Object.freeze({ type: "string", description: "Final summary of work completed in this session." }),
       finalize: Object.freeze({
         type: "boolean",
@@ -428,6 +449,10 @@ const PUBLIC_TOOL_SCHEMA_CATALOG: Readonly<
       autoPromote: Object.freeze({
         type: "boolean",
         description: "Auto-promote candidate/provisional notes recorded in this session.",
+      }),
+      autoCurate: Object.freeze({
+        type: "boolean",
+        description: "Alias for autoPromote during session end curation.",
       }),
       ...CHECKPOINT_DRAFT_PROPS,
     }),
@@ -507,6 +532,16 @@ const PUBLIC_TOOL_SCHEMA_CATALOG: Readonly<
       ...SESSION_ID_PROP,
       workflowId: Object.freeze({ type: "string", description: "Active session-end workflow UUID." }),
       summary: Object.freeze({ type: "string", description: "Amended final checkpoint summary." }),
+      finalize: Object.freeze({
+        type: "boolean",
+        description: "When true, completes verification and terminal completion immediately after amendment.",
+      }),
+      complete: Object.freeze({ type: "boolean", description: "Alias for finalize." }),
+      autoPromote: Object.freeze({
+        type: "boolean",
+        description: "Auto-promote candidate/provisional notes recorded in this session.",
+      }),
+      autoCurate: Object.freeze({ type: "boolean", description: "Alias for autoPromote." }),
       ...CHECKPOINT_DRAFT_PROPS,
     }),
   }),
@@ -587,11 +622,23 @@ const PUBLIC_TOOL_SCHEMA_CATALOG: Readonly<
     }),
   }),
   memory_forgetEvidence: Object.freeze({
-    description: "Cryptographically erase a key-wrap generation for right-to-be-forgotten compliance.",
+    description: "Cryptographically erase retained evidence or governed record provenance for right-to-be-forgotten compliance.",
     properties: Object.freeze({
       ...PROJECT_ROOT_PROP,
       ...SESSION_ID_PROP,
-      purpose: Object.freeze({ type: "string", description: "Key purpose to rotate and erase (e.g. data-key-wrap)." }),
+      evidenceIds: Object.freeze({
+        type: "array",
+        items: Object.freeze({ type: "string" }),
+        description: "Optional list of retained evidence IDs to cryptographically erase.",
+      }),
+      evidenceId: Object.freeze({ type: "string", description: "Single retained evidence ID alias." }),
+      recordIds: Object.freeze({
+        type: "array",
+        items: Object.freeze({ type: "string" }),
+        description: "Optional list of governed note record IDs whose backing evidence must be erased.",
+      }),
+      recordId: Object.freeze({ type: "string", description: "Single governed note record ID alias." }),
+      purpose: Object.freeze({ type: "string", description: "Key purpose to rotate and erase when no IDs are specified (e.g. data-key-wrap)." }),
       reason: Object.freeze({ type: "string", description: "Audit reason for cryptographic erasure." }),
     }),
   }),
@@ -1255,12 +1302,20 @@ export class V2PublicToolRouter {
             if (rev === null || rev === beforeRev - 1n) {
               return row;
             }
-            const parsedPayload = JSON.parse(String(row.payload_json)) as {
-              origin:
+            let parsedPayload: {
+              origin?:
                 | { kind: "workflow"; workflowId: WorkflowId; workflowGeneration: number }
                 | { kind: "direct-command"; commandId: string };
-              triggeringEventType: string;
+              triggeringEventType?: string;
             };
+            try {
+              parsedPayload = JSON.parse(String(row.payload_json)) as typeof parsedPayload;
+            } catch {
+              throw new LifecycleError("INTEGRITY_FAILURE");
+            }
+            if (!parsedPayload || typeof parsedPayload !== "object" || !parsedPayload.origin) {
+              throw new LifecycleError("INTEGRITY_FAILURE");
+            }
             lifecycleOutboxCheckRepo.assertExactPlannedRevision(lifecycleConnection, {
               projectId: String(params.$projectId) as ProjectId,
               sessionId: String(params.$sessionId) as SessionId,
@@ -1752,6 +1807,12 @@ export class V2PublicToolRouter {
     const sessionId = randomUUID();
     const cleanedTask = taskSummary.trim();
     if (cleanedTask.length > 0 && cleanedTask !== "session-start") {
+      if (this.#sessionTaskSummaries.size >= 512 && !this.#sessionTaskSummaries.has(sessionId)) {
+        const oldestKey = this.#sessionTaskSummaries.keys().next().value;
+        if (oldestKey !== undefined) {
+          this.#sessionTaskSummaries.delete(oldestKey);
+        }
+      }
       this.#sessionTaskSummaries.set(sessionId, cleanedTask);
     }
     const command = decodeLifecycleSemanticCommandDraft({
@@ -1970,17 +2031,12 @@ export class V2PublicToolRouter {
             return prior;
           }
         } else if (!this.#readOnlyMode) {
-          // Git branch/scope changed in live workspace: reset stale-scope projection files before rebuilding
-          rmSync(projectionDir, { recursive: true, force: true });
-          mkdirSync(projectionDir, { recursive: true });
           this.#cachedProjectionManifest = null;
           this.#cachedProjectionBytes = null;
           this.#cachedProjectedNotes = null;
         }
       } catch {
         if (!this.#readOnlyMode) {
-          rmSync(projectionDir, { recursive: true, force: true });
-          mkdirSync(projectionDir, { recursive: true });
           this.#cachedProjectionManifest = null;
           this.#cachedProjectionBytes = null;
           this.#cachedProjectedNotes = null;
@@ -2008,6 +2064,9 @@ export class V2PublicToolRouter {
         builder,
       },
     });
+    if (!this.#readOnlyMode) {
+      await coordinator.rotateScopeIfMismatched(activeProjectionBinding);
+    }
     const published = await coordinator.ensurePublishedV3(
       activeProjectionBinding,
       BigInt(currentPos),
@@ -2363,6 +2422,33 @@ export class V2PublicToolRouter {
       notesBySession.set(n.sessionId, list);
     }
     const latestCp = this.#readLatestProjectCheckpoint();
+    const checkpointTaskBySession = new Map<string, string>();
+    try {
+      const cpRows = this.#connection
+        .prepare(
+          `SELECT session_id, payload_json
+           FROM events
+           WHERE project_id = $projectId AND event_type = 'SessionCheckpointRecorded'
+           ORDER BY global_position DESC LIMIT 120`,
+        )
+        .all({ $projectId: this.#identity.projectId }) as Array<{
+        session_id?: string | null;
+        payload_json: string;
+      }>;
+      for (const cpRow of cpRows) {
+        const sid = typeof cpRow.session_id === "string" ? cpRow.session_id : "";
+        if (!sid || checkpointTaskBySession.has(sid)) continue;
+        try {
+          const parsed = JSON.parse(cpRow.payload_json) as { checkpoint?: { taskSummary?: string } };
+          const summary = parsed.checkpoint?.taskSummary?.trim() ?? "";
+          if (summary.length > 0) checkpointTaskBySession.set(sid, summary);
+        } catch {
+          // Ignore malformed checkpoint payload in activity summary
+        }
+      }
+    } catch {
+      // Degrade gracefully if checkpoint query fails
+    }
     const leaseRepo = new SessionLeaseRepository();
     const nowMs = BigInt(Date.now());
 
@@ -2371,7 +2457,7 @@ export class V2PublicToolRouter {
       const sLog = sNotes.find((n) => n.recordKind === "session-log");
       const firstNote = sNotes[0];
       const isCpMatch = latestCp?.sessionId === r.session_id;
-      const boundTask = this.#sessionTaskSummaries.get(r.session_id);
+      const boundTask = this.#sessionTaskSummaries.get(r.session_id) ?? checkpointTaskBySession.get(r.session_id);
       const currentTask =
         isCpMatch && latestCp?.taskSummary
           ? latestCp.taskSummary
@@ -2800,6 +2886,52 @@ export class V2PublicToolRouter {
     return combined.includes(normTarget);
   }
 
+  #computeQueryTokens(rawQuery: string, extraTerms: readonly string[] = []): string[] {
+    return [
+      ...new Set([
+        ...this.#tokenizeMultilingual(rawQuery),
+        ...extraTerms.flatMap((t) => this.#tokenizeMultilingual(t)),
+      ]),
+    ];
+  }
+
+  #computeCorpusTokenIdf(
+    tokens: readonly string[],
+    corpusNotes?: ReadonlyArray<{
+      readonly title: string;
+      readonly summary: string;
+      readonly body: string;
+      readonly normalizedKey: string;
+      readonly lowerSearchText?: string;
+    }>,
+  ): ReadonlyMap<string, number> {
+    const map = new Map<string, number>();
+    if (tokens.length === 0) return map;
+    if (!corpusNotes || corpusNotes.length <= 1) {
+      for (const token of tokens) map.set(token, 1.0);
+      return map;
+    }
+    const uniqueTokens = [...new Set(tokens)];
+    const counts = new Map<string, number>();
+    for (const token of uniqueTokens) counts.set(token, 0);
+    const totalDocs = corpusNotes.length;
+    for (const doc of corpusNotes) {
+      const docText =
+        doc.lowerSearchText ??
+        `${doc.title} ${doc.summary} ${doc.normalizedKey} ${doc.body}`.toLowerCase();
+      for (const token of uniqueTokens) {
+        if (docText.includes(token)) {
+          counts.set(token, (counts.get(token) ?? 0) + 1);
+        }
+      }
+    }
+    for (const token of uniqueTokens) {
+      const df = counts.get(token) ?? 0;
+      map.set(token, Math.max(0.4, Math.log(1 + (totalDocs - df + 0.5) / (df + 0.5)) + 0.5));
+    }
+    return map;
+  }
+
   #scoreHybridNoteMatch(
     note: {
       readonly title: string;
@@ -2821,6 +2953,8 @@ export class V2PublicToolRouter {
       readonly normalizedKey: string;
       readonly lowerSearchText?: string;
     }>,
+    precomputedIdf?: ReadonlyMap<string, number>,
+    precomputedTokens?: readonly string[],
   ): number {
     const qLower = rawQuery.trim().toLowerCase();
     const titleLower = note.title.toLowerCase();
@@ -2842,29 +2976,12 @@ export class V2PublicToolRouter {
       }
     }
 
-    const tokens = [
-      ...new Set([
-        ...this.#tokenizeMultilingual(rawQuery),
-        ...extraTerms.flatMap((t) => this.#tokenizeMultilingual(t)),
-      ]),
-    ];
-
-    const totalDocs = corpusNotes && corpusNotes.length > 0 ? corpusNotes.length : 1;
-    const tokenIdf = (token: string): number => {
-      if (!corpusNotes || corpusNotes.length <= 1) return 1.0;
-      let df = 0;
-      for (const doc of corpusNotes) {
-        const docText =
-          doc.lowerSearchText ??
-          `${doc.title} ${doc.summary} ${doc.normalizedKey} ${doc.body}`.toLowerCase();
-        if (docText.includes(token)) df += 1;
-      }
-      return Math.max(0.4, Math.log(1 + (totalDocs - df + 0.5) / (df + 0.5)) + 0.5);
-    };
+    const tokens = precomputedTokens ?? this.#computeQueryTokens(rawQuery, extraTerms);
+    const idfMap = precomputedIdf ?? this.#computeCorpusTokenIdf(tokens, corpusNotes);
 
     let matchedTokens = 0;
     for (const token of tokens) {
-      const idf = tokenIdf(token);
+      const idf = idfMap.get(token) ?? 1.0;
       if (combinedHeader.includes(token)) {
         score += Math.round(120 * idf);
         matchedTokens += 1;
@@ -3072,12 +3189,20 @@ export class V2PublicToolRouter {
 
     const allNotes = await this.#listProjectNotesFromProjection();
     const queryText = taskSummary ?? "";
+    const selfCheckTokens =
+      queryText || filesTouched.length > 0
+        ? this.#computeQueryTokens(queryText, filesTouched)
+        : [];
+    const selfCheckIdf =
+      selfCheckTokens.length > 0
+        ? this.#computeCorpusTokenIdf(selfCheckTokens, allNotes)
+        : undefined;
     const scoredMistakes = allNotes
       .filter((n) => n.recordKind === "mistake")
       .map((n) => ({
         note: n,
         score: queryText || filesTouched.length > 0
-          ? this.#scoreHybridNoteMatch(n, queryText, filesTouched, allNotes)
+          ? this.#scoreHybridNoteMatch(n, queryText, filesTouched, allNotes, selfCheckIdf, selfCheckTokens)
           : 1,
       }))
       .sort((a, b) => b.score - a.score || b.note.sourceEventPosition - a.note.sourceEventPosition);
@@ -3087,7 +3212,7 @@ export class V2PublicToolRouter {
       .map((n) => ({
         note: n,
         score: queryText || filesTouched.length > 0
-          ? this.#scoreHybridNoteMatch(n, queryText, filesTouched, allNotes)
+          ? this.#scoreHybridNoteMatch(n, queryText, filesTouched, allNotes, selfCheckIdf, selfCheckTokens)
           : 1,
       }))
       .sort((a, b) => b.score - a.score || b.note.sourceEventPosition - a.note.sourceEventPosition);
@@ -3523,11 +3648,13 @@ export class V2PublicToolRouter {
 
     if (existingItems.length < limit) {
       const allProjectNotes = await this.#listProjectNotesFromProjection();
+      const searchTokens = this.#computeQueryTokens(query, []);
+      const searchIdf = this.#computeCorpusTokenIdf(searchTokens, allProjectNotes);
       const hybridMatches = allProjectNotes
         .filter((note) => !seenIds.has(note.id))
         .map((note) => ({
           note,
-          score: this.#scoreHybridNoteMatch(note, query, [], allProjectNotes),
+          score: this.#scoreHybridNoteMatch(note, query, [], allProjectNotes, searchIdf, searchTokens),
         }))
         .filter((entry) => entry.score > 0)
         .sort((a, b) => b.score - a.score || b.note.sourceEventPosition - a.note.sourceEventPosition);
@@ -3776,9 +3903,11 @@ export class V2PublicToolRouter {
     });
 
     const allProjectNotes = await this.#listProjectNotesFromProjection();
+    const packTokens = this.#computeQueryTokens(query, plannedFiles);
+    const packIdf = this.#computeCorpusTokenIdf(packTokens, allProjectNotes);
     const initialScored = allProjectNotes.map((note) => ({
       note,
-      score: this.#scoreHybridNoteMatch(note, query, plannedFiles, allProjectNotes),
+      score: this.#scoreHybridNoteMatch(note, query, plannedFiles, allProjectNotes, packIdf, packTokens),
     }));
     const { boostedEntries, causalTriads } = this.#buildCausalTriads(
       initialScored,
@@ -4200,8 +4329,9 @@ export class V2PublicToolRouter {
     const existingFiles: string[] = [];
     const missingFiles: string[] = [];
     for (const fp of [...allReferencedFiles].sort((a, b) => a.localeCompare(b))) {
-      const absTarget = join(this.#paths.projectRoot, ...fp.split("/"));
-      if (existsSync(absTarget)) {
+      if (!isAcceptablePath(fp)) continue;
+      const contained = resolveContainedWorkspaceFile(this.#paths.projectRoot, fp, 64 * 1024 * 1024);
+      if (contained !== null) {
         existingFiles.push(fp);
       } else {
         missingFiles.push(fp);
@@ -4870,6 +5000,9 @@ export class V2PublicToolRouter {
     );
     const b = this.#rootContext.binding;
     const authority = this.#requireSessionAuthority(parentSessionId);
+    if (authority.ownerGeneration === null) {
+      throw new FreshStartError("FRESH_START_INPUT_INVALID");
+    }
     const childSessionId = randomUUID();
     const command = decodeLifecycleSemanticCommandDraft({
       commandType: "fork-child",
@@ -4906,7 +5039,7 @@ export class V2PublicToolRouter {
       authorizationSessionId: parentSessionId,
       targetSessionId: parentSessionId,
       capabilityKind: "root-session-handle",
-      capabilityGeneration: authority.ownerGeneration!.toString(),
+      capabilityGeneration: authority.ownerGeneration.toString(),
     });
     const proof = this.#mintProof(parentSessionId, this.#rootContext, (scope) => ({
       ...scope,
@@ -5515,11 +5648,6 @@ export class V2PublicToolRouter {
       const validationRunner = new ValidationProfileRunner({
         registry: this.#validationProfileRegistry,
         keyProvider: this.#custody.capability,
-        processRunner: {
-          async run() {
-            return { status: 0, stdout: "ok", stderr: "" };
-          },
-        },
       });
       for (const attemptPlan of expandedPlans) {
         const validationResult = await validationRunner.run({
@@ -5665,6 +5793,9 @@ export class V2PublicToolRouter {
 
     const finalWf = workflowRepo.read(b.projectId, workflowId);
     const finalAuth = this.#authorityRepo.get(this.#connection, b.projectId, sessionId);
+    if ((finalAuth?.semanticState ?? "ended") === "ended") {
+      this.#sessionTaskSummaries.delete(sessionId);
+    }
     return {
       phase: finalWf?.phase ?? "completed",
       state: finalAuth?.semanticState ?? "ended",
@@ -5732,6 +5863,7 @@ export class V2PublicToolRouter {
       throw new FreshStartError("FRESH_START_INPUT_INVALID");
     }
     if (authority.semanticState === "ended" || authority.terminalAt !== null) {
+      this.#sessionTaskSummaries.delete(sessionId);
       const curationSummary = await this.#collectSessionCurationSummary(sessionId, args);
       return {
         ok: true,
@@ -5803,7 +5935,10 @@ export class V2PublicToolRouter {
       sessionId,
       taskSummary: String(args.summary ?? "Pre-session-end checkpoint"),
     });
-    authority = this.#authorityRepo.get(this.#connection, b.projectId, sessionId)!;
+    authority = this.#authorityRepo.get(this.#connection, b.projectId, sessionId);
+    if (!authority || authority.ownerGeneration === null) {
+      throw new FreshStartError("FRESH_START_INPUT_INVALID");
+    }
 
     const summary = String(args.summary ?? "Requesting session end");
     const { draft: finalCheckpoint } = checkpointDraftFromArgs(
@@ -5848,7 +5983,7 @@ export class V2PublicToolRouter {
       authorizationSessionId: sessionId,
       targetSessionId: sessionId,
       capabilityKind: "root-session-handle",
-      capabilityGeneration: authority.ownerGeneration!.toString(),
+      capabilityGeneration: authority.ownerGeneration.toString(),
     });
     const proof = this.#mintProof(sessionId, this.#rootContext, (scope) => ({
       ...scope,
@@ -5915,7 +6050,10 @@ export class V2PublicToolRouter {
     const workflowId = String(args.workflowId ?? "").trim();
     if (!workflowId) throw new FreshStartError("FRESH_START_INPUT_INVALID");
     const b = this.#rootContext.binding;
-    const authority = this.#authorityRepo.get(this.#connection, b.projectId, sessionId)!;
+    const authority = this.#authorityRepo.get(this.#connection, b.projectId, sessionId);
+    if (!authority || authority.ownerGeneration === null) {
+      throw new FreshStartError("FRESH_START_INPUT_INVALID");
+    }
     const summary = String(args.summary ?? "Amended final checkpoint summary");
     const { draft: finalCheckpoint } = checkpointDraftFromArgs(
       summary,
@@ -5962,7 +6100,7 @@ export class V2PublicToolRouter {
       authorizationSessionId: sessionId,
       targetSessionId: sessionId,
       capabilityKind: "root-session-handle",
-      capabilityGeneration: authority.ownerGeneration!.toString(),
+      capabilityGeneration: authority.ownerGeneration.toString(),
     });
     const proof = this.#mintProof(sessionId, this.#rootContext, (scope) => ({
       ...scope,
@@ -6029,7 +6167,10 @@ export class V2PublicToolRouter {
     const workflowId = String(args.workflowId ?? "").trim();
     if (!workflowId) throw new FreshStartError("FRESH_START_INPUT_INVALID");
     const b = this.#rootContext.binding;
-    const authority = this.#authorityRepo.get(this.#connection, b.projectId, sessionId)!;
+    const authority = this.#authorityRepo.get(this.#connection, b.projectId, sessionId);
+    if (!authority || authority.ownerGeneration === null || !authority.latestCheckpointId) {
+      throw new FreshStartError("FRESH_START_INPUT_INVALID");
+    }
     const command = decodeLifecycleSemanticCommandDraft({
       commandType: "cancel-session-end",
       commandId: randomUUID(),
@@ -6042,7 +6183,7 @@ export class V2PublicToolRouter {
       sessionId,
       workflowId,
       expectedStreamVersion: this.#currentSessionStreamVersion(sessionId),
-      preTransitionCheckpointId: authority.latestCheckpointId!,
+      preTransitionCheckpointId: authority.latestCheckpointId,
     });
     const witness = buildLifecycleIntentWitness(command, {
       projectId: b.projectId,
@@ -6061,7 +6202,7 @@ export class V2PublicToolRouter {
       authorizationSessionId: sessionId,
       targetSessionId: sessionId,
       capabilityKind: "root-session-handle",
-      capabilityGeneration: authority.ownerGeneration!.toString(),
+      capabilityGeneration: authority.ownerGeneration.toString(),
     });
     const proof = this.#mintProof(sessionId, this.#rootContext, (scope) => ({
       ...scope,
@@ -6097,43 +6238,9 @@ export class V2PublicToolRouter {
       }
     ).publicResult;
 
-    const allNotes = await this.#listProjectNotesFromProjection();
-    const sessionNotes = allNotes.filter((n) => n.sessionId === sessionId);
-    const candidateNotes = sessionNotes.filter(
-      (n) => n.status === "candidate" || n.status === "provisional",
-    );
-    const autoPromotedIds: string[] = [];
-    if (args.autoPromote === true || args.autoCurate === true) {
-      const seenSummaries = new Set<string>();
-      for (const cand of candidateNotes) {
-        const normSummary = cand.summary.trim().toLowerCase();
-        if (seenSummaries.has(normSummary)) continue;
-        seenSummaries.add(normSummary);
-        try {
-          const promoted = await this.#handlePromote({
-            recordId: cand.recordId,
-            targetStatus: "verified",
-            verificationMethod: "user-confirmed",
-            verificationAnchor: `session-end-curation:${sessionId}`,
-            reason: "Auto-promoted during session end curation",
-          });
-          if (promoted.ok) {
-            autoPromotedIds.push(cand.recordId);
-          }
-        } catch {
-          // Skip high-risk or non-promotable candidates gracefully.
-        }
-      }
-    }
-    const curationSummary = Object.freeze({
-      sessionNoteCount: sessionNotes.length,
-      candidateCountBeforeClose: candidateNotes.length,
-      autoPromotedCount: autoPromotedIds.length,
-      autoPromotedIds: Object.freeze(autoPromotedIds),
-      learningReminder:
-        sessionNotes.length === 0
-          ? "เซสชันนี้ยังไม่มีการบันทึก ADR / Insight / Mistake — แนะนำให้บันทึกบทเรียนสำคัญในเซสชันถัดไป"
-          : null,
+    const curationSummary = await this.#collectSessionCurationSummary(sessionId, {
+      autoPromote: false,
+      autoCurate: false,
     });
 
     return {

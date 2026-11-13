@@ -8,6 +8,7 @@ import {
   readFileSync,
   realpathSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -29,6 +30,11 @@ import { NodeSqliteDriver } from "../src/orchestrator/storage/node-sqlite-driver
 import { expectedSchemaFingerprint } from "../src/orchestrator/storage/schema-fingerprint.js";
 import { inspectV2Build } from "../src/v2/build-identity.js";
 import { createV2Foundation, ensureProjectV2StoreReady } from "../src/v2/composition.js";
+import {
+  extractMemoryEntities,
+  isAcceptablePath,
+  resolveContainedWorkspaceFile,
+} from "../src/v2/entity-extractor.js";
 import {
   V2_PRODUCTION_CAPABILITIES,
   V2_PRODUCTION_RECOVERY_POLICY,
@@ -719,6 +725,29 @@ test("8. Core V2 Engine Hardening: read-only purity, dynamic git branch-scope pr
       "Expected Projection V3 FTS search to dynamically bind to refs/heads/main and index main branch notes",
     );
 
+    // F5.1 Regression: switching branches must preserve projection-reconciliation-v2.json and strictly advance generation (> 1)
+    const liveProjDir = join(
+      projectRoot,
+      ".git",
+      "project-memory",
+      initStatus.projectId,
+      "v2",
+      "projections",
+    );
+    assert.equal(
+      existsSync(join(liveProjDir, PROJECTION_RECONCILIATION_JOURNAL_FILENAME)),
+      true,
+      "projection-reconciliation-v2.json must never be deleted on git branch rotation",
+    );
+    const rotatedManifest = JSON.parse(
+      readFileSync(join(liveProjDir, "projection-manifest.json"), "utf8"),
+    ) as { generation: number; highestObservedGeneration: number; branchRef: string | null };
+    assert.equal(rotatedManifest.branchRef, "refs/heads/main");
+    assert.ok(
+      rotatedManifest.generation > 1 && rotatedManifest.highestObservedGeneration >= rotatedManifest.generation,
+      `Expected monotonic generation > 1 after branch switch, got ${JSON.stringify(rotatedManifest)}`,
+    );
+
     // Verify cross-branch duplicate detection catches the duplicate ADR across feat/alpha and main
     const dups = (await foundation.content.invoke("memory_findDuplicates", {})) as {
       duplicateGroups: Array<{ contentHash: string; recordIds: string[] }>;
@@ -1075,5 +1104,71 @@ test("9. Unified Entity/Link Extractor, IDF-weighted Causal Triads & memory_veri
   } finally {
     await foundation.close();
     fixture.cleanup();
+  }
+});
+
+test("10. Security Hardening (F1): Workspace file containment blocks ../ traversal, .env secrets, memory/ archive, and junction/symlink escapes", async () => {
+  const outerRoot = realpathSync.native(mkdtempSync(join(tmpdir(), "pm-v2-path-containment-")));
+  const outsideSecretDir = join(outerRoot, "outside");
+  mkdirSync(outsideSecretDir, { recursive: true });
+  writeFileSync(join(outsideSecretDir, "secret.ts"), "export const API_KEY = 'top-secret';\n", "utf8");
+
+  const fixture = await createActiveStoreFixture("pm-v2-path-guard-");
+  mkdirSync(join(fixture.projectRoot, "src"), { recursive: true });
+  writeFileSync(join(fixture.projectRoot, ".env"), "OPENAI_API_KEY=never-read-me\n", "utf8");
+  writeFileSync(join(fixture.projectRoot, ".env.production"), "JWT_SECRET=never-read-me\n", "utf8");
+  writeFileSync(join(fixture.projectRoot, "src", "safe.ts"), "export const safe = 1;\n", "utf8");
+  try {
+    symlinkSync(
+      outsideSecretDir,
+      join(fixture.projectRoot, "src", "linked-outside"),
+      process.platform === "win32" ? "junction" : "dir",
+    );
+  } catch {
+    // Ignore if OS disallows links
+  }
+
+  const foundation = await createV2Foundation(fixture.config, { entryUrl: V2_DIST_ENTRY_URL });
+  try {
+    assert.equal(isAcceptablePath("src/../../outside/secret.ts"), false);
+    assert.equal(isAcceptablePath(".env"), false);
+    assert.equal(isAcceptablePath("config/.env.production"), false);
+    assert.equal(isAcceptablePath("memory/frozen.md"), false);
+    assert.equal(isAcceptablePath("memory-v2/internal.json"), false);
+    assert.equal(isAcceptablePath("src/safe.ts"), true);
+
+    assert.equal(resolveContainedWorkspaceFile(fixture.projectRoot, "src/../../outside/secret.ts"), null);
+    assert.equal(resolveContainedWorkspaceFile(fixture.projectRoot, ".env"), null);
+    assert.equal(resolveContainedWorkspaceFile(fixture.projectRoot, ".env.production"), null);
+    assert.equal(resolveContainedWorkspaceFile(fixture.projectRoot, "src/linked-outside/secret.ts"), null);
+    assert.notEqual(resolveContainedWorkspaceFile(fixture.projectRoot, "src/safe.ts"), null);
+
+    const extracted = extractMemoryEntities(
+      "Touched `src/../../outside/secret.ts`, `.env`, `.env.production`, `src/linked-outside/secret.ts`, and `src/safe.ts`.",
+      { projectRoot: fixture.projectRoot },
+    );
+    assert.deepEqual(extracted.filePaths, ["src/safe.ts"]);
+
+    const sess = (await foundation.content.invoke("memory_sessionStart", {
+      agentName: "security-auditor",
+      includeContext: false,
+    })) as { sessionId: string };
+    await foundation.content.invoke("memory_writeInsight", {
+      sessionId: sess.sessionId,
+      title: "Containment Verification Insight",
+      summary: "Checked `src/../../outside/secret.ts`, `.env`, `src/linked-outside/secret.ts`, and `src/safe.ts`.",
+      autoVerify: true,
+    });
+    const truth = (await foundation.content.invoke("memory_verifySourceTruth", {})) as {
+      existingFiles: string[];
+      missingFiles: string[];
+    };
+    assert.deepEqual(truth.existingFiles, ["src/safe.ts"]);
+    assert.equal(truth.missingFiles.includes(".env"), false);
+    assert.equal(truth.missingFiles.includes("src/linked-outside/secret.ts"), false);
+  } finally {
+    await foundation.close();
+    fixture.cleanup();
+    rmSync(outerRoot, { recursive: true, force: true });
   }
 });

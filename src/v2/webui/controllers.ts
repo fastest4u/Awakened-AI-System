@@ -365,12 +365,13 @@ export function renderMvcControllersJs(): string {
           (opts.filePath ? "file:" + opts.filePath : null) ||
           (opts.symbol ? "symbol:" + opts.symbol : null);
         const query = opts.query || "";
+        const kind = opts.kind || "all";
         const sessionId = opts.filterSessionId || "all";
         setInspectedRecordIdState(null);
-        setGraphJumpTarget({ nodeId: targetNodeId, sessionId, query, ts: Date.now() });
+        setGraphJumpTarget({ nodeId: targetNodeId, sessionId, query, kind, ts: Date.now() });
         setActiveTabState("graph");
         writeDeepLinkHash(
-          { tab: "graph", project: currentProject, node: targetNodeId, session: sessionId, q: query },
+          { tab: "graph", project: currentProject, node: targetNodeId, session: sessionId, q: query, kind },
           defaultProjectRoot
         );
       },
@@ -385,7 +386,7 @@ export function renderMvcControllersJs(): string {
         setKanbanJumpTarget({ query, kind, ts: Date.now() });
         setActiveTabState("kanban");
         writeDeepLinkHash(
-          { tab: "kanban", project: currentProject, q: query },
+          { tab: "kanban", project: currentProject, q: query, kind },
           defaultProjectRoot
         );
       },
@@ -899,20 +900,23 @@ export function renderMvcControllersJs(): string {
             " → " +
             data.afterHealthScore +
             "/100)";
+          const executedTools = [
+            "memory_sessionStart",
+            "memory_list",
+            "memory_findDuplicates",
+            "memory_checkStaleness",
+          ];
+          if (data.promoted && data.promoted.length > 0) executedTools.push("memory_promote");
+          if (data.superseded && data.superseded.length > 0) executedTools.push("memory_supersede");
+          if (data.expired && data.expired.length > 0) executedTools.push("memory_expire");
+          executedTools.push("memory_sessionEnd");
           setMessages((prev) => [
             ...prev,
             {
               id: "ac-" + Date.now(),
               role: "ai",
               text: summaryMsg,
-              tools: [
-                "memory_sessionStart",
-                "memory_promote",
-                "memory_supersede",
-                "memory_checkStaleness",
-                "memory_expire",
-                "memory_sessionEnd",
-              ],
+              tools: executedTools,
             },
           ]);
           if (notify) notify(summaryMsg, "success");

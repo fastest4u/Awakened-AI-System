@@ -2723,8 +2723,8 @@ export function renderMvcViewsJs(): string {
       lower.startsWith("https://") ||
       lower.startsWith("http://") ||
       lower.startsWith("mailto:") ||
-      lower.startsWith("vscode:") ||
-      lower.startsWith("cursor:") ||
+      lower.startsWith("vscode://file/") ||
+      lower.startsWith("cursor://file/") ||
       lower.startsWith("#")
     );
   }
@@ -3366,10 +3366,12 @@ export function renderWebComponentsJs(): string {
         }
       }
       disconnectedCallback() {
-        if (this._root) {
-          this._root.unmount();
-          this._root = null;
-        }
+        queueMicrotask(() => {
+          if (!this.isConnected && this._root) {
+            this._root.unmount();
+            this._root = null;
+          }
+        });
       }
       _renderReact() {
         const props = {};

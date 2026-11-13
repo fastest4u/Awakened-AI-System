@@ -312,6 +312,9 @@ test("Task 2: V2 WebUI Server, Knowledge Graph, Multi-Project Switcher, Governan
     const html = await htmlRes.text();
     assert.ok(html.includes("Project Memory V2"));
     assert.ok(html.includes("AI Memory Curator"));
+    const csrfMatch0 = /<meta\s+name="pm-csrf-token"\s+content="([^"]+)"/u.exec(html);
+    assert.ok(csrfMatch0?.[1], "Expected pm-csrf-token meta tag in GET /");
+    const csrfToken = csrfMatch0[1]!;
 
     // 3. Reject invalid/relative project path (Review Focus #4) and unallowed MCP tool name
     const badProjectRes = await fetch(`${baseUrl}/api/overview?project=relative/traversal`);
@@ -322,7 +325,7 @@ test("Task 2: V2 WebUI Server, Knowledge Graph, Multi-Project Switcher, Governan
 
     const badToolRes = await fetch(`${baseUrl}/api/mcp/call`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", "x-pm-csrf-token": csrfToken },
       body: JSON.stringify({
         projectRoot: fixture.projectRoot,
         tool: "non_existent_tool_xyz",
@@ -347,7 +350,7 @@ test("Task 2: V2 WebUI Server, Knowledge Graph, Multi-Project Switcher, Governan
     // 5. Create ADR and Promote via POST /api/governance
     const createAdrRes = await fetch(`${baseUrl}/api/governance`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", "x-pm-csrf-token": csrfToken },
       body: JSON.stringify({
         projectRoot: fixture.projectRoot,
         action: "writeADR",
@@ -362,7 +365,7 @@ test("Task 2: V2 WebUI Server, Knowledge Graph, Multi-Project Switcher, Governan
 
     const promoteRes = await fetch(`${baseUrl}/api/governance`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", "x-pm-csrf-token": csrfToken },
       body: JSON.stringify({
         projectRoot: fixture.projectRoot,
         action: "promote",
@@ -413,7 +416,7 @@ test("Task 2: V2 WebUI Server, Knowledge Graph, Multi-Project Switcher, Governan
 
     const chatRes = await fetch(`${baseUrl}/api/curator/chat`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", "x-pm-csrf-token": csrfToken },
       body: JSON.stringify({
         projectRoot: fixture.projectRoot,
         message: "ค้นหา WebUI Architecture",
@@ -850,10 +853,38 @@ test("Task 3: WebUI security hardening, CSRF/Host/Origin/GET-registration guards
     });
     assert.equal(ipv6Status, 200, "Bare [::1] Host header with loopback IPv6 Origin must return 200");
 
+    const missingCsrfOnHeaderlessPost = await fetch(`${baseUrl}/api/governance`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ action: "writeInsight", title: "X", summary: "Y" }),
+    });
+    assert.equal(
+      missingCsrfOnHeaderlessPost.status,
+      403,
+      "Unconditional CSRF defense must reject POST even when Origin and Sec-Fetch-Site are omitted",
+    );
+
+    const defaultPortOriginRes = await fetch(`${baseUrl}/api/governance`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        Origin: "http://localhost",
+        "x-pm-csrf-token": csrfToken,
+      },
+      body: JSON.stringify({ action: "writeInsight", title: "X", summary: "Y" }),
+    });
+    assert.equal(
+      defaultPortOriginRes.status,
+      403,
+      "Origin http://localhost (default port 80) must be rejected against non-80 WebUI Host port",
+    );
+
     // 5. Proper HTTP status codes: 400 malformed JSON, 413 payload > 1MB, 400 malformed URI
     const badJsonRes = await fetch(`${baseUrl}/api/governance`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", "x-pm-csrf-token": csrfToken },
       body: "{broken-json",
     });
     assert.equal(badJsonRes.status, 400);
@@ -861,10 +892,25 @@ test("Task 3: WebUI security hardening, CSRF/Host/Origin/GET-registration guards
     const hugePayload = JSON.stringify({ pad: "x".repeat(1024 * 1024 + 128) });
     const tooLargeRes = await fetch(`${baseUrl}/api/governance`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", "x-pm-csrf-token": csrfToken },
       body: hugePayload,
     });
     assert.equal(tooLargeRes.status, 413);
+
+    // POST /api/projects/register must reject non-existent paths and paths overlapping defaultProjectRoot/memory
+    const nonExistentRegisterRes = await fetch(`${baseUrl}/api/projects/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-pm-csrf-token": csrfToken },
+      body: JSON.stringify({ projectRoot: unregisteredPath }),
+    });
+    assert.equal(nonExistentRegisterRes.status, 400);
+
+    const overlappingRegisterRes = await fetch(`${baseUrl}/api/projects/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-pm-csrf-token": csrfToken },
+      body: JSON.stringify({ projectRoot: join(fixture.projectRoot, "memory") }),
+    });
+    assert.equal(overlappingRegisterRes.status, 400);
 
     const badUriRes = await fetch(`${baseUrl}/api/notes/%E0%A4%A`);
     assert.equal(badUriRes.status, 400);
@@ -977,6 +1023,168 @@ test("Task 3: WebUI security hardening, CSRF/Host/Origin/GET-registration guards
     assert.equal(parsedKeyValue.tab, "graph");
     assert.equal(parsedKeyValue.q, "curator");
     assert.equal(parsedKeyValue.kind, "file");
+
+    // 9. F6 Regression: Verify vendor.js preserves live Custom Element instances across parent root re-renders
+    class FakeNode {
+      nodeType = 1;
+      tagName: string;
+      id = "";
+      className = "";
+      textContent = "";
+      style: Record<string, string> = {};
+      dataset: Record<string, string> = {};
+      attrs = new Map<string, string>();
+      children: FakeNode[] = [];
+      parentNode: FakeNode | null = null;
+      scrollTop = 0;
+      scrollLeft = 0;
+      constructor(tag: string) {
+        this.tagName = tag.toUpperCase();
+      }
+      get childNodes() {
+        return this.children;
+      }
+      getAttributeNames() {
+        return [...this.attrs.keys()];
+      }
+      setAttribute(k: string, v: string) {
+        this.attrs.set(k, String(v));
+        if (k === "id") this.id = String(v);
+        if (k.startsWith("data-")) {
+          const camel = k
+            .slice(5)
+            .replace(/-([a-z])/gu, (_, c: string) => c.toUpperCase());
+          this.dataset[camel] = String(v);
+        }
+      }
+      getAttribute(k: string) {
+        return this.attrs.get(k) ?? null;
+      }
+      removeAttribute(k: string) {
+        this.attrs.delete(k);
+      }
+      appendChild(child: FakeNode) {
+        if (child.parentNode) child.parentNode.removeChild(child);
+        child.parentNode = this;
+        this.children.push(child);
+        return child;
+      }
+      removeChild(child: FakeNode) {
+        const idx = this.children.indexOf(child);
+        if (idx >= 0) this.children.splice(idx, 1);
+        child.parentNode = null;
+        return child;
+      }
+      addEventListener() {}
+      querySelectorAll() {
+        return [];
+      }
+      set innerHTML(_v: string) {
+        for (const c of this.children) c.parentNode = null;
+        this.children = [];
+      }
+    }
+    const fakeDoc = {
+      activeElement: null,
+      createElement: (tag: string) => new FakeNode(tag),
+      createElementNS: (_ns: string, tag: string) => new FakeNode(tag),
+      createTextNode: (t: string) => {
+        const n = new FakeNode("#text");
+        n.nodeType = 3;
+        n.textContent = t;
+        return n;
+      },
+      querySelector: () => null,
+      getElementById: () => null,
+    };
+    const vendorSandbox: Record<string, unknown> = {
+      window: { document: fakeDoc },
+      document: fakeDoc,
+      Node: { ELEMENT_NODE: 1 },
+      SVGElement: class {},
+      HTMLInputElement: class {},
+      HTMLTextAreaElement: class {},
+      HTMLElement: FakeNode,
+      Promise,
+      Map,
+      Set,
+      Object,
+      Array,
+      String,
+      Number,
+      Boolean,
+      Error,
+      queueMicrotask,
+      setTimeout,
+      clearTimeout,
+    };
+    vendorSandbox.window = vendorSandbox;
+    runInNewContext(bundles["/mvc/vendor.js"]!, vendorSandbox);
+    const VendorReact = vendorSandbox.React as {
+      createElement: (type: unknown, props: Record<string, unknown> | null, ...children: unknown[]) => unknown;
+      useState: <T>(init: T) => [T, (next: T) => void];
+    };
+    const VendorReactDOM = vendorSandbox.ReactDOM as {
+      createRoot: (container: FakeNode) => { render: (vnode: unknown) => void };
+    };
+    const hostContainer = new FakeNode("div");
+    const childContainer = new FakeNode("div");
+    let triggerParentRerender: ((v: number) => void) | null = null;
+    let setChildDraft: ((v: string) => void) | null = null;
+    let latestChildDraft = "";
+
+    function ChildPanel() {
+      const [draft, setDraft] = VendorReact.useState("initial");
+      setChildDraft = setDraft;
+      latestChildDraft = draft;
+      return VendorReact.createElement("div", null, draft);
+    }
+    const childRoot = VendorReactDOM.createRoot(childContainer);
+    childRoot.render(VendorReact.createElement(ChildPanel, null));
+
+    let createdCustomElements = 0;
+    const origCreateElement = fakeDoc.createElement;
+    fakeDoc.createElement = (tag: string) => {
+      if (tag.toLowerCase() === "pm-kanban-view") {
+        createdCustomElements += 1;
+        const ce = new FakeNode(tag);
+        ce.appendChild(childContainer);
+        return ce;
+      }
+      return origCreateElement(tag);
+    };
+
+    function ParentShell() {
+      const [toastTick, setToastTick] = VendorReact.useState(0);
+      triggerParentRerender = setToastTick;
+      return VendorReact.createElement(
+        "div",
+        { className: `tick-${toastTick}` },
+        VendorReact.createElement("pm-kanban-view", { "data-scope": "p1" }),
+      );
+    }
+    const parentRoot = VendorReactDOM.createRoot(hostContainer);
+    parentRoot.render(VendorReact.createElement(ParentShell, null));
+    assert.equal(createdCustomElements, 1);
+
+    // Mutate child state, then trigger parent re-render (like a toast or theme toggle)
+    setChildDraft!("typed-user-input");
+    await Promise.resolve();
+    assert.equal(latestChildDraft, "typed-user-input");
+    triggerParentRerender!(1);
+    await Promise.resolve();
+    triggerParentRerender!(2);
+    await Promise.resolve();
+    assert.equal(
+      createdCustomElements,
+      1,
+      "Parent root re-render must reuse live <pm-kanban-view> custom element instead of recreating it",
+    );
+    assert.equal(
+      latestChildDraft,
+      "typed-user-input",
+      "Child custom element hook state must survive parent root re-renders",
+    );
   } finally {
     await serverHandle.close();
     rmSync(unregisteredPath, { recursive: true, force: true });

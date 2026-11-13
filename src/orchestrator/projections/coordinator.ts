@@ -5,6 +5,7 @@ import {
   readFileSync,
   realpathSync,
   readdirSync,
+  unlinkSync,
 } from "node:fs";
 import { basename, isAbsolute, join, normalize, resolve } from "node:path";
 
@@ -588,6 +589,147 @@ export class V2ProjectionBuildCoordinator {
   async ensurePublishedV3(binding: ProjectBinding, requiredEventPosition: bigint, deadlineMs: number): Promise<PublishedProjectionGenerationV3> {
     if (!this.#schema3) throw new Error("PROJECTION_REQUEST_INVALID");
     return this.#ensureProfile(3, binding, requiredEventPosition, deadlineMs) as Promise<PublishedProjectionGenerationV3>;
+  }
+
+  async rotateScopeIfMismatched(binding: ProjectBinding): Promise<boolean> {
+    return this.#serialized(binding.projectId, async () => {
+      if (!this.#assertProjectionDirectorySafe()) return false;
+      const identity = this.#requiredDirectoryIdentity();
+      const lease = acquireProjectionManifestPublicationLease(this.#projectionDirectory);
+      if (!sameProjectionDirectoryIdentity(identity, lease.directoryIdentity)) {
+        lease.release(true);
+        throw new Error("PROJECTION_PATH_INVALID");
+      }
+      let retainLock = false;
+      let primary: unknown;
+      try {
+        const snapshot = filesystemStableProjectionDirectoryOperations.captureManifest(
+          this.#projectionDirectory,
+          identity,
+        );
+        if (snapshot.state === "missing") return false;
+        let existing: Record<string, unknown>;
+        try {
+          const parsed = JSON.parse(
+            Buffer.from(snapshot.bytesBase64, "base64").toString("utf8"),
+          ) as unknown;
+          if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+            return false;
+          }
+          existing = parsed as Record<string, unknown>;
+        } catch {
+          return false;
+        }
+
+        if (
+          existing.projectId !== binding.projectId
+          || existing.vaultId !== binding.vaultId
+          || existing.storeId !== binding.storeId
+        ) {
+          return false;
+        }
+        if (
+          existing.workspaceId === binding.workspaceId
+          && existing.branchScopeId === binding.branchScopeId
+          && existing.branchRef === binding.branchRef
+        ) {
+          return false;
+        }
+
+        retainLock = true;
+        this.#cleanupKnownTemps();
+        const filenames = readdirSync(this.#projectionDirectory).sort();
+        let maxObserved = Math.max(
+          Number.isSafeInteger(existing.generation) ? Number(existing.generation) : 0,
+          Number.isSafeInteger(existing.highestObservedGeneration)
+            ? Number(existing.highestObservedGeneration)
+            : 0,
+        );
+        for (const filename of filenames) {
+          const match = V2_GENERATION_FILE.exec(filename);
+          if (match !== null) {
+            maxObserved = Math.max(maxObserved, Number(match[1]));
+          }
+        }
+        this.#reconciliationJournal.reserveAtLeast(
+          this.#projectionDirectory,
+          identity,
+          lease.lockToken,
+          maxObserved,
+        );
+
+        const manifestPath = join(this.#projectionDirectory, PROJECTION_MANIFEST_FILENAME);
+        try {
+          const mStat = lstatSync(manifestPath);
+          if (mStat.isSymbolicLink() || !mStat.isFile()) {
+            throw new Error("PROJECTION_PATH_INVALID");
+          }
+          unlinkSync(manifestPath);
+        } catch (err) {
+          if (!notFound(err)) throw err;
+        }
+
+        const leased = new Set(this.#leasedFilenames());
+        for (const filename of filenames) {
+          const match = V2_GENERATION_FILE.exec(filename);
+          if (match === null || leased.has(filename)) continue;
+          const image = filesystemStableProjectionDirectoryOperations.readGenerationImage(
+            this.#projectionDirectory,
+            identity,
+            lease.lockToken,
+            filename,
+          );
+          const retiredFilename = `.projections-${filename.split("-")[1]}-retired-${randomBytes(16).toString("hex")}.sqlite`;
+          const intent = this.#reconciliationJournal.beginRetirement(
+            this.#projectionDirectory,
+            identity,
+            lease.lockToken,
+            Object.freeze({
+              state: "intent",
+              generation: Number(match[1]),
+              finalFilename: filename,
+              retiredFilename,
+              image: toRetirementImage(image.identity),
+            }),
+          );
+          filesystemStableProjectionDirectoryOperations.retireGeneration(
+            this.#projectionDirectory,
+            identity,
+            lease.lockToken,
+            image.identity,
+            intent.retiredFilename,
+          );
+          const observed = filesystemStableProjectionDirectoryOperations.captureRetiredGeneration(
+            this.#projectionDirectory,
+            identity,
+            lease.lockToken,
+            intent.retiredFilename,
+          );
+          if (observed === null || !sameRetirementRenameContinuity(observed, intent.image)) {
+            throw new Error("PROJECTION_PUBLICATION_RECOVERY_REQUIRED");
+          }
+          this.#reconciliationJournal.completeRetirement(
+            this.#projectionDirectory,
+            identity,
+            lease.lockToken,
+            intent,
+            toRetirementImage(observed),
+          );
+        }
+
+        retainLock = false;
+        return true;
+      } catch (error) {
+        primary = error;
+        throw error;
+      } finally {
+        try {
+          lease.release(retainLock);
+        } catch (error) {
+          if (primary === undefined) throw error;
+        }
+      }
+    });
   }
 
   async #ensureProfile(profile: 2 | 3, binding: ProjectBinding, requiredEventPosition: bigint, deadlineMs: number): Promise<RichPublished> {
