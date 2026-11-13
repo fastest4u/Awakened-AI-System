@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import {
   existsSync,
@@ -24,6 +25,10 @@ import {
   PROJECTION_RECONCILIATION_JOURNAL_FILENAME,
   filesystemStableProjectionDirectoryOperations,
 } from "../src/orchestrator/projections/stable-directory.js";
+import { ImmutableProjectionBuilder } from "../src/orchestrator/projections/builder.js";
+import { V2ProjectionBuildCoordinator } from "../src/orchestrator/projections/coordinator.js";
+import { SqliteProjectionEventReader } from "../src/orchestrator/projections/event-reader.js";
+import { V2ProjectionLeaseUnavailableError } from "../src/orchestrator/projections/v2-reader-lease.js";
 import { canonicalJson } from "../src/orchestrator/serialization/canonical-json.js";
 import { PROJECT_STORE_MIGRATIONS } from "../src/orchestrator/storage/migrations/registry.js";
 import { NodeSqliteDriver } from "../src/orchestrator/storage/node-sqlite-driver.js";
@@ -118,6 +123,7 @@ async function createActiveStoreFixture(prefix = "pm-v2-accel-") {
     releaseId,
     eventsPath,
     config,
+    initialized,
     cleanup() {
       rmSync(projectRoot, { recursive: true, force: true });
     },
@@ -1170,5 +1176,135 @@ test("10. Security Hardening (F1): Workspace file containment blocks ../ travers
     await foundation.close();
     fixture.cleanup();
     rmSync(outerRoot, { recursive: true, force: true });
+  }
+});
+
+test("11. Projection Scope Rotation Atomicity (R2-1): refuses rotation while reader lease is active and recovers cleanly from mid-retirement crash without wedging manifest", async () => {
+  const fixture = await createActiveStoreFixture("pm-v2-rot-atomic-");
+  try {
+    const eventsPath = join(fixture.v2VaultRoot, ".memory-mcp", "v2", "events.sqlite");
+    const projectionDirectory = join(fixture.v2VaultRoot, ".memory-mcp", "projections", "rot-atomic");
+    mkdirSync(projectionDirectory, { recursive: true });
+    const driver = new NodeSqliteDriver({ DatabaseSync });
+    const eventReader = new SqliteProjectionEventReader({
+      driver,
+      eventStorePath: eventsPath,
+      busyTimeoutMs: 5_000,
+    });
+    const builder = new ImmutableProjectionBuilder({ driver, projectionDirectory });
+
+    const bindingA = Object.freeze({
+      projectId: fixture.initialized.projectId,
+      vaultId: fixture.initialized.vaultId,
+      storeId: fixture.initialized.storeId,
+      workspaceId: "a".repeat(64) as never,
+      branchScopeId: "00000000-0000-4000-8000-0000000000a1" as never,
+      branchRef: "refs/heads/branch-a",
+      sessionId: null,
+    });
+    const bindingB = Object.freeze({
+      projectId: fixture.initialized.projectId,
+      vaultId: fixture.initialized.vaultId,
+      storeId: fixture.initialized.storeId,
+      workspaceId: "a".repeat(64) as never,
+      branchScopeId: "00000000-0000-4000-8000-0000000000b2" as never,
+      branchRef: "refs/heads/branch-b",
+      sessionId: null,
+    });
+
+    const coord = new V2ProjectionBuildCoordinator({
+      projectionDirectory,
+      eventReader,
+      builder,
+      schema3: { eventReader, builder },
+    });
+
+    // 1. Publish initial V3 generation under bindingA
+    const pubA = await coord.ensurePublishedV3(bindingA, 0n, 10_000);
+    assert.equal(pubA.manifest.generation, 1);
+    const manifestPath = join(projectionDirectory, "projection-manifest.json");
+    assert.equal(existsSync(manifestPath), true);
+
+    // 2. Acquire an active reader lease on bindingA's generation file -> rotation to bindingB MUST refuse WITHOUT deleting projection-manifest.json!
+    const readerLease = await coord.leasePublishedV3ForEvaluation(bindingA);
+    try {
+      await assert.rejects(
+        () => coord.rotateScopeIfMismatched(bindingB),
+        (err) => err instanceof V2ProjectionLeaseUnavailableError,
+      );
+      assert.equal(
+        existsSync(manifestPath),
+        true,
+        "projection-manifest.json must remain intact when rotation is refused due to an active reader lease",
+      );
+    } finally {
+      readerLease.close();
+    }
+
+    // 3. Simulate a crash mid-retirement (after retirement rename, before completeRetirement & before manifest unlink)
+    let injectCrashOnce = true;
+    const crashingCoord = new V2ProjectionBuildCoordinator({
+      projectionDirectory,
+      eventReader,
+      builder,
+      schema3: { eventReader, builder },
+      faultInjector: {
+        hit(boundary) {
+          if (injectCrashOnce && boundary === "after-v2-retirement-rename-before-complete") {
+            injectCrashOnce = false;
+            throw new Error("SIMULATED_MID_ROTATION_CRASH");
+          }
+        },
+      },
+    });
+    await assert.rejects(
+      () => crashingCoord.rotateScopeIfMismatched(bindingB),
+      /SIMULATED_MID_ROTATION_CRASH|PROJECTION_PUBLICATION_RECOVERY_REQUIRED/u,
+    );
+    // Manifest MUST still be present on disk because retirement had not completed!
+    assert.equal(
+      existsSync(manifestPath),
+      true,
+      "projection-manifest.json must not be unlinked before retirement completes",
+    );
+    // Simulate operator/process restart clearing stale cooperative lock file
+    rmSync(join(projectionDirectory, PROJECTION_MANIFEST_PUBLICATION_LOCK_FILENAME), {
+      force: true,
+    });
+
+    // 4. Subsequent rotation + publication on bindingB in a restarted process recovers cleanly without wedging!
+    const recoveryScript = `
+      import { DatabaseSync } from "node:sqlite";
+      import { NodeSqliteDriver } from ${JSON.stringify(pathToFileURL(resolve("dist-test/src/orchestrator/storage/node-sqlite-driver.js")).href)};
+      import { SqliteProjectionEventReader } from ${JSON.stringify(pathToFileURL(resolve("dist-test/src/orchestrator/projections/event-reader.js")).href)};
+      import { ImmutableProjectionBuilder } from ${JSON.stringify(pathToFileURL(resolve("dist-test/src/orchestrator/projections/builder.js")).href)};
+      import { V2ProjectionBuildCoordinator } from ${JSON.stringify(pathToFileURL(resolve("dist-test/src/orchestrator/projections/coordinator.js")).href)};
+      const projectionDirectory = process.argv[1];
+      const eventsPath = process.argv[2];
+      const bindingB = JSON.parse(process.argv[3]);
+      const driver = new NodeSqliteDriver({ DatabaseSync });
+      const eventReader = new SqliteProjectionEventReader({ driver, eventStorePath: eventsPath, busyTimeoutMs: 5000 });
+      const builder = new ImmutableProjectionBuilder({ driver, projectionDirectory });
+      const coord = new V2ProjectionBuildCoordinator({ projectionDirectory, eventReader, builder, schema3: { eventReader, builder } });
+      const rotated = await coord.rotateScopeIfMismatched(bindingB);
+      const pubB = await coord.ensurePublishedV3(bindingB, 0n, 10000);
+      process.stdout.write(JSON.stringify({ rotated, branchRef: pubB.manifest.branchRef, generation: pubB.manifest.generation }));
+    `;
+    const childRes = spawnSync(
+      process.execPath,
+      ["--input-type=module", "-e", recoveryScript, projectionDirectory, eventsPath, JSON.stringify(bindingB)],
+      { encoding: "utf8" },
+    );
+    assert.equal(childRes.status, 0, `Expected child recovery exit 0, stderr=${childRes.stderr}`);
+    const recovered = JSON.parse(childRes.stdout.trim()) as {
+      rotated: boolean;
+      branchRef: string | null;
+      generation: number;
+    };
+    assert.equal(recovered.rotated, true);
+    assert.equal(recovered.branchRef, "refs/heads/branch-b");
+    assert.ok(recovered.generation > pubA.manifest.generation);
+  } finally {
+    fixture.cleanup();
   }
 });

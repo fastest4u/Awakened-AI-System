@@ -1363,6 +1363,7 @@ export async function runV2Admin(argv: readonly string[]): Promise<unknown> {
       entryUrl,
       syncBuild: true,
       ensureActive: command === "bootstrap-project",
+      promotePrepared: command === "bootstrap-project",
     });
     const paths = await assertFreshStartPaths(config);
     if (command === "bootstrap-project" && values["--freeze-v1"] === "true") {

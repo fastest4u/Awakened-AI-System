@@ -677,7 +677,10 @@ export function createV2WebUiHandler(options: V2WebUiOptions) {
     return false;
   }
 
-  async function getFoundationForProject(projectRoot: string): Promise<V2Foundation> {
+  async function getFoundationForProject(
+    projectRoot: string,
+    getOpts?: { readonly allowBootstrap?: boolean },
+  ): Promise<V2Foundation> {
     const canonicalRoot = canonicalizeProjectRoot(projectRoot);
     const cacheKey = canonicalProjectKey(canonicalRoot);
     const cached = foundationCache.get(cacheKey);
@@ -686,17 +689,25 @@ export function createV2WebUiHandler(options: V2WebUiOptions) {
       foundationCache.set(cacheKey, cached);
       return cached;
     }
-    const inflight = foundationPromiseCache.get(cacheKey);
+    const allowBootstrap = getOpts?.allowBootstrap === true;
+    const inflightKey = `${cacheKey}:${allowBootstrap ? "boot" : "open"}`;
+    const inflight = foundationPromiseCache.get(inflightKey);
     if (inflight) return inflight;
 
+    const autoSyncBuild = process.env.MEMORY_V2_AUTO_SYNC_BUILD === "1";
     const initPromise = (async () => {
       const config = await ensureProjectV2StoreReady({
         projectRoot: canonicalRoot,
         entryUrl,
-        syncBuild: true,
-        ensureActive: true,
+        allowBootstrap,
+        syncBuild: autoSyncBuild,
+        ensureActive: allowBootstrap,
+        promotePrepared: false,
       });
-      const foundation = await createV2Foundation(config, { entryUrl });
+      const foundation = await createV2Foundation(config, {
+        entryUrl,
+        autoHealBuildSync: autoSyncBuild,
+      });
       if (ownedFoundations.size >= 32) {
         for (const [oldKey, oldFoundation] of foundationCache.entries()) {
           if (ownedFoundations.has(oldFoundation)) {
@@ -712,11 +723,11 @@ export function createV2WebUiHandler(options: V2WebUiOptions) {
       addKnownProject(canonicalRoot);
       return foundation;
     })();
-    foundationPromiseCache.set(cacheKey, initPromise);
+    foundationPromiseCache.set(inflightKey, initPromise);
     try {
       return await initPromise;
     } finally {
-      foundationPromiseCache.delete(cacheKey);
+      foundationPromiseCache.delete(inflightKey);
     }
   }
 
@@ -899,7 +910,9 @@ export function createV2WebUiHandler(options: V2WebUiOptions) {
             return;
           }
         }
-        const foundation = await getFoundationForProject(canonicalCandidate);
+        const foundation = await getFoundationForProject(canonicalCandidate, {
+          allowBootstrap: true,
+        });
         const st = await foundation.status();
         sendJson(res, 200, {
           ok: true,
@@ -1132,7 +1145,37 @@ export function createV2WebUiHandler(options: V2WebUiOptions) {
           body.args && typeof body.args === "object" && !Array.isArray(body.args)
             ? (body.args as Record<string, unknown>)
             : {};
-        const foundation = await getFoundationForProject(projectRoot);
+        let nestedTargetRoot: string | null = null;
+        for (const nestedKey of ["projectRoot", "workspaceRoot"] as const) {
+          const nestedVal = toolArgs[nestedKey];
+          if (nestedVal !== undefined && nestedVal !== null) {
+            if (typeof nestedVal !== "string" || nestedVal.trim().length === 0) {
+              sendJson(res, 400, { ok: false, error: "INVALID_PROJECT_ROOT" });
+              return;
+            }
+            const validatedNested = validateProjectRootParam(nestedVal, "");
+            if (!validatedNested) {
+              sendJson(res, 400, { ok: false, error: "INVALID_PROJECT_ROOT" });
+              return;
+            }
+            if (!isRegisteredOrInitializedProject(validatedNested)) {
+              sendJson(res, 403, { ok: false, error: "UNREGISTERED_PROJECT_ROOT" });
+              return;
+            }
+            if (
+              nestedTargetRoot !== null &&
+              canonicalProjectKey(nestedTargetRoot) !== canonicalProjectKey(validatedNested)
+            ) {
+              sendJson(res, 400, { ok: false, error: "INVALID_PROJECT_ROOT" });
+              return;
+            }
+            nestedTargetRoot = validatedNested;
+          }
+        }
+        const effectiveProjectRoot = nestedTargetRoot ?? projectRoot;
+        const { projectRoot: _ignoredProj, workspaceRoot: _ignoredWs, ...sanitizedToolArgs } =
+          toolArgs;
+        const foundation = await getFoundationForProject(effectiveProjectRoot);
         if (toolName === "memory_v2Status") {
           sendJson(res, 200, {
             ok: true,
@@ -1141,7 +1184,7 @@ export function createV2WebUiHandler(options: V2WebUiOptions) {
           });
           return;
         }
-        const result = await foundation.content.invoke(toolName, toolArgs);
+        const result = await foundation.content.invoke(toolName, sanitizedToolArgs);
         sendJson(res, 200, {
           ok: true,
           tool: toolName,

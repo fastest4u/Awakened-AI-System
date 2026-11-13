@@ -941,6 +941,40 @@ test("Task 3: WebUI security hardening, CSRF/Host/Origin/GET-registration guards
       "GET/POST endpoints must never create directories or SQLite stores for unregistered paths",
     );
 
+    // 6b. R2-2: POST /api/mcp/call with nested args.projectRoot / args.workspaceRoot pointing to an existing unregistered directory must return 403 without bootstrapping memory-v2
+    const existingUnregisteredDir = mkdtempSync(join(tmpdir(), "pm-v2-existing-unreg-"));
+    try {
+      const nestedMcpCallRes = await fetch(`${baseUrl}/api/mcp/call`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          Origin: baseUrl,
+          "x-pm-csrf-token": csrfToken,
+        },
+        body: JSON.stringify({
+          projectRoot: fixture.projectRoot,
+          tool: "memory_sessionStart",
+          args: {
+            projectRoot: existingUnregisteredDir,
+            agentName: "nested-bypass-probe",
+            includeContext: false,
+          },
+        }),
+      });
+      assert.equal(
+        nestedMcpCallRes.status,
+        403,
+        "POST /api/mcp/call must reject nested unregistered args.projectRoot with 403",
+      );
+      assert.equal(
+        existsSync(join(existingUnregisteredDir, "memory-v2")),
+        false,
+        "POST /api/mcp/call must never auto-bootstrap memory-v2 inside an unregistered nested args.projectRoot",
+      );
+    } finally {
+      rmSync(existingUnregisteredDir, { recursive: true, force: true });
+    }
+
     // 7. Compile ALL 6 frontend MVC JS bundles via vm.Script + verify UX/Deep-Linking invariants
     const bundlePaths = [
       "/mvc/vendor.js",

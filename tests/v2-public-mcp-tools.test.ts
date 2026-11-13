@@ -1164,12 +1164,24 @@ test("Strict PR #17 regressions: complete tool schemas, non-mutating routed read
       assert.equal(targetStatusJson.projectId, distinctActiveTarget.release.projectId);
       assert.equal(targetStatusJson.mode, "active");
 
-      // 4. F3.2: Read-only routed tool against a 'prepared' store must fail closed and NEVER promote it to 'active'
+      // 4. F3.2 & R2-3: Both read-only AND mutating routed tools against an already-initialized 'prepared' store must fail closed and NEVER promote it to 'active'
       await assert.rejects(
         () =>
           client.callTool({
             name: "memory_list",
             arguments: { projectRoot: preparedTarget.projectRoot, limit: 5 },
+          }),
+        /FRESH_START_RELEASE_NOT_READY/u,
+      );
+      await assert.rejects(
+        () =>
+          client.callTool({
+            name: "memory_sessionStart",
+            arguments: {
+              projectRoot: preparedTarget.projectRoot,
+              agentName: "mutating-probe",
+              includeContext: false,
+            },
           }),
         /FRESH_START_RELEASE_NOT_READY/u,
       );
@@ -1188,7 +1200,7 @@ test("Strict PR #17 regressions: complete tool schemas, non-mutating routed read
         assert.equal(
           stateRow?.mode,
           "prepared",
-          "Read-only routed memory_list must not silently promote a prepared store to active",
+          "Neither read-only nor mutating routed MCP tools may silently promote an initialized prepared store to active",
         );
       } finally {
         preparedConn.close();

@@ -628,24 +628,47 @@ export class V2ProjectionBuildCoordinator {
         ) {
           return false;
         }
+        if (existing.schemaVersion !== 2 && existing.schemaVersion !== 3) {
+          return false;
+        }
         if (
           existing.workspaceId === binding.workspaceId
-          && existing.branchScopeId === binding.branchScopeId
-          && existing.branchRef === binding.branchRef
+          && (existing.branchScopeId ?? null) === binding.branchScopeId
+          && (existing.branchRef ?? null) === binding.branchRef
         ) {
           return false;
+        }
+        if (typeof existing.workspaceId !== "string" || existing.workspaceId.length === 0) {
+          throw new Error("PROJECTION_PUBLICATION_RECOVERY_REQUIRED");
+        }
+        const existingBinding: ProjectBinding = Object.freeze({
+          projectId: binding.projectId,
+          vaultId: binding.vaultId,
+          storeId: binding.storeId,
+          workspaceId: existing.workspaceId as ProjectBinding["workspaceId"],
+          branchScopeId: (typeof existing.branchScopeId === "string"
+            ? existing.branchScopeId
+            : null) as ProjectBinding["branchScopeId"],
+          branchRef: typeof existing.branchRef === "string" ? existing.branchRef : null,
+          sessionId: null,
+        });
+        const parsedExisting = parseRichProjectionManifest(existing, existingBinding);
+
+        const leased = new Set(this.#leasedFilenames());
+        const preScanFilenames = readdirSync(this.#projectionDirectory).sort();
+        for (const filename of preScanFilenames) {
+          if (V2_GENERATION_FILE.test(filename) && leased.has(filename)) {
+            throw new V2ProjectionLeaseUnavailableError();
+          }
         }
 
         retainLock = true;
         this.#cleanupKnownTemps();
-        const filenames = readdirSync(this.#projectionDirectory).sort();
         let maxObserved = Math.max(
-          Number.isSafeInteger(existing.generation) ? Number(existing.generation) : 0,
-          Number.isSafeInteger(existing.highestObservedGeneration)
-            ? Number(existing.highestObservedGeneration)
-            : 0,
+          parsedExisting.generation,
+          parsedExisting.highestObservedGeneration,
         );
-        for (const filename of filenames) {
+        for (const filename of preScanFilenames) {
           const match = V2_GENERATION_FILE.exec(filename);
           if (match !== null) {
             maxObserved = Math.max(maxObserved, Number(match[1]));
@@ -658,6 +681,16 @@ export class V2ProjectionBuildCoordinator {
           maxObserved,
         );
 
+        // Reconcile prior retirement intents and retire all old-scope generation
+        // files FIRST while projection-manifest.json still records existingBinding.
+        this.#reconcileUnpublished(null, identity, lease.lockToken, existingBinding);
+
+        for (const filename of readdirSync(this.#projectionDirectory)) {
+          if (V2_GENERATION_FILE.test(filename)) {
+            throw new V2ProjectionLeaseUnavailableError();
+          }
+        }
+
         const manifestPath = join(this.#projectionDirectory, PROJECTION_MANIFEST_FILENAME);
         try {
           const mStat = lstatSync(manifestPath);
@@ -667,54 +700,6 @@ export class V2ProjectionBuildCoordinator {
           unlinkSync(manifestPath);
         } catch (err) {
           if (!notFound(err)) throw err;
-        }
-
-        const leased = new Set(this.#leasedFilenames());
-        for (const filename of filenames) {
-          const match = V2_GENERATION_FILE.exec(filename);
-          if (match === null || leased.has(filename)) continue;
-          const image = filesystemStableProjectionDirectoryOperations.readGenerationImage(
-            this.#projectionDirectory,
-            identity,
-            lease.lockToken,
-            filename,
-          );
-          const retiredFilename = `.projections-${filename.split("-")[1]}-retired-${randomBytes(16).toString("hex")}.sqlite`;
-          const intent = this.#reconciliationJournal.beginRetirement(
-            this.#projectionDirectory,
-            identity,
-            lease.lockToken,
-            Object.freeze({
-              state: "intent",
-              generation: Number(match[1]),
-              finalFilename: filename,
-              retiredFilename,
-              image: toRetirementImage(image.identity),
-            }),
-          );
-          filesystemStableProjectionDirectoryOperations.retireGeneration(
-            this.#projectionDirectory,
-            identity,
-            lease.lockToken,
-            image.identity,
-            intent.retiredFilename,
-          );
-          const observed = filesystemStableProjectionDirectoryOperations.captureRetiredGeneration(
-            this.#projectionDirectory,
-            identity,
-            lease.lockToken,
-            intent.retiredFilename,
-          );
-          if (observed === null || !sameRetirementRenameContinuity(observed, intent.image)) {
-            throw new Error("PROJECTION_PUBLICATION_RECOVERY_REQUIRED");
-          }
-          this.#reconciliationJournal.completeRetirement(
-            this.#projectionDirectory,
-            identity,
-            lease.lockToken,
-            intent,
-            toRetirementImage(observed),
-          );
         }
 
         retainLock = false;

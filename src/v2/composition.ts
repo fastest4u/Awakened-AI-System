@@ -166,6 +166,7 @@ export async function ensureProjectV2StoreReady(options: {
   readonly allowBootstrap?: boolean;
   readonly syncBuild?: boolean;
   readonly ensureActive?: boolean;
+  readonly promotePrepared?: boolean;
 }): Promise<V2LaunchConfig> {
   if (!isAbsolute(options.projectRoot) || options.projectRoot.includes("\0")) {
     throw new FreshStartError("FRESH_START_CONFIG_INVALID");
@@ -254,7 +255,7 @@ export async function ensureProjectV2StoreReady(options: {
       };
       repo.transact(identity, (tx) => {
         const current = tx.state()!;
-        if (current.mode === "prepared") {
+        if (options.ensureActive !== false && current.mode === "prepared") {
           tx.transition({
             transitionId: randomUUID(),
             expectedMode: "prepared",
@@ -368,7 +369,7 @@ export async function ensureProjectV2StoreReady(options: {
       }
     }
 
-    if (options.ensureActive && state.mode === "prepared") {
+    if (options.promotePrepared === true && state.mode === "prepared") {
       repo.transact(identity, (tx) => {
         const current = tx.state()!;
         if (current.mode === "prepared") {
