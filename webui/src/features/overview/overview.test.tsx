@@ -331,4 +331,69 @@ describe('Overview page', () => {
     expect(within(table!).getByText(/Alpha migration task/)).toBeInTheDocument();
     expect(within(table!).queryByText(/Beta optimization pipeline/)).not.toBeInTheDocument();
   });
+
+  const triadContextTestCases = [
+    { type: 'file', label: 'auth.ts', expectedNode: 'file:src/auth.ts' },
+    { type: 'symbol', label: 'verifyToken', expectedNode: 'symbol:verifyToken' },
+    { type: 'session', label: /เซสชัน #s-123456/, expectedNode: 'session:s-12345678' },
+  ];
+
+  for (const { type, label, expectedNode } of triadContextTestCases) {
+    it(`causal triad ${type} context badge navigates to graph with node=${expectedNode}`, async () => {
+      const mockOverview = {
+        ok: true,
+        projectRoot: 'C:\\default',
+        projectName: 'default',
+        status: 'active',
+        audit: {
+          healthScore: 90,
+          counts: { verifiedNotes: 1, unpromotedCandidates: 0, conflictedNotes: 0, duplicateGroups: 0 },
+          recommendations: [],
+          duplicateGroups: [],
+        },
+        analytics: {
+          byStatus: {},
+          byKind: {},
+          activitySeries: [],
+        },
+        lifecycle: {
+          sessions: [],
+          latestCheckpoint: null,
+        },
+        causalTriads: [
+          {
+            anchorMistakeId: 'mis-triad-anchor',
+            mistakeTitle: 'Bug in token refresh',
+            relatedAdrs: [],
+            relatedInsights: [],
+            sharedContext: ['file:src/auth.ts', 'symbol:verifyToken', 'session:s-12345678'],
+          },
+        ],
+      };
+
+      const { router } = renderApp({
+        initialUrl: '/overview',
+        fetchHandler: (url) => {
+          if (url.startsWith('/api/overview')) {
+            return new Response(JSON.stringify(mockOverview), {
+              status: 200,
+              headers: { 'Content-Type': 'application/json' },
+            });
+          }
+        },
+      });
+
+      await screen.findByText('Bug in token refresh');
+
+      const badge = screen.getByText(label);
+      await userEvent.click(badge);
+
+      await waitFor(() => {
+        expect(router.state.location.pathname).toBe('/graph');
+        const search = router.state.location.search as any;
+        expect(search.node).toBe(expectedNode);
+        expect(search.node).not.toBe('mis-triad-anchor');
+      });
+    });
+  }
 });

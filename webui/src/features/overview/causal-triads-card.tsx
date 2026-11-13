@@ -183,7 +183,7 @@ export function CausalTriadsCard({ causalTriads }: CausalTriadsCardProps) {
                             variant="outline"
                             title={`${fp} (คลิกเพื่อดูในกราฟ)`}
                             className="text-[10px] px-1.5 py-0 h-5 cursor-pointer gap-1 hover:bg-accent"
-                            onClick={() => navigateToGraph(triad.anchorMistakeId)}
+                            onClick={() => navigateToGraph(ctx)}
                           >
                             <FileText className="size-2.5 text-[#10b981]" />
                             <span className="max-w-[100px] truncate">{short}</span>
@@ -198,7 +198,7 @@ export function CausalTriadsCard({ causalTriads }: CausalTriadsCardProps) {
                             variant="outline"
                             title={`Symbol: ${sym} (คลิกเพื่อดูในกราฟ)`}
                             className="text-[10px] px-1.5 py-0 h-5 cursor-pointer gap-1 hover:bg-accent"
-                            onClick={() => navigateToGraph(triad.anchorMistakeId)}
+                            onClick={() => navigateToGraph(ctx)}
                           >
                             <Code2 className="size-2.5 text-[#f59e0b]" />
                             <span className="max-w-[100px] truncate">{sym}</span>
@@ -213,7 +213,7 @@ export function CausalTriadsCard({ causalTriads }: CausalTriadsCardProps) {
                             variant="outline"
                             title={`Session: ${sid} (คลิกเพื่อดูในกราฟ)`}
                             className="text-[10px] px-1.5 py-0 h-5 cursor-pointer gap-1 hover:bg-accent"
-                            onClick={() => navigateToGraph(triad.anchorMistakeId)}
+                            onClick={() => navigateToGraph(ctx)}
                           >
                             <Clock className="size-2.5 text-muted-foreground" />
                             <span>เซสชัน #{sid.slice(0, 8)}</span>

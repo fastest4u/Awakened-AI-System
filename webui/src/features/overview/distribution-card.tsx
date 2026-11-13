@@ -15,7 +15,13 @@ import {
   FileText,
 } from 'lucide-react';
 import { kindDistribution } from '@/lib/overview-math';
-import { PieChart, Pie, Cell, ResponsiveContainer } from 'recharts';
+import { PieChart, Pie, Cell } from 'recharts';
+import {
+  ChartContainer,
+  ChartTooltip,
+  ChartTooltipContent,
+  type ChartConfig,
+} from '@/components/ui/chart';
 
 export interface DistributionCardProps {
   byKind?: Record<string, number> | null;
@@ -43,6 +49,25 @@ const KIND_META = {
     color: '#38bdf8',
   },
 } as const;
+
+const chartConfig: ChartConfig = {
+  adr: {
+    label: 'ADR (การตัดสินใจ)',
+    color: '#6366f1',
+  },
+  insight: {
+    label: 'Insight (บทเรียน)',
+    color: '#10b981',
+  },
+  mistake: {
+    label: 'Mistake (ข้อควรระวัง)',
+    color: '#f59e0b',
+  },
+  'session-log': {
+    label: 'Session Log (ประวัติ)',
+    color: '#38bdf8',
+  },
+};
 
 export function DistributionCard({ byKind }: DistributionCardProps) {
   const items = kindDistribution(byKind);
@@ -75,13 +100,39 @@ export function DistributionCard({ byKind }: DistributionCardProps) {
       </CardHeader>
       <CardContent>
         <div className="flex flex-col sm:flex-row items-center gap-4">
-          <div className="w-[120px] h-[120px] shrink-0 relative flex items-center justify-center">
-            <ResponsiveContainer
-              width={120}
-              height={120}
-              minWidth={0}
-              minHeight={0}
+          <div
+            className="w-[120px] h-[120px] shrink-0 relative flex items-center justify-center"
+            ref={(parent) => {
+              if (parent) {
+                const el = parent.querySelector(
+                  '.recharts-responsive-container',
+                ) as HTMLElement | null;
+                if (el) {
+                  const orig = el.getBoundingClientRect.bind(el);
+                  el.getBoundingClientRect = () => {
+                    const r = orig();
+                    return r.width === 0 && r.height === 0
+                      ? {
+                          width: 120,
+                          height: 120,
+                          top: 0,
+                          left: 0,
+                          bottom: 120,
+                          right: 120,
+                          x: 0,
+                          y: 0,
+                          toJSON: () => {},
+                        }
+                      : r;
+                  };
+                }
+              }
+            }}
+          >
+            <ChartContainer
+              config={chartConfig}
               initialDimension={{ width: 120, height: 120 }}
+              className="h-[120px] w-[120px] aspect-auto"
             >
               <PieChart>
                 <Pie
@@ -99,8 +150,11 @@ export function DistributionCard({ byKind }: DistributionCardProps) {
                     <Cell key={`cell-${index}`} fill={entry.color} />
                   ))}
                 </Pie>
+                {total > 0 && (
+                  <ChartTooltip content={<ChartTooltipContent hideLabel />} />
+                )}
               </PieChart>
-            </ResponsiveContainer>
+            </ChartContainer>
             <div className="absolute inset-0 flex flex-col items-center justify-center pointer-events-none">
               <span className="text-sm font-bold text-foreground">{total}</span>
               <span className="text-[9px] text-muted-foreground">รายการ</span>

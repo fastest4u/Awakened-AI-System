@@ -13,9 +13,13 @@ import {
   Bar,
   XAxis,
   YAxis,
-  Tooltip,
-  ResponsiveContainer,
 } from 'recharts';
+import {
+  ChartContainer,
+  ChartTooltip,
+  ChartTooltipContent,
+  type ChartConfig,
+} from '@/components/ui/chart';
 
 export interface ActivityPoint {
   label: string;
@@ -27,6 +31,17 @@ export interface ActivityPoint {
 export interface ActivityCardProps {
   activitySeries?: ActivityPoint[] | null;
 }
+
+const chartConfig: ChartConfig = {
+  notes: {
+    label: 'ความจำทั้งหมด',
+    color: '#6366f1',
+  },
+  verified: {
+    label: 'ยืนยันแล้ว',
+    color: '#10b981',
+  },
+};
 
 export function ActivityCard({ activitySeries }: ActivityCardProps) {
   const data =
@@ -52,13 +67,39 @@ export function ActivityCard({ activitySeries }: ActivityCardProps) {
         </CardDescription>
       </CardHeader>
       <CardContent className="pt-2">
-        <div className="w-full h-[155px]">
-          <ResponsiveContainer
-            width="100%"
-            height={155}
-            minWidth={0}
-            minHeight={0}
+        <div
+          className="w-full h-[155px]"
+          ref={(parent) => {
+            if (parent) {
+              const el = parent.querySelector(
+                '.recharts-responsive-container',
+              ) as HTMLElement | null;
+              if (el) {
+                const orig = el.getBoundingClientRect.bind(el);
+                el.getBoundingClientRect = () => {
+                  const r = orig();
+                  return r.width === 0 && r.height === 0
+                    ? {
+                        width: 320,
+                        height: 155,
+                        top: 0,
+                        left: 0,
+                        bottom: 155,
+                        right: 320,
+                        x: 0,
+                        y: 0,
+                        toJSON: () => {},
+                      }
+                    : r;
+                };
+              }
+            }
+          }}
+        >
+          <ChartContainer
+            config={chartConfig}
             initialDimension={{ width: 320, height: 155 }}
+            className="h-[155px] w-full aspect-auto"
           >
             <ComposedChart
               data={data}
@@ -83,38 +124,7 @@ export function ActivityCard({ activitySeries }: ActivityCardProps) {
                 tick={{ fontSize: 10, fill: 'hsl(var(--muted-foreground))' }}
                 domain={[0, 'auto']}
               />
-              <Tooltip
-                content={({ active, payload, label }) => {
-                  if (!active || !payload?.length) return null;
-                  return (
-                    <div className="rounded-lg border bg-popover px-2.5 py-1.5 text-xs shadow-md">
-                      <p className="font-semibold text-popover-foreground mb-1">
-                        {label}
-                      </p>
-                      {payload.map((item, idx) => (
-                        <div
-                          key={`tt-${idx}`}
-                          className="flex items-center justify-between gap-3 text-muted-foreground"
-                        >
-                          <span
-                            className="inline-block size-2 rounded-full"
-                            style={{ backgroundColor: item.color }}
-                          />
-                          <span>
-                            {item.dataKey === 'notes'
-                              ? 'ความจำทั้งหมด'
-                              : 'ยืนยันแล้ว'}
-                            :
-                          </span>
-                          <span className="font-medium text-foreground">
-                            {item.value}
-                          </span>
-                        </div>
-                      ))}
-                    </div>
-                  );
-                }}
-              />
+              <ChartTooltip content={<ChartTooltipContent />} />
               <Area
                 type="monotone"
                 dataKey="notes"
@@ -130,7 +140,7 @@ export function ActivityCard({ activitySeries }: ActivityCardProps) {
                 opacity={0.85}
               />
             </ComposedChart>
-          </ResponsiveContainer>
+          </ChartContainer>
         </div>
       </CardContent>
     </Card>
