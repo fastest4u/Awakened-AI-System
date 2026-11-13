@@ -15,6 +15,7 @@ const expectedEssential = [
   // Heavy end-to-end V2 public surface, WebUI, multi-project, acceleration, governance & recovery
   "v2-public-mcp-tools",
   "v2-webui-and-curator",
+  "v2-webui-spa-serving",
   "v2-governed-lifecycle-mutations",
   "v2-awakening-and-multiproject",
   "v2-recovery-backup-restore",

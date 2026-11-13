@@ -15,6 +15,7 @@ export const DEFAULT_TEST_CONCURRENCY = 4;
 export const ESSENTIAL_DEFAULT_TESTS = Object.freeze([
   "v2-public-mcp-tools.test.js",
   "v2-webui-and-curator.test.js",
+  "v2-webui-spa-serving.test.js",
   "v2-governed-lifecycle-mutations.test.js",
   "v2-awakening-and-multiproject.test.js",
   "v2-recovery-backup-restore.test.js",

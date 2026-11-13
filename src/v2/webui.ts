@@ -30,6 +30,15 @@ import {
   renderMvcViewsJs,
   renderWebComponentsJs,
 } from "./webui/views-and-web-components.js";
+import {
+  SPA_ROUTE_PATHS,
+  loadSpaClientBundle,
+  renderClientMissingHtml,
+  renderSpaIndexHtml,
+  resolveSpaClientDir,
+  type PrecomputedStaticAsset,
+  type SpaClientBundle,
+} from "./webui/spa-assets.js";
 
 export interface GraphNode {
   readonly id: string;
@@ -736,12 +745,64 @@ export interface V2WebUiOptions {
   readonly entryUrl?: string;
   readonly foundations?: ReadonlyMap<string, V2Foundation>;
   readonly allowedHost?: string;
+  readonly clientDistDir?: string;
 }
 
 export function createV2WebUiHandler(options: V2WebUiOptions) {
   const defaultProjectRoot = canonicalizeProjectRoot(options.defaultProjectRoot);
   const entryUrl = options.entryUrl ?? resolveDefaultEntryUrl();
   const csrfToken = randomBytes(24).toString("hex");
+  const resolvedClientDir = resolveSpaClientDir({
+    clientDistDir: options.clientDistDir,
+    entryUrl,
+    cwd: process.cwd(),
+  });
+  let spaBundle: SpaClientBundle | null = loadSpaClientBundle(resolvedClientDir);
+  let lastBundleAttempt = Date.now();
+
+  function sendPrecomputedStaticAsset(
+    req: IncomingMessage,
+    res: ServerResponse,
+    asset: PrecomputedStaticAsset,
+    isImmutable: boolean,
+  ): void {
+    const cacheControl = isImmutable
+      ? "public, max-age=31536000, immutable"
+      : "public, max-age=3600";
+    const ifNoneMatch =
+      typeof req.headers["if-none-match"] === "string" ? req.headers["if-none-match"] : "";
+    if (
+      ifNoneMatch &&
+      ifNoneMatch
+        .split(",")
+        .map((s) => s.trim())
+        .includes(asset.etag)
+    ) {
+      res.writeHead(304, {
+        ...WEBUI_SECURITY_HEADERS,
+        etag: asset.etag,
+        "cache-control": cacheControl,
+        vary: "Accept-Encoding",
+      });
+      res.end();
+      return;
+    }
+
+    const acceptEncoding =
+      typeof req.headers["accept-encoding"] === "string" ? req.headers["accept-encoding"] : "";
+    const supportsGzip = /\bgzip\b/iu.test(acceptEncoding) && asset.gzip !== null;
+    const body = supportsGzip ? asset.gzip : asset.raw;
+    res.writeHead(200, {
+      ...WEBUI_SECURITY_HEADERS,
+      "content-type": asset.contentType,
+      "cache-control": cacheControl,
+      etag: asset.etag,
+      vary: "Accept-Encoding",
+      ...(supportsGzip ? { "content-encoding": "gzip" } : {}),
+    });
+    res.end(body);
+  }
+
   const staticMvcAssets: Readonly<Record<string, PrecomputedJsAsset>> = Object.freeze({
     "/mvc/vendor.js": buildPrecomputedJsAsset(renderVendorRuntimeJs()),
     "/mvc/models.js": buildPrecomputedJsAsset(renderMvcModelsJs()),
@@ -990,9 +1051,32 @@ export function createV2WebUiHandler(options: V2WebUiOptions) {
       }
       const pathname = parsedUrl.pathname;
 
-      // 1. HTML Host & Modular Frontend MVC Scripts (React + TanStack + shadcn/ui + Web Components)
-      if (method === "GET" && (pathname === "/" || pathname === "/index.html")) {
-        const html = renderMvcIndexHtml(defaultProjectRoot, csrfToken);
+      const rawUrl = req.url ?? "/";
+      if (rawUrl.includes("..") || /%2e%2e/iu.test(rawUrl)) {
+        sendJson(res, 404, { ok: false, error: "NOT_FOUND", path: pathname });
+        return;
+      }
+
+      // 1. SPA Client Bundle & Route Serving
+      if (method === "GET" && SPA_ROUTE_PATHS.has(pathname)) {
+        if (!spaBundle) {
+          const now = Date.now();
+          if (now - lastBundleAttempt >= 2000) {
+            lastBundleAttempt = now;
+            spaBundle = loadSpaClientBundle(resolvedClientDir);
+          }
+        }
+        if (!spaBundle) {
+          const html = renderClientMissingHtml(csrfToken, defaultProjectRoot);
+          res.writeHead(503, {
+            ...WEBUI_SECURITY_HEADERS,
+            "content-type": "text/html; charset=utf-8",
+            "cache-control": "no-store",
+          });
+          res.end(html);
+          return;
+        }
+        const html = renderSpaIndexHtml(spaBundle.indexTemplate, csrfToken, defaultProjectRoot);
         res.writeHead(200, {
           ...WEBUI_SECURITY_HEADERS,
           "content-type": "text/html; charset=utf-8",
@@ -1001,8 +1085,31 @@ export function createV2WebUiHandler(options: V2WebUiOptions) {
         res.end(html);
         return;
       }
+
+      if (method === "GET" && spaBundle && spaBundle.assets.has(pathname)) {
+        const asset = spaBundle.assets.get(pathname)!;
+        sendPrecomputedStaticAsset(req, res, asset, pathname.startsWith("/assets/"));
+        return;
+      }
+
+      if (method === "GET" && pathname.startsWith("/assets/")) {
+        sendJson(res, 404, { ok: false, error: "NOT_FOUND", path: pathname });
+        return;
+      }
+
+      // Legacy /mvc/*.js routes (kept until Task 10)
       if (method === "GET" && Object.prototype.hasOwnProperty.call(staticMvcAssets, pathname)) {
         sendStaticJsAsset(req, res, staticMvcAssets[pathname]!);
+        return;
+      }
+
+      // Bootstrap configuration for SPA clients
+      if (method === "GET" && pathname === "/api/bootstrap") {
+        sendJson(res, 200, {
+          ok: true,
+          csrfToken,
+          defaultProjectRoot,
+        });
         return;
       }
 
