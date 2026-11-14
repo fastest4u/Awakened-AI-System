@@ -390,8 +390,8 @@ describe('Knowledge Graph page', () => {
     });
   });
 
-  it('renders visible node text labels and valid CSS variable colors without nested hsl(var(--...)) in both flow and orbital modes', async () => {
-    renderApp({
+  it('renders rich glassmorphic card nodes, column guides, MiniMap, quick-open sheet button, and valid CSS colors without nested hsl(var(--...))', async () => {
+    const { router } = renderApp({
       initialUrl: '/graph',
       fetchHandler: (url) => {
         if (url.startsWith('/api/graph')) {
@@ -402,7 +402,7 @@ describe('Knowledge Graph page', () => {
       },
     });
 
-    const svg = await waitFor(() => {
+    const stage = await waitFor(() => {
       const el = document.querySelector('#knowledge-graph-canvas');
       expect(el).not.toBeNull();
       return el!;
@@ -410,52 +410,42 @@ describe('Knowledge Graph page', () => {
 
     await waitFor(() => {
       expect(document.querySelector('[data-node-id="note:rec-1"]')).not.toBeNull();
+      expect(document.querySelector('[data-node-id="file:src/auth.ts"]')).not.toBeNull();
+      expect(document.querySelector('[data-node-id="symbol:refreshToken"]')).not.toBeNull();
+      expect(document.querySelector('[data-node-id="session:sess-1"]')).not.toBeNull();
     });
 
-    // Flow mode renders column subtitles and node display labels inside #graph-nodes
-    const flowNodesGroup = svg.querySelector('#graph-nodes')!;
-    const flowNodeText = flowNodesGroup.textContent ?? '';
-    expect(flowNodeText).toContain('Auth refactor and token secu');
-    expect(flowNodeText).toContain('Token Refresh Pattern');
-    expect(flowNodeText).toContain('auth.ts');
-    expect(flowNodeText).toContain('refreshToken');
-
-    const colGuidesText = svg.querySelector('#flow-column-guides')?.textContent ?? '';
+    // Flow stage header pills render all 4 narrative columns
+    const colGuidesText = stage.querySelector('#flow-column-guides')?.textContent ?? '';
     expect(colGuidesText).toContain('จุดเริ่มต้นของงาน');
     expect(colGuidesText).toContain('การตัดสินใจ & บทเรียน');
     expect(colGuidesText).toContain('ซอร์สโค้ดที่เกี่ยวข้อง');
     expect(colGuidesText).toContain('โมดูลที่ได้รับผลกระทบ');
 
-    const fileNodeEl = svg.querySelector('[data-node-id="file:src/auth.ts"]')!;
-    const fileRect = fileNodeEl.querySelector('rect');
-    const fileLabelText = fileNodeEl.querySelector('text');
-    expect(fileRect?.getAttribute('fill')).toBe('var(--card)');
-    expect(fileLabelText?.getAttribute('fill')).toBe('var(--foreground)');
-    expect(svg.outerHTML).not.toMatch(/(hsl|rgb|oklch)\(var\(--/);
+    // Rich custom card content: full human labels + separated file dir/basename
+    const sessionCard = stage.querySelector('[data-node-id="session:sess-1"]')!;
+    const noteCard = stage.querySelector('[data-node-id="note:rec-1"]')!;
+    const fileCard = stage.querySelector('[data-node-id="file:src/auth.ts"]')!;
+    const symbolCard = stage.querySelector('[data-node-id="symbol:refreshToken"]')!;
 
-    // Switch to Orbital mode and hover a non-selected node to verify hover label styling
-    const orbitalBtn = screen.getByRole('button', {
-      name: /มุมมองเครือข่ายวงโคจร/i,
-    });
-    fireEvent.click(orbitalBtn);
+    expect(sessionCard.textContent).toContain('Auth refactor and token security');
+    expect(noteCard.textContent).toContain('Token Refresh Pattern');
+    expect(fileCard.textContent).toContain('auth.ts');
+    expect(fileCard.textContent).toContain('src/');
+    expect(symbolCard.textContent).toContain('refreshToken');
 
-    const orbFileNodeEl = await waitFor(() => {
-      const el = document.querySelector('#knowledge-graph-canvas [data-node-id="file:src/auth.ts"]');
-      expect(el).not.toBeNull();
-      return el!;
-    });
-    fireEvent.mouseEnter(orbFileNodeEl);
+    // MiniMap and zero nested hsl/rgb/oklch(var(--...))
+    expect(stage.querySelector('.react-flow__minimap')).not.toBeNull();
+    expect(stage.outerHTML).not.toMatch(/(hsl|rgb|oklch)\(var\(--/);
 
+    // Quick-open button [data-action="open-note"] opens NoteDetailSheet directly
+    const openBtn = noteCard.querySelector('[data-action="open-note"]') as HTMLButtonElement;
+    expect(openBtn).not.toBeNull();
+    fireEvent.click(openBtn);
     await waitFor(() => {
-      const orbLabelText = orbFileNodeEl.querySelector('text');
-      expect(orbLabelText).not.toBeNull();
-      expect(orbLabelText?.textContent).toContain('auth.ts');
-      expect(orbLabelText?.getAttribute('fill')).toBe('var(--foreground)');
-      expect(orbLabelText?.getAttribute('stroke')).toBe('var(--background)');
+      const search = router.state.location.search as any;
+      expect(search.note).toBe('rec-1');
     });
-    expect(document.querySelector('#knowledge-graph-canvas')!.outerHTML).not.toMatch(
-      /(hsl|rgb|oklch)\(var\(--/,
-    );
   });
 
   it('defaults to focused related-only mode hiding unrelated nodes and toggles back with #graph-focus-related-toggle', async () => {
@@ -643,7 +633,7 @@ describe('Knowledge Graph page', () => {
     });
   });
 
-  it('centers Orbital bottom-pole node labels beneath their node with text-anchor="middle"', async () => {
+  it('renders Orbital galaxy mode cards with full readable labels and non-overlapping ELK positions', async () => {
     const orbitalPoleGraph: GraphResponse = {
       ok: true,
       projectRoot: 'C:\\default',
@@ -693,28 +683,15 @@ describe('Knowledge Graph page', () => {
     fireEvent.click(orbitalBtn);
 
     await waitFor(() => {
-      const svg = document.querySelector('#knowledge-graph-canvas') as SVGSVGElement;
-      const viewBoxParts = (svg.getAttribute('viewBox') || '0 0 880 560').split(/\s+/).map(Number);
-      const cx = viewBoxParts[2] / 2;
-      const cy = viewBoxParts[3] / 2;
-
-      const nodeGroups = Array.from(svg.querySelectorAll('#graph-nodes > g[data-node-id]'));
-      const bottomPoleLabels: Element[] = [];
-      for (const g of nodeGroups) {
-        if (g.getAttribute('data-node-id') === 'note:center') continue;
-        const circle = g.querySelector('circle');
-        const label = g.querySelector('text');
-        if (!circle || !label) continue;
-        const nx = Number(circle.getAttribute('cx'));
-        const ny = Number(circle.getAttribute('cy'));
-        if (Math.abs(nx - cx) <= 100 && ny > cy) {
-          bottomPoleLabels.push(label);
-        }
+      const stage = document.querySelector('#knowledge-graph-canvas')!;
+      const cards = stage.querySelectorAll('[data-node-id]');
+      expect(cards.length).toBe(8);
+      for (let i = 1; i <= 7; i++) {
+        const card = stage.querySelector(`[data-node-id="symbol:sym${i}"]`);
+        expect(card).not.toBeNull();
+        expect(card?.textContent).toContain(`sym${i}`);
       }
-      expect(bottomPoleLabels.length).toBeGreaterThan(0);
-      for (const label of bottomPoleLabels) {
-        expect(label.getAttribute('text-anchor')).toBe('middle');
-      }
+      expect(stage.textContent).toContain('ELK Galaxy');
     });
   });
 });

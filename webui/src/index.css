@@ -114,3 +114,36 @@
     font-family: 'Inter Variable', 'Noto Sans Thai', sans-serif;
   }
 }
+
+@keyframes xyEdgeFlow {
+  from {
+    stroke-dashoffset: 24;
+  }
+  to {
+    stroke-dashoffset: 0;
+  }
+}
+
+.xyflow-graph-stage .react-flow__node {
+  transition: transform 320ms cubic-bezier(0.22, 1, 0.36, 1), opacity 220ms ease;
+}
+
+.xyflow-graph-stage .react-flow__node.dragging {
+  transition: none !important;
+}
+
+.xyflow-graph-stage .xyflow-edge-animated {
+  animation: xyEdgeFlow 1.4s linear infinite;
+}
+
+.xyflow-graph-stage .react-flow__minimap {
+  background-color: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 0.75rem;
+  overflow: hidden;
+  box-shadow: 0 10px 25px -10px rgba(0, 0, 0, 0.35);
+}
+
+.xyflow-graph-stage .react-flow__attribution {
+  display: none;
+}

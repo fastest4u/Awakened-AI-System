@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo, useRef } from 'react';
+import { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import { useSearch, useNavigate } from '@tanstack/react-router';
 import { useQuery } from '@tanstack/react-query';
 import { graphQuery } from '@/api/queries';
@@ -10,17 +10,14 @@ import { Skeleton } from '@/components/ui/skeleton';
 import {
   computeNeighborhood,
   filterGraph,
-  computeFlowLayout,
-  computeOrbitalLayout,
-  pickSpotlightLabels,
   findMatchingNode,
   selectFocusedNodesAndEdges,
 } from '@/lib/graph-layout';
+import { selectVisibleGraphNodes } from '@/lib/elk-graph-layout';
 import type { GraphNode } from '@/api/types';
-import { usePanZoom } from './use-pan-zoom';
 import { GraphToolbar } from './graph-toolbar';
 import { GraphZoomHud } from './graph-zoom-hud';
-import { GraphCanvas } from './graph-canvas';
+import { GraphCanvas, type GraphCanvasHandle } from './graph-canvas';
 import { GraphInspector, type GraphStory } from './graph-inspector';
 
 export function GraphPage() {
@@ -109,21 +106,24 @@ export function GraphPage() {
     });
   };
 
-  const handleSelectNode = (nodeId: string) => {
-    navigate({
-      to: '.',
-      search: (prev: any) => {
-        const next = { ...prev };
-        if (nodeId) {
-          next.node = nodeId;
-        } else {
-          delete next.node;
-        }
-        return next;
-      },
-      replace: true,
-    });
-  };
+  const handleSelectNode = useCallback(
+    (nodeId: string) => {
+      navigate({
+        to: '.',
+        search: (prev: any) => {
+          const next = { ...prev };
+          if (nodeId) {
+            next.node = nodeId;
+          } else {
+            delete next.node;
+          }
+          return next;
+        },
+        replace: true,
+      });
+    },
+    [navigate],
+  );
 
   const handleOpenInKanban = (label: string) => {
     navigate({
@@ -212,61 +212,53 @@ export function GraphPage() {
     );
   }, [filtered, highlightedNodeIds, effectiveRelatedOnly]);
 
-  // Layout computation
-  const layoutResult = useMemo(() => {
-    if (layoutMode === 'flow') {
-      return computeFlowLayout(focusedGraph.nodes, highlightedNodeIds);
-    }
-    return computeOrbitalLayout(
+  const visibleNodes = useMemo(() => {
+    return selectVisibleGraphNodes(
       focusedGraph.nodes,
       highlightedNodeIds,
       selectedNode?.id,
+      56,
     );
-  }, [layoutMode, focusedGraph.nodes, highlightedNodeIds, selectedNode?.id]);
+  }, [focusedGraph.nodes, highlightedNodeIds, selectedNode?.id]);
 
-  // Spotlight labels in orbital mode
-  const spotlightLabelIds = useMemo(() => {
-    return pickSpotlightLabels(
-      focusedGraph.nodes,
-      layoutResult.positions,
-      selectedNode?.id,
-      highlightedNodeIds,
-    );
-  }, [focusedGraph.nodes, layoutResult.positions, selectedNode?.id, highlightedNodeIds]);
+  const graphCanvasRef = useRef<GraphCanvasHandle | null>(null);
+  const [zoom, setZoom] = useState(1);
 
-  // Pan / Zoom hook
-  const {
-    zoom,
-    zoomIn,
-    zoomOut,
-    resetZoom,
-    focusNode,
-    wasDraggingRef,
-    handleWheel,
-    handleMouseDown,
-    handleMouseMove,
-    handleMouseUp,
-    handleMouseLeave,
-    viewBox,
-  } = usePanZoom({
-    width: layoutResult.width,
-    height: layoutResult.height,
-  });
+  const zoomIn = useCallback(() => {
+    setZoom((prev) => {
+      const next = Math.min(2.5, Math.round((prev + 0.25) * 100) / 100);
+      graphCanvasRef.current?.zoomTo(next);
+      return next;
+    });
+  }, []);
 
-  const handleFocusSelected = () => {
+  const zoomOut = useCallback(() => {
+    setZoom((prev) => {
+      const next = Math.max(0.5, Math.round((prev - 0.25) * 100) / 100);
+      graphCanvasRef.current?.zoomTo(next);
+      return next;
+    });
+  }, []);
+
+  const resetZoom = useCallback(() => {
+    setZoom(1);
+    graphCanvasRef.current?.resetView();
+  }, []);
+
+  const handleFocusSelected = useCallback(() => {
     if (!selectedNode) return;
-    const pos = layoutResult.positions.get(selectedNode.id);
-    if (pos) {
-      focusNode(pos);
-    }
-  };
+    setZoom(1.75);
+    graphCanvasRef.current?.focusNode(selectedNode.id, 1.75);
+  }, [selectedNode]);
 
-  const handleFocusNode = (nodeId: string) => {
-    const pos = layoutResult.positions.get(nodeId);
-    if (pos) {
-      focusNode(pos);
-    }
-  };
+  const handleFocusNode = useCallback(
+    (nodeId: string) => {
+      handleSelectNode(nodeId);
+      setZoom(1.75);
+      graphCanvasRef.current?.focusNode(nodeId, 1.75);
+    },
+    [handleSelectNode],
+  );
 
   // Human-readable story relationships for inspector
   const story: GraphStory = useMemo(() => {
@@ -315,7 +307,7 @@ export function GraphPage() {
 
   const hiddenCount = Math.max(
     0,
-    filtered.nodes.length - layoutResult.visibleNodes.length,
+    filtered.nodes.length - visibleNodes.length,
   );
 
   return (
@@ -343,7 +335,7 @@ export function GraphPage() {
             {/* Left Pane: Canvas + Zoom HUD */}
             <div className="min-w-0">
               <GraphZoomHud
-                nodeCount={layoutResult.visibleNodes.length}
+                nodeCount={visibleNodes.length}
                 hiddenCount={hiddenCount}
                 focusRelatedOnly={focusRelatedOnly}
                 effectiveRelatedOnly={effectiveRelatedOnly}
@@ -358,25 +350,16 @@ export function GraphPage() {
               />
 
               <GraphCanvas
+                ref={graphCanvasRef}
                 layoutMode={layoutMode}
-                width={layoutResult.width}
-                height={layoutResult.height}
-                viewBox={viewBox}
-                nodes={layoutResult.visibleNodes}
+                nodes={visibleNodes}
                 edges={focusedGraph.edges}
-                positions={layoutResult.positions}
                 selectedNodeId={selectedNode?.id || null}
                 highlightedNodeIds={highlightedNodeIds}
-                spotlightLabelIds={spotlightLabelIds}
                 onSelectNode={handleSelectNode}
                 onFocusNode={handleFocusNode}
                 onOpenNote={openNote}
-                onWheel={handleWheel}
-                onMouseDown={handleMouseDown}
-                onMouseMove={handleMouseMove}
-                onMouseUp={handleMouseUp}
-                onMouseLeave={handleMouseLeave}
-                wasDraggingRef={wasDraggingRef}
+                onSyncZoom={setZoom}
               />
             </div>
 
