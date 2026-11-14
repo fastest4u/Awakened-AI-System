@@ -446,4 +446,62 @@ describe('Overview page', () => {
       });
     });
   }
+
+  it('renders causal triads as resolved historical lessons ("บทเรียนในอดีต (แก้แล้ว)") without destructive red Mistake badge', async () => {
+    const mockOverview = {
+      ok: true,
+      projectRoot: 'C:\\default',
+      projectName: 'default',
+      status: 'active',
+      audit: {
+        healthScore: 95,
+        counts: {
+          verifiedNotes: 3,
+          unpromotedCandidates: 0,
+          conflictedNotes: 0,
+          duplicateGroups: 0,
+        },
+        recommendations: [],
+        duplicateGroups: [],
+      },
+      analytics: {
+        byStatus: { verified: 3 },
+        byKind: { adr: 1, insight: 1, mistake: 1 },
+        activitySeries: [],
+      },
+      lifecycle: {
+        sessions: [],
+        latestCheckpoint: null,
+      },
+      causalTriads: [
+        {
+          anchorMistakeId: 'mis-resolved-1',
+          mistakeTitle: 'Bug in token refresh',
+          relatedAdrs: [{ recordId: 'adr-1', title: 'ADR Token Refresh Guard' }],
+          relatedInsights: [{ recordId: 'ins-1', title: 'Insight Safe Token Retry' }],
+          sharedContext: ['file:src/auth.ts'],
+        },
+      ],
+    };
+
+    renderApp({
+      initialUrl: '/overview',
+      fetchHandler: (url) => {
+        if (url.startsWith('/api/overview')) {
+          return new Response(JSON.stringify(mockOverview), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+      },
+    });
+
+    const resolvedBadge = await screen.findByText('บทเรียนในอดีต (แก้แล้ว)');
+    expect(resolvedBadge).toBeInTheDocument();
+    expect(screen.queryByText('Mistake')).toBeNull();
+    expect(
+      document.querySelector('[data-slot="badge"][data-variant="destructive"]'),
+    ).toBeNull();
+    expect(document.body.innerHTML).not.toMatch(/(hsl|rgb|oklch)\(var\(--/);
+  });
 });

@@ -1164,6 +1164,210 @@ test("Task 5: WebUI Usability & System Efficiency Upgrades (E1-E4 & U1-U5)", asy
         await cleanFixture.cleanup();
       }
     });
+
+    await t.test("5.5 Overview & Graph causalTriads exclude superseded/expired notes and missing repo files", async () => {
+      mkdirSync(join(fixture.projectRoot, "src"), { recursive: true });
+      writeFileSync(
+        join(fixture.projectRoot, "src", "live-module.ts"),
+        "export function liveHandler() { return true; }\n",
+        "utf8",
+      );
+
+      const triadSession = (await fixture.foundation.content.invoke("memory_sessionStart", {
+        taskSummary: "Seed active and superseded notes for causalTriad filtering regression",
+        contextArea: "webui causalTriads",
+        includeContext: false,
+      })) as { sessionId: string };
+
+      const obsoleteMistake = (await fixture.foundation.content.invoke("memory_writeMistake", {
+        sessionId: triadSession.sessionId,
+        title: "Obsolete Legacy MVC Mistake",
+        summary: "Bug in src/deleted-legacy.ts and src/live-module.ts (`liveHandler`).",
+        autoVerify: true,
+        verificationMethod: "test-verified",
+      })) as { recordId: string };
+
+      const activeMistake = (await fixture.foundation.content.invoke("memory_writeMistake", {
+        sessionId: triadSession.sessionId,
+        title: "Active Handler Mistake",
+        summary: "Race condition in src/live-module.ts and src/deleted-legacy.ts (`liveHandler`).",
+        autoVerify: true,
+        verificationMethod: "test-verified",
+      })) as { recordId: string };
+
+      const obsoleteAdr = (await fixture.foundation.content.invoke("memory_writeADR", {
+        sessionId: triadSession.sessionId,
+        title: "Obsolete Legacy MVC ADR",
+        summary: "Old architecture in src/live-module.ts (`liveHandler`).",
+        autoVerify: true,
+        verificationMethod: "test-verified",
+      })) as { recordId: string };
+
+      const activeAdr = (await fixture.foundation.content.invoke("memory_writeADR", {
+        sessionId: triadSession.sessionId,
+        title: "Active Handler Architecture ADR",
+        summary: "New architecture in src/live-module.ts replacing src/deleted-legacy.ts (`liveHandler`).",
+        autoVerify: true,
+        verificationMethod: "test-verified",
+      })) as { recordId: string };
+
+      const staleSessionA = (await fixture.foundation.content.invoke("memory_sessionStart", {
+        taskSummary: "Stale mistake session A",
+        contextArea: "legacy",
+        includeContext: false,
+      })) as { sessionId: string };
+      const staleOnlyMistake = (await fixture.foundation.content.invoke("memory_writeMistake", {
+        sessionId: staleSessionA.sessionId,
+        title: "Legacy Deleted-Only File Mistake",
+        summary: "Historical bug in src/deleted-only-a.ts (`staleOnlyFn`).",
+        autoVerify: true,
+        verificationMethod: "test-verified",
+      })) as { recordId: string };
+      await fixture.foundation.content.invoke("memory_sessionEnd", {
+        sessionId: staleSessionA.sessionId,
+        summary: "End stale A",
+        finalize: true,
+      });
+
+      const staleSessionB = (await fixture.foundation.content.invoke("memory_sessionStart", {
+        taskSummary: "Stale ADR session B",
+        contextArea: "legacy",
+        includeContext: false,
+      })) as { sessionId: string };
+      await fixture.foundation.content.invoke("memory_writeADR", {
+        sessionId: staleSessionB.sessionId,
+        title: "Legacy Deleted-Only File ADR",
+        summary: "Legacy design in src/deleted-only-a.ts.",
+        autoVerify: true,
+        verificationMethod: "test-verified",
+      });
+      await fixture.foundation.content.invoke("memory_sessionEnd", {
+        sessionId: staleSessionB.sessionId,
+        summary: "End stale B",
+        finalize: true,
+      });
+
+      await fixture.foundation.content.invoke("memory_supersede", {
+        sessionId: triadSession.sessionId,
+        recordId: obsoleteMistake.recordId,
+        supersedingRecordId: activeAdr.recordId,
+        reason: "Replaced by active ADR",
+      });
+      await fixture.foundation.content.invoke("memory_supersede", {
+        sessionId: triadSession.sessionId,
+        recordId: obsoleteAdr.recordId,
+        supersedingRecordId: activeAdr.recordId,
+        reason: "Replaced by active ADR",
+      });
+
+      await fixture.foundation.content.invoke("memory_sessionEnd", {
+        sessionId: triadSession.sessionId,
+        summary: "Finish causalTriads filtering test setup",
+        finalize: true,
+      });
+
+      const overviewRes = await fetch(
+        `${baseUrl}/api/overview?project=${encodeURIComponent(fixture.projectRoot)}`,
+      );
+      assert.equal(overviewRes.status, 200);
+      const overviewJson = (await overviewRes.json()) as {
+        ok: boolean;
+        causalTriads: Array<{
+          anchorMistakeId: string;
+          relatedAdrIds: string[];
+          sharedContext: string[];
+        }>;
+      };
+      assert.equal(overviewJson.ok, true);
+      assert.ok(
+        !overviewJson.causalTriads.some((c) => c.anchorMistakeId === obsoleteMistake.recordId),
+        "Superseded mistake must NOT appear in /api/overview causalTriads",
+      );
+      const activeTriad = overviewJson.causalTriads.find(
+        (c) => c.anchorMistakeId === activeMistake.recordId,
+      );
+      assert.ok(activeTriad, "Active mistake should produce a causal triad in /api/overview");
+      assert.ok(
+        activeTriad.relatedAdrIds.includes(activeAdr.recordId),
+        "Active triad should link activeAdr",
+      );
+      assert.ok(
+        !activeTriad.relatedAdrIds.includes(obsoleteAdr.recordId),
+        "Active triad must NOT link superseded ADR",
+      );
+      assert.ok(
+        activeTriad.sharedContext.includes("file:src/live-module.ts"),
+        "Active triad should retain existing repo file context",
+      );
+      assert.ok(
+        !activeTriad.sharedContext.includes("file:src/deleted-legacy.ts"),
+        "Active triad must NOT include deleted/nonexistent repo files in sharedContext",
+      );
+      assert.ok(
+        !overviewJson.causalTriads.some((c) => c.anchorMistakeId === staleOnlyMistake.recordId),
+        "Mistake & ADR sharing only a deleted repo file must NOT form a causal triad in /api/overview",
+      );
+
+      // Direct unit verification that buildMemoryKnowledgeGraph suppresses causal-triad for superseded inputs while keeping supersedes edges
+      const unitGraph = buildMemoryKnowledgeGraph([
+        {
+          recordId: "sup-mistake",
+          recordKind: "mistake",
+          title: "Superseded Legacy Mistake",
+          summary: "Old bug in src/live-module.ts (`liveHandler`).",
+          status: "superseded",
+        },
+        {
+          recordId: "cur-adr",
+          recordKind: "adr",
+          title: "Current Active ADR",
+          summary: "Current design in src/live-module.ts (`liveHandler`).",
+          status: "verified",
+          supersedesRecordIds: ["sup-mistake"],
+        },
+      ]);
+      assert.ok(
+        !unitGraph.edges.some(
+          (e) => e.relation === "causal-triad" && e.source === "note:sup-mistake",
+        ),
+        "buildMemoryKnowledgeGraph must NOT emit causal-triad edge from superseded note",
+      );
+      assert.ok(
+        unitGraph.edges.some(
+          (e) => e.relation === "supersedes" && e.source === "note:cur-adr" && e.target === "note:sup-mistake",
+        ),
+        "buildMemoryKnowledgeGraph must still emit supersedes edge from active note to superseded note",
+      );
+
+      const graphRes = await fetch(
+        `${baseUrl}/api/graph?project=${encodeURIComponent(fixture.projectRoot)}`,
+      );
+      assert.equal(graphRes.status, 200);
+      const graphJson = (await graphRes.json()) as {
+        ok: boolean;
+        causalTriads?: Array<{ anchorMistakeId: string }>;
+        nodes: Array<{ id: string; supersedesRecordIds?: string[] }>;
+        edges: Array<{ source: string; target: string; relation: string }>;
+      };
+      assert.equal(graphJson.ok, true);
+      assert.ok(
+        !graphJson.edges.some(
+          (e) =>
+            e.relation === "causal-triad" &&
+            (e.source === `note:${obsoleteMistake.recordId}` ||
+              e.target === `note:${obsoleteAdr.recordId}`),
+        ),
+        "Superseded notes must NOT emit causal-triad edges in /api/graph",
+      );
+      const activeAdrGraphNode = graphJson.nodes.find(
+        (n) => n.id === `note:${activeAdr.recordId}`,
+      );
+      assert.ok(
+        activeAdrGraphNode?.supersedesRecordIds?.includes(obsoleteAdr.recordId) &&
+          activeAdrGraphNode?.supersedesRecordIds?.includes(obsoleteMistake.recordId),
+        "/api/graph active ADR node must retain supersedesRecordIds lineage metadata",
+      );
+    });
   } finally {
     await serverHandle.close();
     await fixture.cleanup();

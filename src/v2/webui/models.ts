@@ -6,6 +6,7 @@ import {
   computeCausalTriads,
   isAcceptablePath,
   normalizeCandidatePath,
+  resolveContainedWorkspaceFile,
   type CausalTriadNoteInput,
 } from "../entity-extractor.js";
 import { V2_PUBLIC_TOOL_DEFINITIONS } from "../public-tools.js";
@@ -268,21 +269,37 @@ export class OverviewModel {
         },
       }),
     ]);
-    const notes = MemoryNoteModel.enrichRawItems(collectedRawItems.slice(0, 100), projectRoot);
+    const activeRawItems = collectedRawItems.filter(
+      (r) =>
+        !["retracted", "superseded", "expired", "erased-evidence"].includes(
+          String(r.status ?? ""),
+        ),
+    );
+    const filterMissingRepoFiles =
+      existsSync(join(projectRoot, "src")) || existsSync(join(projectRoot, "package.json"));
+    const notes = MemoryNoteModel.enrichRawItems(activeRawItems.slice(0, 100), projectRoot);
 
-    const triadInputs: CausalTriadNoteInput[] = notes.map((n) => ({
-      id: String(n.recordId ?? n.id ?? ""),
-      recordId: String(n.recordId ?? n.id ?? ""),
-      recordKind: String(n.recordKind ?? n.kind ?? "insight"),
-      title: String(n.title ?? ""),
-      sessionId: typeof n.sessionId === "string" ? n.sessionId : null,
-      filePaths: Array.isArray(n.filePaths)
+    const triadInputs: CausalTriadNoteInput[] = notes.map((n) => {
+      const rawPaths = Array.isArray(n.filePaths)
         ? n.filePaths.filter((p): p is string => typeof p === "string")
-        : [],
-      symbols: Array.isArray(n.symbols)
-        ? n.symbols.filter((s): s is string => typeof s === "string")
-        : [],
-    }));
+        : [];
+      const filePaths = filterMissingRepoFiles
+        ? rawPaths.filter(
+            (fp) => resolveContainedWorkspaceFile(projectRoot, fp, 16 * 1024 * 1024) !== null,
+          )
+        : rawPaths;
+      return {
+        id: String(n.recordId ?? n.id ?? ""),
+        recordId: String(n.recordId ?? n.id ?? ""),
+        recordKind: String(n.recordKind ?? n.kind ?? "insight"),
+        title: String(n.title ?? ""),
+        sessionId: typeof n.sessionId === "string" ? n.sessionId : null,
+        filePaths,
+        symbols: Array.isArray(n.symbols)
+          ? n.symbols.filter((s): s is string => typeof s === "string")
+          : [],
+      };
+    });
     const { causalTriads } = computeCausalTriads(
       triadInputs.map((note) => ({ note, score: 1 })),
       triadInputs,
@@ -294,13 +311,6 @@ export class OverviewModel {
       conflicted: audit.counts.conflictedNotes,
       stale: audit.counts.staleNotes,
     };
-
-    const activeRawItems = collectedRawItems.filter(
-      (r) =>
-        !["retracted", "superseded", "expired", "erased-evidence"].includes(
-          String(r.status ?? ""),
-        ),
-    );
 
     const byKind: Record<string, number> = {
       adr: 0,

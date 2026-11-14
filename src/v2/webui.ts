@@ -240,6 +240,7 @@ export function buildMemoryKnowledgeGraph(
   }
 
   interface ParsedNoteGraphEntry extends CausalTriadNoteInput {
+    readonly status: string;
     readonly normalizedKey: string;
     readonly wikilinks: readonly string[];
     readonly supersedesTargets: readonly string[];
@@ -347,6 +348,7 @@ export function buildMemoryKnowledgeGraph(
       id: recordId,
       recordId,
       recordKind: subkind,
+      status,
       title,
       sessionId: sessionId || null,
       filePaths,
@@ -435,9 +437,13 @@ export function buildMemoryKnowledgeGraph(
     }
   }
 
+  const activeParsedNotes = parsedNotes.filter(
+    (n) =>
+      !["retracted", "superseded", "expired", "erased-evidence"].includes(n.status),
+  );
   const { causalTriads } = computeCausalTriads(
-    parsedNotes.map((note) => ({ note, score: 1 })),
-    parsedNotes,
+    activeParsedNotes.map((note) => ({ note, score: 1 })),
+    activeParsedNotes,
   );
   for (const triad of causalTriads) {
     const mistakeNodeId = `note:${triad.anchorMistakeId}`;

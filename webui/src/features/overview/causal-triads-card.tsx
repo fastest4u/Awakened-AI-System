@@ -8,8 +8,8 @@ import {
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import {
-  GitBranch,
-  AlertTriangle,
+  ShieldCheck,
+  CheckCircle2,
   Share2,
   Landmark,
   Lightbulb,
@@ -56,14 +56,14 @@ export function CausalTriadsCard({ causalTriads }: CausalTriadsCardProps) {
     <Card className="w-full">
       <CardHeader>
         <CardTitle className="flex items-center gap-2 text-base">
-          <GitBranch className="size-4.5 text-[#ef4444]" />
+          <ShieldCheck className="size-4.5 text-[#10b981]" />
           <span>
-            เส้นทางบทเรียนและทางแก้ (Causal Triads: Mistake ➔ Insight / ADR)
+            เส้นทางบทเรียนและทางแก้ (Causal Triads: บทเรียนในอดีต ➔ วิธีแก้ถาวร)
           </span>
         </CardTitle>
         <CardDescription>
-          เชื่อมโยงข้อผิดพลาดเข้ากับบทเรียนและการตัดสินใจสถาปัตยกรรมที่แก้ไขจุดเดียวกันอัตโนมัติ
-          (IDF-Weighted)
+          บันทึกข้อผิดพลาดในอดีตที่แก้ไขเสร็จแล้ว เชื่อมโยงกับบทเรียน (Insight) และสถาปัตยกรรม
+          (ADR) อัตโนมัติเพื่อป้องกันปัญหาซ้ำ (IDF-Weighted)
         </CardDescription>
       </CardHeader>
       <CardContent>
@@ -99,12 +99,15 @@ export function CausalTriadsCard({ causalTriads }: CausalTriadsCardProps) {
             return (
               <div
                 key={triad.anchorMistakeId}
-                className="p-3.5 rounded-xl border border-destructive/30 bg-card/50 flex flex-col gap-2.5 transition-colors"
+                className="p-3.5 rounded-xl border border-border/80 bg-card/60 hover:border-[#10b981]/40 flex flex-col gap-2.5 transition-colors"
               >
                 <div className="flex items-center justify-between gap-2">
-                  <Badge variant="destructive" className="gap-1">
-                    <AlertTriangle className="size-3" />
-                    <span>Mistake</span>
+                  <Badge
+                    variant="outline"
+                    className="gap-1 border-[#10b981]/35 bg-[#10b981]/10 text-[#059669] dark:text-[#34d399]"
+                  >
+                    <CheckCircle2 className="size-3" />
+                    <span>บทเรียนในอดีต (แก้แล้ว)</span>
                   </Badge>
                   <div className="flex items-center gap-1.5">
                     <Button
