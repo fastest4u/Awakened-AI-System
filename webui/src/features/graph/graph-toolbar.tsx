@@ -21,6 +21,9 @@ export interface GraphToolbarProps {
   sessionFilter: string;
   onSessionChange: (value: string) => void;
   sessionNodesList: GraphNode[];
+  noteNodesList?: GraphNode[];
+  selectedNodeId?: string | null;
+  onSelectNoteNode?: (nodeId: string) => void;
   kindFilter: string;
   onKindChange: (kind: string) => void;
   totalFilteredCount: number;
@@ -41,11 +44,18 @@ export function GraphToolbar({
   sessionFilter,
   onSessionChange,
   sessionNodesList,
+  noteNodesList,
+  selectedNodeId,
+  onSelectNoteNode,
   kindFilter,
   onKindChange,
   totalFilteredCount,
   stats,
 }: GraphToolbarProps) {
+  const selectedNoteValue =
+    selectedNodeId && noteNodesList?.some((nn) => nn.id === selectedNodeId)
+      ? selectedNodeId
+      : '';
   const activeKind = kindFilter || 'all';
 
   return (
@@ -117,6 +127,25 @@ export function GraphToolbar({
               );
             })}
           </select>
+
+          {noteNodesList && noteNodesList.length > 0 && onSelectNoteNode && (
+            <select
+              id="graph-note-select"
+              value={selectedNoteValue}
+              onChange={(e) => {
+                if (e.target.value) onSelectNoteNode(e.target.value);
+              }}
+              aria-label="เลือกเรื่องที่สนใจเพื่อโฟกัส"
+              className="h-8 max-w-[240px] truncate rounded-md border border-input bg-card px-2.5 py-1 text-xs text-foreground shadow-xs transition-colors focus-visible:outline-hidden focus-visible:ring-1 focus-visible:ring-ring cursor-pointer"
+            >
+              <option value="">เลือกเรื่องที่สนใจ ({noteNodesList.length})</option>
+              {noteNodesList.map((nn) => (
+                <option key={nn.id} value={nn.id}>
+                  {shortNodeDisplayLabel(nn)}
+                </option>
+              ))}
+            </select>
+          )}
         </div>
 
         <div className="flex items-center gap-1.5 flex-wrap shrink-0">

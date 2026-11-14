@@ -6,6 +6,7 @@ import {
   computeOrbitalLayout,
   pickSpotlightLabels,
   findMatchingNode,
+  selectFocusedNodesAndEdges,
 } from './graph-layout';
 import type { GraphNode, GraphEdge, GraphResponse } from '@/api/types';
 
@@ -223,5 +224,92 @@ describe('graph-layout', () => {
     const spotlights = pickSpotlightLabels(nodes, positions, 'session:0', highlighted);
     expect(spotlights.size).toBeLessThanOrEqual(10);
     expect(spotlights.has('session:0')).toBe(false); // excludes selected
+  });
+
+  it('pickSpotlightLabels excludes unrelated nodes when highlighted set is non-empty', () => {
+    const nodes: GraphNode[] = [
+      { id: 'note:center', label: 'Center Note', kind: 'note', sessionId: 's1' },
+      { id: 'file:a.ts', label: 'src/a.ts', kind: 'file' },
+      { id: 'file:b.ts', label: 'src/b.ts', kind: 'file' },
+      { id: 'file:c.ts', label: 'src/c.ts', kind: 'file' },
+      { id: 'file:d.ts', label: 'src/d.ts', kind: 'file' },
+      { id: 'symbol:relSym', label: 'relSym', kind: 'symbol' },
+      { id: 'note:unrelated', label: 'Unrelated Note', kind: 'note', sessionId: 's2' },
+      { id: 'file:unrelated.ts', label: 'src/unrelated.ts', kind: 'file' },
+      { id: 'symbol:unrelatedSym', label: 'unrelatedSym', kind: 'symbol' },
+      { id: 'session:s2', label: 'Other Session', kind: 'session', sessionId: 's2' },
+    ];
+    const highlighted = new Set([
+      'note:center',
+      'file:a.ts',
+      'file:b.ts',
+      'file:c.ts',
+      'file:d.ts',
+      'symbol:relSym',
+    ]);
+    const layout = computeOrbitalLayout(nodes, highlighted, 'note:center');
+    const spotlights = pickSpotlightLabels(
+      nodes,
+      layout.positions,
+      'note:center',
+      highlighted,
+    );
+
+    expect(spotlights.has('note:center')).toBe(false);
+    expect(spotlights.has('file:a.ts')).toBe(true);
+    expect(spotlights.has('file:d.ts')).toBe(true);
+    expect(spotlights.has('symbol:relSym')).toBe(true);
+    expect(spotlights.has('note:unrelated')).toBe(false);
+    expect(spotlights.has('file:unrelated.ts')).toBe(false);
+    expect(spotlights.has('symbol:unrelatedSym')).toBe(false);
+    expect(spotlights.has('session:s2')).toBe(false);
+  });
+
+  it('selectFocusedNodesAndEdges keeps only highlighted nodes and internal edges when focusRelatedOnly is true', () => {
+    const nodes: GraphNode[] = [
+      { id: 'session:s1', label: 'Session 1', kind: 'session', sessionId: 's1' },
+      { id: 'note:n1', label: 'Note 1', kind: 'note', sessionId: 's1' },
+      { id: 'file:f1', label: 'src/f1.ts', kind: 'file' },
+      { id: 'note:n2', label: 'Unrelated Note', kind: 'note', sessionId: 's2' },
+      { id: 'file:f2', label: 'src/f2.ts', kind: 'file' },
+    ];
+    const edges: GraphEdge[] = [
+      { source: 'note:n1', target: 'session:s1', relation: 'created-in-session' },
+      { source: 'note:n1', target: 'file:f1', relation: 'touches-file' },
+      { source: 'note:n2', target: 'file:f2', relation: 'touches-file' },
+    ];
+    const highlighted = new Set(['session:s1', 'note:n1', 'file:f1']);
+
+    const focused = selectFocusedNodesAndEdges({ nodes, edges }, highlighted, true);
+    expect(focused.nodes.map((n) => n.id)).toEqual([
+      'session:s1',
+      'note:n1',
+      'file:f1',
+    ]);
+    expect(focused.edges).toHaveLength(2);
+
+    const unfocused = selectFocusedNodesAndEdges({ nodes, edges }, highlighted, false);
+    expect(unfocused.nodes).toHaveLength(5);
+    expect(unfocused.edges).toHaveLength(3);
+  });
+
+  it('computeNeighborhood for note traces defines-symbol from touched files when direct mentions-symbol count is 0', () => {
+    const nodes: GraphNode[] = [
+      { id: 'session:s1', label: 'Session 1', kind: 'session', sessionId: 's1' },
+      { id: 'note:n1', label: 'Note 1', kind: 'note', sessionId: 's1' },
+      { id: 'file:f1', label: 'src/f1.ts', kind: 'file' },
+      { id: 'symbol:symA', label: 'symA', kind: 'symbol' },
+      { id: 'symbol:symOther', label: 'symOther', kind: 'symbol' },
+    ];
+    const edges: GraphEdge[] = [
+      { source: 'note:n1', target: 'file:f1', relation: 'touches-file' },
+      { source: 'file:f1', target: 'symbol:symA', relation: 'defines-symbol' },
+    ];
+
+    const neighborhood = computeNeighborhood('note:n1', edges, nodes);
+    expect(neighborhood.has('session:s1')).toBe(true);
+    expect(neighborhood.has('file:f1')).toBe(true);
+    expect(neighborhood.has('symbol:symA')).toBe(true);
+    expect(neighborhood.has('symbol:symOther')).toBe(false);
   });
 });

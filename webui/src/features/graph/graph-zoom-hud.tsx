@@ -1,9 +1,12 @@
-import { Minus, Plus, Crosshair } from 'lucide-react';
+import { Minus, Plus, Crosshair, Eye, Focus } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 
 export interface GraphZoomHudProps {
   nodeCount: number;
   hiddenCount: number;
+  focusRelatedOnly?: boolean;
+  effectiveRelatedOnly?: boolean;
+  onToggleFocusRelatedOnly?: () => void;
   zoom: number;
   onZoomIn: () => void;
   onZoomOut: () => void;
@@ -14,6 +17,9 @@ export interface GraphZoomHudProps {
 export function GraphZoomHud({
   nodeCount,
   hiddenCount,
+  focusRelatedOnly = false,
+  effectiveRelatedOnly = false,
+  onToggleFocusRelatedOnly,
   zoom,
   onZoomIn,
   onZoomOut,
@@ -23,11 +29,15 @@ export function GraphZoomHud({
   return (
     <div className="flex items-center justify-between gap-2 flex-wrap mb-2 px-2.5 py-1.5 rounded-lg bg-card border border-border text-xs">
       <span className="text-muted-foreground truncate">
-        แสดง {nodeCount} โหนดสำคัญ
+        {effectiveRelatedOnly
+          ? `แสดงเฉพาะ ${nodeCount} โหนดที่เกี่ยวข้อง`
+          : `แสดง ${nodeCount} โหนดสำคัญ`}
         {hiddenCount > 0 && (
           <span className="hidden sm:inline">
             {' '}
-            (ซ่อนโหนดรอง {hiddenCount} รายการเพื่อความอ่านง่าย — ใช้ช่องค้นหาเพื่อเจาะจง)
+            {effectiveRelatedOnly
+              ? `(ซ่อนโหนดที่ไม่เกี่ยวข้อง ${hiddenCount} รายการเพื่อให้อ่านง่าย)`
+              : `(ซ่อนโหนดรอง ${hiddenCount} รายการเพื่อความอ่านง่าย — ใช้ช่องค้นหาเพื่อเจาะจง)`}
           </span>
         )}
       </span>
@@ -63,6 +73,33 @@ export function GraphZoomHud({
         >
           <Plus className="size-3" />
         </Button>
+        {onToggleFocusRelatedOnly && (
+          <Button
+            id="graph-focus-related-toggle"
+            type="button"
+            size="sm"
+            variant={focusRelatedOnly ? 'secondary' : 'outline'}
+            onClick={onToggleFocusRelatedOnly}
+            title={
+              focusRelatedOnly
+                ? 'แสดงโหนดทั้งหมดในกราฟ'
+                : 'ซ่อนโหนดที่ไม่เกี่ยวข้อง แสดงเฉพาะเครือข่ายของจุดที่เลือก'
+            }
+            className="h-7 gap-1 px-2.5 text-[11px]"
+          >
+            {focusRelatedOnly ? (
+              <>
+                <Eye className="size-3" />
+                <span>แสดงทั้งหมด</span>
+              </>
+            ) : (
+              <>
+                <Focus className="size-3" />
+                <span>เฉพาะที่เกี่ยวข้อง</span>
+              </>
+            )}
+          </Button>
+        )}
         <Button
           type="button"
           size="sm"

@@ -14,6 +14,7 @@ import {
   computeOrbitalLayout,
   pickSpotlightLabels,
   findMatchingNode,
+  selectFocusedNodesAndEdges,
 } from '@/lib/graph-layout';
 import type { GraphNode } from '@/api/types';
 import { usePanZoom } from './use-pan-zoom';
@@ -29,6 +30,7 @@ export function GraphPage() {
   const search = useSearch({ strict: false }) as Record<string, string | undefined>;
 
   const [layoutMode, setLayoutMode] = useState<'flow' | 'orbital'>('flow');
+  const [focusRelatedOnly, setFocusRelatedOnly] = useState<boolean>(true);
 
   // Search input state with debouncing and safe external URL sync guard
   const urlQ = search?.q || '';
@@ -149,6 +151,10 @@ export function GraphPage() {
     () => rawNodes.filter((n) => n.kind === 'session'),
     [rawNodes],
   );
+  const noteNodesList = useMemo(
+    () => rawNodes.filter((n) => n.kind === 'note'),
+    [rawNodes],
+  );
 
   const effectiveQuery = isUserTypingRef.current
     ? debouncedSearch.trim()
@@ -191,27 +197,42 @@ export function GraphPage() {
     return computeNeighborhood(selectedNode?.id, rawEdges, rawNodes);
   }, [selectedNode?.id, rawEdges, rawNodes]);
 
+  const effectiveRelatedOnly = Boolean(
+    focusRelatedOnly &&
+      !effectiveQuery &&
+      kindFilter === 'all' &&
+      highlightedNodeIds.size > 0,
+  );
+
+  const focusedGraph = useMemo(() => {
+    return selectFocusedNodesAndEdges(
+      filtered,
+      highlightedNodeIds,
+      effectiveRelatedOnly,
+    );
+  }, [filtered, highlightedNodeIds, effectiveRelatedOnly]);
+
   // Layout computation
   const layoutResult = useMemo(() => {
     if (layoutMode === 'flow') {
-      return computeFlowLayout(filtered.nodes, highlightedNodeIds);
+      return computeFlowLayout(focusedGraph.nodes, highlightedNodeIds);
     }
     return computeOrbitalLayout(
-      filtered.nodes,
+      focusedGraph.nodes,
       highlightedNodeIds,
       selectedNode?.id,
     );
-  }, [layoutMode, filtered.nodes, highlightedNodeIds, selectedNode?.id]);
+  }, [layoutMode, focusedGraph.nodes, highlightedNodeIds, selectedNode?.id]);
 
   // Spotlight labels in orbital mode
   const spotlightLabelIds = useMemo(() => {
     return pickSpotlightLabels(
-      filtered.nodes,
+      focusedGraph.nodes,
       layoutResult.positions,
       selectedNode?.id,
       highlightedNodeIds,
     );
-  }, [filtered.nodes, layoutResult.positions, selectedNode?.id, highlightedNodeIds]);
+  }, [focusedGraph.nodes, layoutResult.positions, selectedNode?.id, highlightedNodeIds]);
 
   // Pan / Zoom hook
   const {
@@ -308,6 +329,9 @@ export function GraphPage() {
           sessionFilter={sessionFilter}
           onSessionChange={handleSessionChange}
           sessionNodesList={sessionNodesList}
+          noteNodesList={noteNodesList}
+          selectedNodeId={selectedNode?.id || null}
+          onSelectNoteNode={handleSelectNode}
           kindFilter={kindFilter}
           onKindChange={handleKindChange}
           totalFilteredCount={filtered.nodes.length}
@@ -321,6 +345,11 @@ export function GraphPage() {
               <GraphZoomHud
                 nodeCount={layoutResult.visibleNodes.length}
                 hiddenCount={hiddenCount}
+                focusRelatedOnly={focusRelatedOnly}
+                effectiveRelatedOnly={effectiveRelatedOnly}
+                onToggleFocusRelatedOnly={() =>
+                  setFocusRelatedOnly((prev) => !prev)
+                }
                 zoom={zoom}
                 onZoomIn={zoomIn}
                 onZoomOut={zoomOut}
@@ -334,7 +363,7 @@ export function GraphPage() {
                 height={layoutResult.height}
                 viewBox={viewBox}
                 nodes={layoutResult.visibleNodes}
-                edges={filtered.edges}
+                edges={focusedGraph.edges}
                 positions={layoutResult.positions}
                 selectedNodeId={selectedNode?.id || null}
                 highlightedNodeIds={highlightedNodeIds}

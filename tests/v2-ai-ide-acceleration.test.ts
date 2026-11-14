@@ -1179,6 +1179,30 @@ test("10. Security Hardening (F1): Workspace file containment blocks ../ travers
   }
 });
 
+test("10b. Entity Extractor: recognizes webui/ paths and filters CSS/CLI keywords and git commit hashes from symbols", () => {
+  const extracted = extractMemoryEntities(
+    "Fixed `webui/src/features/graph/graph-canvas.tsx` and `GraphCanvas` pointerEvents; commit `fb56522` with `fill` `stroke` `none` `typecheck`.",
+  );
+  assert.ok(
+    extracted.filePaths.includes("webui/src/features/graph/graph-canvas.tsx"),
+    `Expected webui file path to be extracted, got: ${JSON.stringify(extracted.filePaths)}`,
+  );
+  assert.ok(
+    extracted.symbols.includes("GraphCanvas"),
+    `Expected GraphCanvas symbol, got: ${JSON.stringify(extracted.symbols)}`,
+  );
+  assert.ok(
+    extracted.symbols.includes("pointerEvents"),
+    `Expected pointerEvents symbol, got: ${JSON.stringify(extracted.symbols)}`,
+  );
+  for (const noise of ["fb56522", "fill", "stroke", "none", "typecheck"]) {
+    assert.ok(
+      !extracted.symbols.includes(noise),
+      `Did not expect noise symbol "${noise}" in ${JSON.stringify(extracted.symbols)}`,
+    );
+  }
+});
+
 test("11. Projection Scope Rotation Atomicity (R2-1): refuses rotation while reader lease is active and recovers cleanly from mid-retirement crash without wedging manifest", async () => {
   const fixture = await createActiveStoreFixture("pm-v2-rot-atomic-");
   try {

@@ -329,10 +329,42 @@ const STOP_SYMBOLS = new Set([
   "Rationale",
   "Impact",
   "Verification",
+  "none",
+  "auto",
+  "inherit",
+  "initial",
+  "unset",
+  "solid",
+  "hidden",
+  "visible",
+  "block",
+  "inline",
+  "flex",
+  "grid",
+  "fill",
+  "stroke",
+  "color",
+  "width",
+  "height",
+  "left",
+  "right",
+  "top",
+  "bottom",
+  "center",
+  "middle",
+  "start",
+  "end",
+  "normal",
+  "bold",
+  "typecheck",
+  "lint",
+  "build",
+  "test",
+  "dev",
 ]);
 
 const WORKSPACE_PATH_RE =
-  /(?:^|[\s`'":(\[<])((?:\.[\\/])?(?:(?:src|tests|scripts|docs|app|routes|config|packages|lib|\.github|\.agents|\.cursor|\.windsurf|\.antigravity|\.claude|\.vscode|\.codex|\.zed|\.superpowers|dist|build|out|coverage)[\\/][A-Za-z0-9_./\\-]+\.[A-Za-z0-9]{1,10}|[A-Za-z0-9_.-]+\.(?:ts|tsx|js|jsx|mjs|cjs|json|md|mdc|sql|sqlite|py|php|go|rs|java|toml|yaml|yml|css|html|sh|ps1)))(?=$|[\s`'");,\]>!?]|:\d|\.(?:\s|$))/gu;
+  /(?:^|[\s`'":(\[<])((?:\.[\\/])?(?:(?:src|tests|scripts|docs|app|routes|config|packages|lib|webui|public|client|server|frontend|backend|\.github|\.agents|\.cursor|\.windsurf|\.antigravity|\.claude|\.vscode|\.codex|\.zed|\.superpowers|dist|build|out|coverage)[\\/][A-Za-z0-9_./\\-]+\.[A-Za-z0-9]{1,10}|[A-Za-z0-9_.-]+\.(?:ts|tsx|js|jsx|mjs|cjs|json|md|mdc|sql|sqlite|py|php|go|rs|java|toml|yaml|yml|css|html|sh|ps1)))(?=$|[\s`'");,\]>!?]|:\d|\.(?:\s|$))/gu;
 
 export function normalizeCandidatePath(raw: string): string {
   return raw
@@ -503,6 +535,9 @@ function isAcceptableSymbol(sym: string, filePathBasenames: ReadonlySet<string>)
     return false;
   }
   if (/^\d/u.test(sym)) {
+    return false;
+  }
+  if (/^[0-9a-f]{7,40}$/u.test(sym) && /\d/u.test(sym)) {
     return false;
   }
   if (sym.startsWith("#")) {

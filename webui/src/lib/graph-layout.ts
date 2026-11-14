@@ -113,9 +113,32 @@ export function computeNeighborhood(
     if (sessId) {
       highlighted.add(`session:${sessId}`);
     }
+    const touchedFiles = new Set<string>();
+    let directSymbolCount = 0;
     for (const e of edges) {
       if (e.target === selectedId) highlighted.add(e.source);
-      if (e.source === selectedId) highlighted.add(e.target);
+      if (e.source === selectedId) {
+        highlighted.add(e.target);
+        if (e.relation === 'touches-file') {
+          touchedFiles.add(e.target);
+        } else if (e.relation === 'mentions-symbol') {
+          directSymbolCount += 1;
+        }
+      }
+    }
+    if (directSymbolCount === 0 && touchedFiles.size > 0) {
+      let addedFromFiles = 0;
+      for (const e of edges) {
+        if (
+          e.relation === 'defines-symbol' &&
+          touchedFiles.has(e.source) &&
+          !highlighted.has(e.target)
+        ) {
+          highlighted.add(e.target);
+          addedFromFiles += 1;
+          if (addedFromFiles >= 12) break;
+        }
+      }
     }
   } else if (kind === 'session') {
     const noteIds = new Set<string>();
@@ -260,6 +283,32 @@ export function filterGraph(
   );
 
   return { nodes: filtered, edges };
+}
+
+/**
+ * In Focused Related-Only mode, restricts rendered nodes and edges strictly to
+ * the selected neighborhood (when non-empty) to eliminate unrelated clutter.
+ */
+export function selectFocusedNodesAndEdges(
+  filtered: {
+    readonly nodes: readonly GraphNode[];
+    readonly edges: readonly GraphEdge[];
+  },
+  highlighted: ReadonlySet<string>,
+  focusRelatedOnly: boolean,
+): { nodes: GraphNode[]; edges: GraphEdge[] } {
+  if (!focusRelatedOnly || highlighted.size === 0) {
+    return {
+      nodes: [...filtered.nodes],
+      edges: [...filtered.edges],
+    };
+  }
+  const nodes = filtered.nodes.filter((n) => highlighted.has(n.id));
+  const allowedIds = new Set(nodes.map((n) => n.id));
+  const edges = filtered.edges.filter(
+    (e) => allowedIds.has(e.source) && allowedIds.has(e.target),
+  );
+  return { nodes, edges };
 }
 
 /**
@@ -433,20 +482,20 @@ export function pickSpotlightLabels(
   const visible = nodes.filter(
     (n) => positions.has(n.id) && n.id !== selectedId,
   );
+  const onlyHighlighted = highlighted.size > 0;
 
   const pickForKind = (kind: GraphNode['kind'], cap: number) => {
     const list = visible.filter((n) => n.kind === kind);
-    const hi = list.filter((n) => highlighted.has(n.id)).slice(0, cap);
-    const rest = list
-      .filter((n) => !highlighted.has(n.id))
-      .slice(0, Math.max(0, cap - hi.length));
-    return [...hi, ...rest];
+    if (onlyHighlighted) {
+      return list.filter((n) => highlighted.has(n.id)).slice(0, cap);
+    }
+    return list.slice(0, cap);
   };
 
   const sessions = pickForKind('session', 2);
   const notes = pickForKind('note', 3);
-  const files = pickForKind('file', 3);
-  const symbols = pickForKind('symbol', 3);
+  const files = pickForKind('file', 5);
+  const symbols = pickForKind('symbol', 8);
 
   const combined = [...sessions, ...notes, ...files, ...symbols].slice(0, 10);
   return new Set(combined.map((n) => n.id));

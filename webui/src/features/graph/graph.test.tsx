@@ -457,4 +457,264 @@ describe('Knowledge Graph page', () => {
       /(hsl|rgb|oklch)\(var\(--/,
     );
   });
+
+  it('defaults to focused related-only mode hiding unrelated nodes and toggles back with #graph-focus-related-toggle', async () => {
+    const multiClusterGraph: GraphResponse = {
+      ok: true,
+      projectRoot: 'C:\\default',
+      nodes: [
+        {
+          id: 'session:s1',
+          label: 'Session Primary',
+          kind: 'session',
+          sessionId: 's1',
+          currentTask: 'Primary Task',
+        },
+        {
+          id: 'note:primary-1',
+          label: 'Primary Note',
+          kind: 'note',
+          recordId: 'primary-1',
+          sessionId: 's1',
+          subkind: 'adr',
+          status: 'verified',
+        },
+        {
+          id: 'file:src/primary.ts',
+          label: 'src/primary.ts',
+          kind: 'file',
+        },
+        {
+          id: 'symbol:primarySym',
+          label: 'primarySym',
+          kind: 'symbol',
+        },
+        {
+          id: 'session:s2',
+          label: 'Session Unrelated',
+          kind: 'session',
+          sessionId: 's2',
+          currentTask: 'Unrelated Task',
+        },
+        {
+          id: 'note:unrelated-2',
+          label: 'Unrelated Note',
+          kind: 'note',
+          recordId: 'unrelated-2',
+          sessionId: 's2',
+          subkind: 'insight',
+          status: 'verified',
+        },
+        {
+          id: 'file:src/unrelated.ts',
+          label: 'src/unrelated.ts',
+          kind: 'file',
+        },
+        {
+          id: 'symbol:unrelatedSym',
+          label: 'unrelatedSym',
+          kind: 'symbol',
+        },
+      ],
+      edges: [
+        { source: 'note:primary-1', target: 'session:s1', relation: 'created-in-session' },
+        { source: 'note:primary-1', target: 'file:src/primary.ts', relation: 'touches-file' },
+        { source: 'note:primary-1', target: 'symbol:primarySym', relation: 'mentions-symbol' },
+        { source: 'note:unrelated-2', target: 'session:s2', relation: 'created-in-session' },
+        { source: 'note:unrelated-2', target: 'file:src/unrelated.ts', relation: 'touches-file' },
+        { source: 'note:unrelated-2', target: 'symbol:unrelatedSym', relation: 'mentions-symbol' },
+      ],
+      stats: {
+        sessionNodes: 2,
+        noteNodes: 2,
+        fileNodes: 2,
+        symbolNodes: 2,
+        edgeCount: 6,
+      },
+    };
+
+    renderApp({
+      initialUrl: '/graph?node=note:primary-1',
+      fetchHandler: (url) => {
+        if (url.startsWith('/api/graph')) {
+          return new Response(JSON.stringify(multiClusterGraph), {
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+        return new Response(JSON.stringify({ ok: true }), { status: 200 });
+      },
+    });
+
+    await waitFor(() => {
+      expect(document.querySelector('[data-node-id="note:primary-1"]')).toBeTruthy();
+    });
+
+    // Focused mode is on by default: unrelated nodes are hidden
+    expect(document.querySelector('[data-node-id="file:src/primary.ts"]')).toBeTruthy();
+    expect(document.querySelector('[data-node-id="symbol:primarySym"]')).toBeTruthy();
+    expect(document.querySelector('[data-node-id="note:unrelated-2"]')).toBeNull();
+    expect(document.querySelector('[data-node-id="file:src/unrelated.ts"]')).toBeNull();
+    expect(document.querySelector('[data-node-id="symbol:unrelatedSym"]')).toBeNull();
+
+    // Toggle to show all nodes
+    const toggleBtn = document.querySelector('#graph-focus-related-toggle') as HTMLButtonElement;
+    expect(toggleBtn).toBeTruthy();
+    expect(toggleBtn.textContent).toMatch(/แสดงทั้งหมด/);
+    fireEvent.click(toggleBtn);
+
+    await waitFor(() => {
+      expect(document.querySelector('[data-node-id="note:unrelated-2"]')).toBeTruthy();
+      expect(document.querySelector('[data-node-id="file:src/unrelated.ts"]')).toBeTruthy();
+      expect(document.querySelector('[data-node-id="symbol:unrelatedSym"]')).toBeTruthy();
+      expect(toggleBtn.textContent).toMatch(/เฉพาะที่เกี่ยวข้อง/);
+    });
+  });
+
+  it('switches focused note cluster via #graph-note-select', async () => {
+    const multiNoteGraph: GraphResponse = {
+      ok: true,
+      projectRoot: 'C:\\default',
+      nodes: [
+        {
+          id: 'note:first',
+          label: 'First Topic',
+          kind: 'note',
+          recordId: 'first',
+          sessionId: 's1',
+          subkind: 'adr',
+        },
+        {
+          id: 'file:src/first.ts',
+          label: 'src/first.ts',
+          kind: 'file',
+        },
+        {
+          id: 'note:second',
+          label: 'Second Topic',
+          kind: 'note',
+          recordId: 'second',
+          sessionId: 's2',
+          subkind: 'mistake',
+        },
+        {
+          id: 'file:src/second.ts',
+          label: 'src/second.ts',
+          kind: 'file',
+        },
+      ],
+      edges: [
+        { source: 'note:first', target: 'file:src/first.ts', relation: 'touches-file' },
+        { source: 'note:second', target: 'file:src/second.ts', relation: 'touches-file' },
+      ],
+      stats: {
+        sessionNodes: 0,
+        noteNodes: 2,
+        fileNodes: 2,
+        symbolNodes: 0,
+        edgeCount: 2,
+      },
+    };
+
+    const { router } = renderApp({
+      initialUrl: '/graph?node=note:first',
+      fetchHandler: (url) => {
+        if (url.startsWith('/api/graph')) {
+          return new Response(JSON.stringify(multiNoteGraph), {
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+        return new Response(JSON.stringify({ ok: true }), { status: 200 });
+      },
+    });
+
+    await waitFor(() => {
+      expect(document.querySelector('[data-node-id="file:src/first.ts"]')).toBeTruthy();
+    });
+
+    const noteSelect = document.querySelector('#graph-note-select') as HTMLSelectElement;
+    expect(noteSelect).toBeTruthy();
+    fireEvent.change(noteSelect, { target: { value: 'note:second' } });
+
+    await waitFor(() => {
+      expect(router.state.location.searchStr).toContain('note%3Asecond');
+      expect(document.querySelector('[data-node-id="note:second"]')).toBeTruthy();
+      expect(document.querySelector('[data-node-id="file:src/second.ts"]')).toBeTruthy();
+      expect(document.querySelector('[data-node-id="file:src/first.ts"]')).toBeNull();
+    });
+  });
+
+  it('centers Orbital bottom-pole node labels beneath their node with text-anchor="middle"', async () => {
+    const orbitalPoleGraph: GraphResponse = {
+      ok: true,
+      projectRoot: 'C:\\default',
+      nodes: [
+        { id: 'note:center', label: 'Center Note', kind: 'note', recordId: 'center', sessionId: 's1' },
+        { id: 'symbol:sym1', label: 'sym1', kind: 'symbol' },
+        { id: 'symbol:sym2', label: 'sym2', kind: 'symbol' },
+        { id: 'symbol:sym3', label: 'sym3', kind: 'symbol' },
+        { id: 'symbol:sym4', label: 'sym4', kind: 'symbol' },
+        { id: 'symbol:sym5', label: 'sym5', kind: 'symbol' },
+        { id: 'symbol:sym6', label: 'sym6', kind: 'symbol' },
+        { id: 'symbol:sym7', label: 'sym7', kind: 'symbol' },
+      ],
+      edges: [
+        { source: 'note:center', target: 'symbol:sym1', relation: 'mentions-symbol' },
+        { source: 'note:center', target: 'symbol:sym2', relation: 'mentions-symbol' },
+        { source: 'note:center', target: 'symbol:sym3', relation: 'mentions-symbol' },
+        { source: 'note:center', target: 'symbol:sym4', relation: 'mentions-symbol' },
+        { source: 'note:center', target: 'symbol:sym5', relation: 'mentions-symbol' },
+        { source: 'note:center', target: 'symbol:sym6', relation: 'mentions-symbol' },
+        { source: 'note:center', target: 'symbol:sym7', relation: 'mentions-symbol' },
+      ],
+      stats: {
+        sessionNodes: 0,
+        noteNodes: 1,
+        fileNodes: 0,
+        symbolNodes: 7,
+        edgeCount: 7,
+      },
+    };
+
+    renderApp({
+      initialUrl: '/graph?node=note:center',
+      fetchHandler: (url) => {
+        if (url.startsWith('/api/graph')) {
+          return new Response(JSON.stringify(orbitalPoleGraph), {
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+        return new Response(JSON.stringify({ ok: true }), { status: 200 });
+      },
+    });
+
+    const orbitalBtn = await waitFor(() =>
+      screen.getByRole('button', { name: /มุมมองเครือข่ายวงโคจร/i }),
+    );
+    fireEvent.click(orbitalBtn);
+
+    await waitFor(() => {
+      const svg = document.querySelector('#knowledge-graph-canvas') as SVGSVGElement;
+      const viewBoxParts = (svg.getAttribute('viewBox') || '0 0 880 560').split(/\s+/).map(Number);
+      const cx = viewBoxParts[2] / 2;
+      const cy = viewBoxParts[3] / 2;
+
+      const nodeGroups = Array.from(svg.querySelectorAll('#graph-nodes > g[data-node-id]'));
+      const bottomPoleLabels: Element[] = [];
+      for (const g of nodeGroups) {
+        if (g.getAttribute('data-node-id') === 'note:center') continue;
+        const circle = g.querySelector('circle');
+        const label = g.querySelector('text');
+        if (!circle || !label) continue;
+        const nx = Number(circle.getAttribute('cx'));
+        const ny = Number(circle.getAttribute('cy'));
+        if (Math.abs(nx - cx) <= 100 && ny > cy) {
+          bottomPoleLabels.push(label);
+        }
+      }
+      expect(bottomPoleLabels.length).toBeGreaterThan(0);
+      for (const label of bottomPoleLabels) {
+        expect(label.getAttribute('text-anchor')).toBe('middle');
+      }
+    });
+  });
 });

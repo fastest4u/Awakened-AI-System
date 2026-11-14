@@ -434,15 +434,32 @@ export function GraphCanvas({
               );
             }
 
-            // Orbital Mode Node
+            // Orbital Mode Node: radiate labels outward from (cx, cy) so labels align with their own node
             const showOrbLabel =
               !isSelected && (spotlightLabelIds.has(n.id) || isHovered);
-            const isLeft = p.x < cx - 24;
-            const isRight = p.x > cx + 24;
-            const labelX = isLeft ? p.x - 14 : isRight ? p.x + 14 : p.x;
-            const labelY =
-              isLeft || isRight ? p.y + 4 : p.y < cy ? p.y - 16 : p.y + 22;
-            const labelAnchor = isLeft ? 'end' : isRight ? 'start' : 'middle';
+            const dx = p.x - cx;
+            const dy = p.y - cy;
+            const dist = Math.hypot(dx, dy);
+            const ux = dist > 0 ? dx / dist : 0;
+            const uy = dist > 0 ? dy / dist : -1;
+            const isPole = dist <= 12 || Math.abs(ux) <= 0.45;
+            const radialOffset =
+              n.kind === 'session' ? 18 : n.kind === 'note' ? 17 : 15;
+            const rawLabelX = isPole ? p.x : p.x + ux * radialOffset;
+            const rawLabelY = isPole
+              ? uy < 0
+                ? p.y - 16
+                : p.y + 22
+              : p.y + uy * radialOffset + 4;
+            const labelX = Math.max(
+              16,
+              Math.min(width - 16, Math.round(rawLabelX)),
+            );
+            const labelY = Math.max(
+              16,
+              Math.min(height - 10, Math.round(rawLabelY)),
+            );
+            const labelAnchor = isPole ? 'middle' : ux > 0 ? 'start' : 'end';
             const pinBelow = p.y < 50;
             const pinRectY = pinBelow ? p.y + 18 : p.y - 42;
             const pinTextY = pinBelow ? p.y + 32 : p.y - 28;
