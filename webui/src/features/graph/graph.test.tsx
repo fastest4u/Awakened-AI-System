@@ -389,4 +389,72 @@ describe('Knowledge Graph page', () => {
       expect(search.node).toBe('note:rec-1');
     });
   });
+
+  it('renders visible node text labels and valid CSS variable colors without nested hsl(var(--...)) in both flow and orbital modes', async () => {
+    renderApp({
+      initialUrl: '/graph',
+      fetchHandler: (url) => {
+        if (url.startsWith('/api/graph')) {
+          return new Response(JSON.stringify(sampleGraph), {
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+      },
+    });
+
+    const svg = await waitFor(() => {
+      const el = document.querySelector('#knowledge-graph-canvas');
+      expect(el).not.toBeNull();
+      return el!;
+    });
+
+    await waitFor(() => {
+      expect(document.querySelector('[data-node-id="note:rec-1"]')).not.toBeNull();
+    });
+
+    // Flow mode renders column subtitles and node display labels inside #graph-nodes
+    const flowNodesGroup = svg.querySelector('#graph-nodes')!;
+    const flowNodeText = flowNodesGroup.textContent ?? '';
+    expect(flowNodeText).toContain('Auth refactor and token secu');
+    expect(flowNodeText).toContain('Token Refresh Pattern');
+    expect(flowNodeText).toContain('auth.ts');
+    expect(flowNodeText).toContain('refreshToken');
+
+    const colGuidesText = svg.querySelector('#flow-column-guides')?.textContent ?? '';
+    expect(colGuidesText).toContain('จุดเริ่มต้นของงาน');
+    expect(colGuidesText).toContain('การตัดสินใจ & บทเรียน');
+    expect(colGuidesText).toContain('ซอร์สโค้ดที่เกี่ยวข้อง');
+    expect(colGuidesText).toContain('โมดูลที่ได้รับผลกระทบ');
+
+    const fileNodeEl = svg.querySelector('[data-node-id="file:src/auth.ts"]')!;
+    const fileRect = fileNodeEl.querySelector('rect');
+    const fileLabelText = fileNodeEl.querySelector('text');
+    expect(fileRect?.getAttribute('fill')).toBe('var(--card)');
+    expect(fileLabelText?.getAttribute('fill')).toBe('var(--foreground)');
+    expect(svg.outerHTML).not.toMatch(/(hsl|rgb|oklch)\(var\(--/);
+
+    // Switch to Orbital mode and hover a non-selected node to verify hover label styling
+    const orbitalBtn = screen.getByRole('button', {
+      name: /มุมมองเครือข่ายวงโคจร/i,
+    });
+    fireEvent.click(orbitalBtn);
+
+    const orbFileNodeEl = await waitFor(() => {
+      const el = document.querySelector('#knowledge-graph-canvas [data-node-id="file:src/auth.ts"]');
+      expect(el).not.toBeNull();
+      return el!;
+    });
+    fireEvent.mouseEnter(orbFileNodeEl);
+
+    await waitFor(() => {
+      const orbLabelText = orbFileNodeEl.querySelector('text');
+      expect(orbLabelText).not.toBeNull();
+      expect(orbLabelText?.textContent).toContain('auth.ts');
+      expect(orbLabelText?.getAttribute('fill')).toBe('var(--foreground)');
+      expect(orbLabelText?.getAttribute('stroke')).toBe('var(--background)');
+    });
+    expect(document.querySelector('#knowledge-graph-canvas')!.outerHTML).not.toMatch(
+      /(hsl|rgb|oklch)\(var\(--/,
+    );
+  });
 });

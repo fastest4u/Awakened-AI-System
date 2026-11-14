@@ -133,7 +133,7 @@ export function GraphCanvas({
                   width={204}
                   height={38}
                   rx={8}
-                  fill="hsl(var(--card))"
+                  fill="var(--card)"
                   stroke={col.color}
                   strokeOpacity="0.4"
                 />
@@ -150,7 +150,7 @@ export function GraphCanvas({
                 <text
                   x={col.x}
                   y={40}
-                  fill="hsl(var(--muted-foreground))"
+                  fill="var(--muted-foreground)"
                   fontSize="9.5"
                   textAnchor="middle"
                 >
@@ -161,7 +161,7 @@ export function GraphCanvas({
                   y1={52}
                   x2={col.x}
                   y2={height - 14}
-                  stroke="hsl(var(--border))"
+                  stroke="var(--border)"
                   strokeDasharray="3 5"
                   opacity="0.35"
                 />
@@ -177,7 +177,7 @@ export function GraphCanvas({
                 cy={cy}
                 r={r}
                 fill="none"
-                stroke="hsl(var(--border))"
+                stroke="var(--border)"
                 strokeDasharray="4 6"
                 opacity="0.35"
               />
@@ -240,7 +240,7 @@ export function GraphCanvas({
                     <path
                       d={dFlow}
                       fill="none"
-                      stroke="hsl(var(--foreground))"
+                      stroke="var(--foreground)"
                       strokeWidth="1.2"
                       strokeDasharray="5 7"
                       opacity={isDirect ? 0.55 : 0.35}
@@ -254,7 +254,7 @@ export function GraphCanvas({
                   key={`edge-${i}`}
                   d={dFlow}
                   fill="none"
-                  stroke="hsl(var(--border))"
+                  stroke="var(--border)"
                   strokeWidth="1"
                   opacity={0.12}
                 />
@@ -286,7 +286,7 @@ export function GraphCanvas({
                   <path
                     d={dOrb}
                     fill="none"
-                    stroke="hsl(var(--foreground))"
+                    stroke="var(--foreground)"
                     strokeWidth="1.2"
                     strokeDasharray="5 7"
                     opacity={isDirect ? 0.55 : 0.35}
@@ -300,7 +300,7 @@ export function GraphCanvas({
                 key={`edge-${i}`}
                 d={dOrb}
                 fill="none"
-                stroke="hsl(var(--border))"
+                stroke="var(--border)"
                 strokeWidth="1"
                 opacity={0.08}
               />
@@ -405,8 +405,8 @@ export function GraphCanvas({
                     width={boxW}
                     height={boxH}
                     rx={8}
-                    fill={isSelected ? 'hsl(var(--secondary))' : 'hsl(var(--card))'}
-                    stroke={isSelected || isHi ? color : 'hsl(var(--border))'}
+                    fill={isSelected ? 'var(--secondary)' : 'var(--card)'}
+                    stroke={isSelected || isHi ? color : 'var(--border)'}
                     strokeWidth={isSelected ? 2 : isHi ? 1.4 : 1}
                   />
 
@@ -422,10 +422,11 @@ export function GraphCanvas({
                   <text
                     x={p.x - boxW / 2 + 24}
                     y={p.y + 4}
-                    fill="hsl(var(--foreground))"
+                    fill="var(--foreground)"
                     fontSize="10.2"
                     fontWeight={isSelected || isHi ? '600' : '500'}
                     textAnchor="start"
+                    pointerEvents="none"
                   >
                     {shortText}
                   </text>
@@ -508,7 +509,7 @@ export function GraphCanvas({
                           : 5.5
                   }
                   fill={color}
-                  stroke={isSelected || isHovered ? 'hsl(var(--foreground))' : 'none'}
+                  stroke={isSelected || isHovered ? 'var(--foreground)' : 'none'}
                   strokeWidth={isSelected ? 2 : isHovered ? 1.5 : 0}
                 />
 
@@ -543,14 +544,15 @@ export function GraphCanvas({
                   <text
                     x={labelX}
                     y={labelY}
-                    fill="hsl(var(--foreground))"
+                    fill="var(--foreground)"
                     fontSize={isHovered ? '11' : '10'}
                     fontWeight={isHovered ? '700' : '600'}
                     textAnchor={labelAnchor}
-                    stroke="hsl(var(--background))"
+                    stroke="var(--background)"
                     strokeWidth="3.5"
                     strokeLinejoin="round"
                     paintOrder="stroke"
+                    pointerEvents="none"
                   >
                     {shortText.length > 26 ? shortText.slice(0, 25) + '…' : shortText}
                   </text>

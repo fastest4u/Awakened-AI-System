@@ -115,13 +115,13 @@ export function ActivityCard({ activitySeries }: ActivityCardProps) {
                 dataKey="label"
                 tickLine={false}
                 axisLine={false}
-                tick={{ fontSize: 10, fill: 'hsl(var(--muted-foreground))' }}
+                tick={{ fontSize: 10, fill: 'var(--muted-foreground)' }}
               />
               <YAxis
                 allowDecimals={false}
                 tickLine={false}
                 axisLine={false}
-                tick={{ fontSize: 10, fill: 'hsl(var(--muted-foreground))' }}
+                tick={{ fontSize: 10, fill: 'var(--muted-foreground)' }}
                 domain={[0, 'auto']}
               />
               <ChartTooltip content={<ChartTooltipContent />} />

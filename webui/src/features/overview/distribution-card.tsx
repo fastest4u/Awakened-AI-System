@@ -82,7 +82,7 @@ export function DistributionCard({ byKind }: DistributionCardProps) {
             value: it.count,
             color: KIND_META[it.key].color,
           }))
-      : [{ name: 'Empty', value: 1, color: 'hsl(var(--muted))' }];
+      : [{ name: 'Empty', value: 1, color: 'var(--muted)' }];
 
   return (
     <Card className="h-full">
@@ -144,7 +144,7 @@ export function DistributionCard({ byKind }: DistributionCardProps) {
                   paddingAngle={total > 0 ? 3 : 0}
                   dataKey="value"
                   strokeWidth={1}
-                  stroke="hsl(var(--card))"
+                  stroke="var(--card)"
                 >
                   {chartData.map((entry, index) => (
                     <Cell key={`cell-${index}`} fill={entry.color} />

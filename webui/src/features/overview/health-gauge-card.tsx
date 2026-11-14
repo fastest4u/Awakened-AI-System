@@ -58,7 +58,7 @@ export function HealthGaugeCard({
                 cy="74"
                 r="58"
                 fill="none"
-                stroke="hsl(var(--secondary))"
+                stroke="var(--secondary)"
                 strokeWidth="12"
               />
               <circle

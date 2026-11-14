@@ -168,6 +168,56 @@ describe('Overview page', () => {
 
     // Must never render "NaN" anywhere
     expect(document.body.textContent).not.toMatch(/NaN/);
+    expect(document.body.innerHTML).not.toMatch(/(hsl|rgb|oklch)\(var\(--/);
+  });
+
+  it('uses direct var(--...) CSS custom properties without nested hsl(var(--...)) in SVG gauge and Recharts charts', async () => {
+    const mockOverview = {
+      ok: true,
+      projectRoot: 'C:\\default',
+      projectName: 'default',
+      status: 'active',
+      audit: {
+        healthScore: 90,
+        counts: {
+          verifiedNotes: 4,
+          unpromotedCandidates: 2,
+          conflictedNotes: 1,
+          duplicateGroups: 1,
+        },
+        recommendations: [],
+        duplicateGroups: [],
+      },
+      analytics: {
+        byStatus: { verified: 4, candidate: 2, conflicted: 1 },
+        byKind: { adr: 2, insight: 2, mistake: 1, 'session-log': 1 },
+        activitySeries: [
+          { label: 'S-1', notes: 3, verified: 2, sessions: 1 },
+          { label: 'Now', notes: 6, verified: 4, sessions: 2 },
+        ],
+      },
+      lifecycle: {
+        sessions: [],
+        latestCheckpoint: null,
+      },
+      causalTriads: [],
+    };
+
+    renderApp({
+      initialUrl: '/overview',
+      fetchHandler: (url) => {
+        if (url.startsWith('/api/overview')) {
+          return new Response(JSON.stringify(mockOverview), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+      },
+    });
+
+    expect(await screen.findByText('90/100')).toBeInTheDocument();
+    expect(document.querySelector('circle[stroke="var(--secondary)"]')).not.toBeNull();
+    expect(document.body.innerHTML).not.toMatch(/(hsl|rgb|oklch)\(var\(--/);
   });
 
   it('triad and session pills open notes', async () => {
