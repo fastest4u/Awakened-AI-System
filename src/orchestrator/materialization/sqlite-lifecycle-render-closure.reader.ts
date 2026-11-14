@@ -134,6 +134,13 @@ function sameSourceIdentity(left: StoredEvent, right: StoredEvent): boolean {
     && left.branchRef === right.branchRef;
 }
 
+function sameWorkspaceIdentity(left: StoredEvent, right: StoredEvent): boolean {
+  return left.projectId === right.projectId
+    && left.vaultId === right.vaultId
+    && left.storeId === right.storeId
+    && left.workspaceId === right.workspaceId;
+}
+
 function sameStoreIdentity(left: StoredEvent, right: StoredEvent): boolean {
   return left.projectId === right.projectId
     && left.vaultId === right.vaultId
@@ -186,7 +193,7 @@ export class SqliteLifecycleRenderClosureReader {
         if (
           item.event.sessionId !== rootSessionId
           || item.event.parentSessionId !== null
-          || !sameSourceIdentity(item.event, rootStart)
+          || !sameWorkspaceIdentity(item.event, rootStart)
         ) return integrity();
       }
 
@@ -217,7 +224,7 @@ export class SqliteLifecycleRenderClosureReader {
           if (
             item.event.sessionId !== childSessionId
             || item.event.parentSessionId !== rootSessionId
-            || !sameSourceIdentity(item.event, rootStart)
+            || !sameWorkspaceIdentity(item.event, rootStart)
           ) return integrity();
         }
         directChildrenRaw.set(childSessionId, events);

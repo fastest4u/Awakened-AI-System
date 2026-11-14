@@ -62,6 +62,10 @@ npm run build
 | `npm run check:runtime` | ตรวจสอบ Node.js, `node:sqlite`, WAL, FTS5 และ fail-closed query-only mode |
 | `npm run build` | Bundle MCP V2 (`dist/v2.js`), Operator CLI (`dist/v2-admin.js`), workers และ `dist/v2-build.json` |
 | `npm run start` / `npm run start:v2` | รัน Project Memory V2 MCP Server (`dist/v2.js`) ผ่าน stdio |
+| `npm run setup:webui` | ติดตั้ง dependencies ของ WebUI SPA (`npm --prefix webui ci`) |
+| `npm run build:webui` | คอมไพล์ WebUI SPA ด้วย Vite (`dist/webui/`) |
+| `npm run test:webui` | รันชุดทดสอบ WebUI Vitest |
+| `npm run dev:webui` | รัน Vite dev server สำหรับ WebUI (`http://localhost:5173`) |
 | `npm run webui` | เปิด WebUI Mission Control ที่ `http://127.0.0.1:4321` |
 | `npm run v2-admin -- <cmd>` | เรียกใช้ Operator CLI (`dist/v2-admin.js`) |
 | `npm run typecheck` | ตรวจสอบชนิดข้อมูล TypeScript (`tsc --noEmit`) |
@@ -130,12 +134,22 @@ node dist/v2-admin.js verify-v1-archive \
 
 ## WebUI Mission Control
 
-เปิดหน้าต่างควบคุมและสำรวจความจำแบบอินเทอร์แอคทีฟ:
+หน้าต่างควบคุมและสำรวจความจำแบบ SPA ยุคใหม่ ขับเคลื่อนด้วย **Vite 8 + React 19 + TanStack Router & Query + Tailwind CSS v4 + shadcn/ui**:
 
 ```bash
+# ติดตั้ง dependencies และ build SPA client (ครั้งแรกหรือเมื่อแก้ไข webui/)
+npm run setup:webui
+npm run build:webui
+
+# เปิด WebUI Mission Control (Production Mode) ที่ http://127.0.0.1:4321
 npm run webui
+
 # หรือระบุพอร์ตและโปรเจกต์เริ่มต้น
 node dist/v2-admin.js webui --project-root "C:/Users/Server/Desktop/Awakened-AI-System" --port 4321
+
+# หรือพัฒนาในโหมด Dev (Vite HMR พร้อม proxy /api ไปยัง backend)
+npm run webui          # เทอร์มินัล 1: รัน backend server
+npm run dev:webui      # เทอร์มินัล 2: รัน Vite dev server ที่ http://localhost:5173
 ```
 
 ความสามารถหลักใน WebUI:

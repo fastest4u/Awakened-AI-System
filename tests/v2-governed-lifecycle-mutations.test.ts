@@ -1,10 +1,13 @@
 import assert from "node:assert/strict";
-import { mkdirSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
+import { pathToFileURL } from "node:url";
 
 import { EventIntegrityService } from "../src/orchestrator/integrity/event-integrity.service.js";
+import { SpawnSyncGitCommandRunner } from "../src/orchestrator/identity/git-workspace.resolver.js";
 import { OperationalKeyCustodyProvider } from "../src/orchestrator/keys/operational-key-custody.js";
 import {
   openEvidenceItem,
@@ -36,6 +39,10 @@ import {
   GovernedLifecycleError,
   GovernedLifecycleService,
 } from "../src/orchestrator/governance/governance.service.js";
+import {
+  createV2Foundation,
+  ensureProjectV2StoreReady,
+} from "../src/v2/composition.js";
 import { makeGovernedNoteDomainFixture } from "./support/governed-note-domain-fixture.js";
 
 function toProjectionBinding(fixture: Awaited<ReturnType<typeof makeGovernedNoteDomainFixture>>): ProjectBinding {
@@ -874,5 +881,205 @@ test("governed_lifecycle_cross_branch_promotion_publishes_and_verifies_projectio
     }
   } finally {
     await fixture.cleanup();
+  }
+});
+
+test("cross_branch_session_stream_continuity_publishes_and_verifies_projection_v3", async () => {
+  const projectRoot = realpathSync.native(mkdtempSync(join(tmpdir(), "pm-v2-cross-branch-session-")));
+  const entryUrl = pathToFileURL(resolve("dist/v2.js")).href;
+  const v2BuildManifest = JSON.parse(readFileSync(resolve("dist/v2-build.json"), "utf8")) as {
+    deploymentId: string;
+  };
+  (globalThis as Record<string, unknown>).__V2_DEPLOYMENT_ID__ = v2BuildManifest.deploymentId;
+  const git = new SpawnSyncGitCommandRunner();
+  try {
+    git.run(projectRoot, ["init", "-b", "feat/alpha"]);
+    git.run(projectRoot, ["config", "user.email", "test@example.com"]);
+    git.run(projectRoot, ["config", "user.name", "Test Operator"]);
+    writeFileSync(join(projectRoot, ".gitignore"), "memory/\nmemory-v2/\n.antigravity/\n", "utf8");
+    git.run(projectRoot, ["add", ".gitignore"]);
+    git.run(projectRoot, ["commit", "-m", "initial commit on feat/alpha"]);
+
+    const v1ArchiveRoot = join(projectRoot, "memory");
+    mkdirSync(v1ArchiveRoot, { recursive: true });
+    writeFileSync(join(v1ArchiveRoot, "sentinel.txt"), "archive-sentinel", "utf8");
+    const v2VaultRoot = join(projectRoot, "memory-v2");
+
+    const config = await ensureProjectV2StoreReady({
+      projectRoot,
+      v2VaultRoot,
+      v1ArchiveRoot,
+      entryUrl,
+      ensureActive: true,
+    });
+    const foundation = await createV2Foundation(config, { entryUrl });
+    try {
+      const status = await foundation.status();
+      const started = (await foundation.content.invoke("memory_sessionStart", {
+        agentName: "cross-branch-tester",
+        taskDescription: "Start session on feat/alpha",
+        includeContext: false,
+      })) as { ok: boolean; sessionId: string };
+      assert.equal(started.ok, true);
+      const sessionId = started.sessionId;
+
+      git.run(projectRoot, ["checkout", "-b", "feat/beta"]);
+
+      const cpBeta = (await foundation.content.invoke("memory_checkpoint", {
+        sessionId,
+        taskSummary: "Cross-branch checkpoint on feat/beta",
+        nextActions: ["Resume on alpha"],
+        filesTouched: ["README.md"],
+      })) as { ok: boolean; checkpointId: string };
+      assert.equal(cpBeta.ok, true);
+
+      const recovered = (await foundation.content.invoke("memory_recoverSession", {
+        sessionId,
+        reasonCode: "explicit-user-approval",
+      })) as { ok: boolean };
+      assert.equal(recovered.ok, true);
+
+      const created = (await foundation.content.invoke("memory_writeInsight", {
+        sessionId,
+        title: "Cross-branch session continuity insight",
+        summary: "Verify Schema 3 handles sessions spanning multiple git branches",
+        content: "# Cross-Branch Session\n\nRecorded on feat/beta within a session opened on feat/alpha.\n",
+        autoVerify: false,
+      })) as { ok: boolean; id?: string; recordId?: string };
+      assert.equal(created.ok, true);
+      const recordId = String(created.recordId ?? created.id ?? "");
+      assert.ok(recordId.length > 0);
+
+      const promoted = (await foundation.content.invoke("memory_promote", {
+        sessionId,
+        recordId,
+        targetStatus: "verified",
+        verificationMethod: "test-verified",
+        verificationAnchor: "tests/v2-governed-lifecycle-mutations.test.ts",
+      })) as { ok: boolean };
+      assert.equal(promoted.ok, true);
+
+      const verifyBeta = (await foundation.content.invoke("memory_verifyVault", {})) as {
+        ok: boolean;
+        status: string;
+      };
+      assert.equal(verifyBeta.ok, true);
+      assert.equal(verifyBeta.status, "healthy");
+
+      const v2Dir = join(projectRoot, ".git", "project-memory", status.projectId, "v2");
+      const eventsPath = join(v2Dir, "events.sqlite");
+      const projectionDir = join(v2Dir, "projections");
+      const manifestRaw = JSON.parse(readFileSync(join(projectionDir, "projection-manifest.json"), "utf8")) as {
+        projectId: string;
+        vaultId: string;
+        storeId: string;
+        workspaceId: string;
+        branchScopeId: string | null;
+        branchRef: string | null;
+      };
+
+      const inspectDb = new DatabaseSync(eventsPath, { readOnly: true });
+      let betaScopeId: string | null = null;
+      try {
+        const row = inspectDb
+          .prepare("SELECT DISTINCT branch_scope_id FROM events WHERE branch_ref = 'refs/heads/feat/beta' LIMIT 1")
+          .get() as { branch_scope_id?: string | null } | undefined;
+        betaScopeId = row?.branch_scope_id ?? null;
+      } finally {
+        inspectDb.close();
+      }
+      assert.ok(betaScopeId !== null);
+      assert.equal(manifestRaw.branchScopeId, betaScopeId);
+
+      const betaBinding: ProjectBinding = Object.freeze({
+        projectId: manifestRaw.projectId as ProjectBinding["projectId"],
+        vaultId: manifestRaw.vaultId as ProjectBinding["vaultId"],
+        storeId: manifestRaw.storeId as ProjectBinding["storeId"],
+        workspaceId: manifestRaw.workspaceId as ProjectBinding["workspaceId"],
+        branchScopeId: betaScopeId as ProjectBinding["branchScopeId"],
+        branchRef: "refs/heads/feat/beta",
+        sessionId: null,
+      });
+
+      const driver = new NodeSqliteDriver({ DatabaseSync });
+      const integrity = new ProjectionIntegrityService({
+        driver,
+        projectionDirectory: projectionDir,
+        eventStorePath: eventsPath,
+      });
+      const verifyReport = await integrity.verify(betaBinding, manifestRaw);
+      assert.equal(verifyReport.status, "passed");
+
+      const reader = new SqliteProjectionEventReader({
+        driver,
+        eventStorePath: eventsPath,
+      });
+      const snap = await reader.openCommittedSnapshotV3(betaBinding);
+      try {
+        const betaDispositions = [...snap.dispositions()];
+        const withoutCrossScopeSessions = new ProjectionFoldAccumulatorV3(new Set(), new Map());
+        assert.throws(
+          () => {
+            for (const d of betaDispositions) {
+              withoutCrossScopeSessions.append(d);
+            }
+          },
+          /INTEGRITY_FAILURE/u,
+          "Cross-branch session events folded without crossScopeSessions must throw INTEGRITY_FAILURE",
+        );
+      } finally {
+        snap.close();
+      }
+
+      git.run(projectRoot, ["checkout", "feat/alpha"]);
+
+      const cpAlpha = (await foundation.content.invoke("memory_checkpoint", {
+        sessionId,
+        taskSummary: "Back on feat/alpha after branch work",
+      })) as { ok: boolean };
+      assert.equal(cpAlpha.ok, true);
+
+      const ended = (await foundation.content.invoke("memory_sessionEnd", {
+        sessionId,
+        summary: "Completed across branches",
+        finalize: true,
+      })) as { ok: boolean; state: string };
+      assert.equal(ended.ok, true);
+      assert.equal(ended.state, "ended");
+
+      const verifyAlpha = (await foundation.content.invoke("memory_verifyVault", {})) as {
+        ok: boolean;
+        status: string;
+      };
+      assert.equal(verifyAlpha.ok, true);
+      assert.equal(verifyAlpha.status, "healthy");
+
+      // Also verify starting a session on feat/alpha and calling memory_sessionEnd directly on a brand-new branch feat/gamma.
+      const secondStart = (await foundation.content.invoke("memory_sessionStart", {
+        task: "Cross-branch direct sessionEnd test",
+      })) as { sessionId: string };
+      const secondSessionId = String(secondStart.sessionId ?? "");
+      assert.ok(secondSessionId.length > 0 && secondSessionId !== sessionId);
+
+      git.run(projectRoot, ["checkout", "-b", "feat/gamma"]);
+      const endedGamma = (await foundation.content.invoke("memory_sessionEnd", {
+        sessionId: secondSessionId,
+        summary: "End directly on a different branch",
+        finalize: true,
+      })) as { ok: boolean; state: string };
+      assert.equal(endedGamma.ok, true);
+      assert.equal(endedGamma.state, "ended");
+
+      const verifyGamma = (await foundation.content.invoke("memory_verifyVault", {})) as {
+        ok: boolean;
+        status: string;
+      };
+      assert.equal(verifyGamma.ok, true);
+      assert.equal(verifyGamma.status, "healthy");
+    } finally {
+      await foundation.close();
+    }
+  } finally {
+    rmSync(projectRoot, { recursive: true, force: true });
   }
 });

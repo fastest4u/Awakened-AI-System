@@ -14,9 +14,11 @@ import type {
 import {
   isProjectionProjectStoreIdentity,
   isProjectionWorkspaceIdentity,
+  type CrossScopeSessionProjection,
   type ProjectBinding,
   type ProjectionSourceDisposition,
 } from "./contracts.js";
+import { decodeProjectionSourceV3 } from "./source-event-codec.js";
 
 const DEFAULT_BUSY_TIMEOUT_MS = 5_000;
 export const MAX_PROJECTION_SOURCE_EVENTS = 100_000;
@@ -60,6 +62,7 @@ export interface ProjectionEventSnapshot {
 export interface ProjectionEventSnapshotV3 extends ProjectionEventSnapshot {
   dispositions(): Iterable<ProjectionSourceDisposition>;
   crossScopeItemIds?(): ReadonlySet<string>;
+  crossScopeSessions?(): ReadonlyMap<string, CrossScopeSessionProjection>;
 }
 
 export interface ProjectionEventReaderV3 extends ProjectionEventReader {
@@ -346,6 +349,7 @@ export class SqliteProjectionEventReader implements ProjectionEventReaderV3 {
     return openBoundedProjectionEventSnapshot(bindingValue, {
       driver: this.#driver, eventStorePath: this.#eventStorePath, busyTimeoutMs: this.#busyTimeoutMs,
       maxEvents: MAX_PROJECTION_SOURCE_EVENTS, maxAggregateBytes: MAX_PROJECTION_SOURCE_BYTES,
+      trackCrossScopeSessions: true,
     });
   }
 
@@ -361,6 +365,132 @@ export class SqliteProjectionEventReader implements ProjectionEventReaderV3 {
 interface BoundedProjectionSnapshotOptions extends CommittedProjectionSnapshotOptions {
   readonly maxEvents: number;
   readonly maxAggregateBytes: number;
+  readonly trackCrossScopeSessions?: boolean;
+}
+
+const STORE_TERMINAL_LIFECYCLE_EVENTS = new Set([
+  "SessionEnded",
+  "SessionAbandoned",
+  "ChildSessionCompleted",
+  "ChildWorkTransferCreated",
+]);
+
+function advanceStoreSessionMap(
+  sessions: Map<string, CrossScopeSessionProjection>,
+  disposition: ProjectionSourceDisposition,
+): void {
+  const decoded = decodeProjectionSourceV3(disposition);
+  const proj = decoded.event;
+  if (proj === null || proj.kind === "governed-lifecycle-transition") return;
+  if (decoded.governedNote !== null) {
+    if (proj.kind !== "governed-memory-source") return integrity();
+    if (proj.binding.sessionId !== null) {
+      const existing = sessions.get(proj.binding.sessionId);
+      if (existing !== undefined && existing.lifecycleState !== "open") return integrity();
+    }
+    return;
+  }
+  if (proj.kind === "session-lifecycle") {
+    const current = sessions.get(proj.sessionId);
+    if (proj.eventType === "SessionStarted" || proj.eventType === "SessionForked") {
+      if (current !== undefined || proj.sourceStreamVersion !== 1n || proj.ownerGeneration === null) {
+        return integrity();
+      }
+      let parent: CrossScopeSessionProjection | null = null;
+      if (proj.eventType === "SessionStarted") {
+        if (proj.parentSessionId !== null) return integrity();
+      } else {
+        if (proj.parentSessionId === null || proj.ownerGeneration !== 1) return integrity();
+        const foundParent = sessions.get(proj.parentSessionId);
+        if (foundParent === undefined || foundParent.lifecycleState !== "open") return integrity();
+        parent = foundParent;
+      }
+      sessions.set(proj.sessionId, Object.freeze({
+        projectId: proj.binding.projectId,
+        sessionId: proj.sessionId,
+        rootSessionId: parent === null ? proj.sessionId : parent.rootSessionId,
+        parentSessionId: proj.parentSessionId,
+        lifecycleState: "open",
+        ownerGeneration: proj.ownerGeneration,
+        openedEventPosition: proj.sourceEventPosition,
+        closedEventPosition: null,
+        sourceEventId: proj.sourceEventId,
+        sourceEventPosition: proj.sourceEventPosition,
+        latestStreamVersion: proj.sourceStreamVersion,
+        openChildCount: 0,
+      }));
+      if (parent !== null) {
+        sessions.set(parent.sessionId, Object.freeze({
+          ...parent,
+          openChildCount: parent.openChildCount + 1,
+        }));
+      }
+      return;
+    }
+    if (
+      current === undefined
+      || current.lifecycleState !== "open"
+      || current.parentSessionId !== proj.parentSessionId
+      || proj.sourceStreamVersion !== current.latestStreamVersion + 1n
+    ) return integrity();
+    if (
+      (proj.eventType === "SessionOwnerTransferred" || proj.eventType === "SessionOwnershipRecovered")
+      && (
+        current.parentSessionId !== null
+        || proj.ownerGeneration === null
+        || proj.previousOwnerGeneration !== current.ownerGeneration
+        || proj.ownerGeneration !== current.ownerGeneration + 1
+      )
+    ) return integrity();
+    const terminal = STORE_TERMINAL_LIFECYCLE_EVENTS.has(proj.eventType);
+    if (terminal && current.openChildCount !== 0) return integrity();
+    if (terminal && current.parentSessionId !== null) {
+      const parent = sessions.get(current.parentSessionId);
+      if (parent === undefined || parent.openChildCount < 1) return integrity();
+      sessions.set(parent.sessionId, Object.freeze({
+        ...parent,
+        openChildCount: parent.openChildCount - 1,
+      }));
+    }
+    sessions.set(proj.sessionId, Object.freeze({
+      ...current,
+      lifecycleState: terminal ? "closed" : "open",
+      ownerGeneration: proj.ownerGeneration ?? current.ownerGeneration,
+      closedEventPosition: terminal ? proj.sourceEventPosition : null,
+      sourceEventId: proj.sourceEventId,
+      sourceEventPosition: proj.sourceEventPosition,
+      latestStreamVersion: proj.sourceStreamVersion,
+    }));
+    return;
+  }
+  if (proj.kind === "checkpoint") {
+    const sessionId = proj.binding.sessionId;
+    if (sessionId === null) return integrity();
+    const current = sessions.get(sessionId);
+    if (
+      current === undefined
+      || current.lifecycleState !== "open"
+      || proj.sourceStreamVersion !== current.latestStreamVersion + 1n
+      || proj.baseEventPosition < current.openedEventPosition
+      || proj.baseEventPosition >= proj.sourceEventPosition
+    ) return integrity();
+    sessions.set(sessionId, Object.freeze({
+      ...current,
+      latestStreamVersion: proj.sourceStreamVersion,
+    }));
+    return;
+  }
+  const sessionId = proj.binding.sessionId;
+  if (sessionId === null) return;
+  const current = sessions.get(sessionId);
+  if (current === undefined) return;
+  if (current.lifecycleState !== "open" || proj.sourceStreamVersion !== current.latestStreamVersion + 1n) {
+    return integrity();
+  }
+  sessions.set(sessionId, Object.freeze({
+    ...current,
+    latestStreamVersion: proj.sourceStreamVersion,
+  }));
 }
 
 function openBoundedProjectionEventSnapshot(
@@ -453,6 +583,8 @@ function openBoundedProjectionEventSnapshot(
     let streamRequested = false;
     let streamComplete = false;
     const crossScopeItemIdsSet = new Set<string>();
+    const crossScopeSessionsMap = new Map<string, CrossScopeSessionProjection>();
+    const trackCrossScopeSessions = options.trackCrossScopeSessions === true && binding.branchScopeId !== null;
     const dispositions = (): Iterable<ProjectionSourceDisposition> => {
         if (released || streamRequested) return integrity();
         streamRequested = true;
@@ -470,10 +602,14 @@ function openBoundedProjectionEventSnapshot(
               const governedNotePrior = assertStoredGovernedNoteCorrespondenceAny(connection, authenticated.event);
               cursor = authenticated.nextCursor;
               if (!sameStore(authenticated.event, binding)) return integrity();
+              const disposition = Object.freeze({ event: authenticated.event, governedNotePrior });
               if (sameBinding(authenticated.event, binding)) {
-                yield Object.freeze({event: authenticated.event, governedNotePrior});
+                yield disposition;
                 // Check before resuming SQLite's iterator after a caller closes the snapshot.
                 if (released) return integrity();
+                if (trackCrossScopeSessions) {
+                  advanceStoreSessionMap(crossScopeSessionsMap, disposition);
+                }
               } else {
                 if (governedNotePrior !== null) {
                   crossScopeItemIdsSet.add(governedNotePrior.witness.recordId);
@@ -493,6 +629,9 @@ function openBoundedProjectionEventSnapshot(
                   } catch {
                     return integrity();
                   }
+                }
+                if (trackCrossScopeSessions) {
+                  advanceStoreSessionMap(crossScopeSessionsMap, disposition);
                 }
               }
             }
@@ -514,6 +653,9 @@ function openBoundedProjectionEventSnapshot(
       terminalEventPosition, terminalEventHash, dispositions,
       crossScopeItemIds(): ReadonlySet<string> {
         return crossScopeItemIdsSet;
+      },
+      crossScopeSessions(): ReadonlyMap<string, CrossScopeSessionProjection> {
+        return crossScopeSessionsMap;
       },
       events(): Iterable<StoredEvent> {
         const sources = dispositions();
@@ -557,7 +699,11 @@ export function openCommittedProjectionEventSnapshot(
 export function replayCommittedProjectionSources(
   binding: ProjectBinding,
   options: CommittedProjectionReplayOptions,
-  consume: (source: ProjectionSourceDisposition, crossScopeItemIds: ReadonlySet<string>) => void,
+  consume: (
+    source: ProjectionSourceDisposition,
+    crossScopeItemIds: ReadonlySet<string>,
+    crossScopeSessions?: ReadonlyMap<string, CrossScopeSessionProjection>,
+  ) => void,
 ): CommittedProjectionReplayResult {
   if (typeof consume !== "function" || typeof options.terminalEventPosition !== "bigint"
     || options.terminalEventPosition < 0n || options.terminalEventPosition > SQLITE_INT64_MAX) return integrity();
@@ -565,10 +711,12 @@ export function replayCommittedProjectionSources(
     ...options,
     maxEvents: boundedPositiveInteger(options.maxEvents, MAX_INTEGRITY_REPLAY_EVENTS, MAX_INTEGRITY_REPLAY_EVENTS),
     maxAggregateBytes: boundedPositiveInteger(options.maxAggregateBytes, MAX_INTEGRITY_REPLAY_BYTES, MAX_INTEGRITY_REPLAY_BYTES),
+    trackCrossScopeSessions: true,
   });
   try {
     const crossScopeIds = snapshot.crossScopeItemIds?.() ?? new Set<string>();
-    for (const source of snapshot.dispositions()) consume(source, crossScopeIds);
+    const crossScopeSessions = snapshot.crossScopeSessions?.() ?? new Map<string, CrossScopeSessionProjection>();
+    for (const source of snapshot.dispositions()) consume(source, crossScopeIds, crossScopeSessions);
     return Object.freeze({eventCount:snapshot.eventCount, aggregateBytes:snapshot.aggregateBytes,
       terminalEventPosition:snapshot.terminalEventPosition, terminalEventHash:snapshot.terminalEventHash});
   } finally { snapshot.close(); }

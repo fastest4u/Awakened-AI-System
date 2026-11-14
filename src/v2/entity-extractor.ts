@@ -329,10 +329,42 @@ const STOP_SYMBOLS = new Set([
   "Rationale",
   "Impact",
   "Verification",
+  "none",
+  "auto",
+  "inherit",
+  "initial",
+  "unset",
+  "solid",
+  "hidden",
+  "visible",
+  "block",
+  "inline",
+  "flex",
+  "grid",
+  "fill",
+  "stroke",
+  "color",
+  "width",
+  "height",
+  "left",
+  "right",
+  "top",
+  "bottom",
+  "center",
+  "middle",
+  "start",
+  "end",
+  "normal",
+  "bold",
+  "typecheck",
+  "lint",
+  "build",
+  "test",
+  "dev",
 ]);
 
 const WORKSPACE_PATH_RE =
-  /(?:^|[\s`'":(\[<])((?:\.[\\/])?(?:(?:src|tests|scripts|docs|app|routes|config|packages|lib|\.github|\.agents|\.cursor|\.windsurf|\.antigravity|\.claude|\.vscode|\.codex|\.zed|\.superpowers|dist|build|out|coverage)[\\/][A-Za-z0-9_./\\-]+\.[A-Za-z0-9]{1,10}|[A-Za-z0-9_.-]+\.(?:ts|tsx|js|jsx|mjs|cjs|json|md|mdc|sql|sqlite|py|php|go|rs|java|toml|yaml|yml|css|html|sh|ps1)))(?=$|[\s`'");,\]>!?]|:\d|\.(?:\s|$))/gu;
+  /(?:^|[\s`'":(\[<])((?:\.[\\/])?(?:(?:src|tests|scripts|docs|app|routes|config|packages|lib|webui|public|client|server|frontend|backend|\.github|\.agents|\.cursor|\.windsurf|\.antigravity|\.claude|\.vscode|\.codex|\.zed|\.superpowers|dist|build|out|coverage)[\\/][A-Za-z0-9_./\\-]+\.[A-Za-z0-9]{1,10}|[A-Za-z0-9_.-]+\.(?:ts|tsx|js|jsx|mjs|cjs|json|md|mdc|sql|sqlite|py|php|go|rs|java|toml|yaml|yml|css|html|sh|ps1)))(?=$|[\s`'");,\]>!?]|:\d|\.(?:\s|$))/gu;
 
 export function normalizeCandidatePath(raw: string): string {
   return raw
@@ -388,6 +420,28 @@ function hasSafeWorkspaceSegments(candidate: string): boolean {
   return true;
 }
 
+const CANONICAL_ROOT_CACHE_TTL_MS = 5_000;
+const CANONICAL_ROOT_CACHE_MAX = 64;
+const canonicalProjectRootCache = new Map<string, { readonly ts: number; readonly canonicalRoot: string }>();
+
+function getMemoizedCanonicalRoot(projectRoot: string): string | null {
+  const resolvedRoot = resolve(projectRoot);
+  const now = Date.now();
+  const cached = canonicalProjectRootCache.get(resolvedRoot);
+  if (cached && now - cached.ts <= CANONICAL_ROOT_CACHE_TTL_MS) {
+    return cached.canonicalRoot;
+  }
+  const rootStat = lstatSync(resolvedRoot);
+  if (!rootStat.isDirectory()) return null;
+  const canonicalRoot = realpathSync.native(resolvedRoot);
+  if (canonicalProjectRootCache.size >= CANONICAL_ROOT_CACHE_MAX && !canonicalProjectRootCache.has(resolvedRoot)) {
+    const oldest = canonicalProjectRootCache.keys().next().value;
+    if (oldest !== undefined) canonicalProjectRootCache.delete(oldest);
+  }
+  canonicalProjectRootCache.set(resolvedRoot, { ts: now, canonicalRoot });
+  return canonicalRoot;
+}
+
 export function resolveContainedWorkspaceFile(
   projectRoot: string,
   rawRelPath: string,
@@ -398,10 +452,8 @@ export function resolveContainedWorkspaceFile(
   if (!hasSafeWorkspaceSegments(candidate)) return null;
 
   try {
-    const resolvedRoot = resolve(projectRoot);
-    const rootStat = lstatSync(resolvedRoot);
-    if (!rootStat.isDirectory()) return null;
-    const canonicalRoot = realpathSync.native(resolvedRoot);
+    const canonicalRoot = getMemoizedCanonicalRoot(projectRoot);
+    if (!canonicalRoot) return null;
 
     const segments = candidate.split("/");
     let cursor = canonicalRoot;
@@ -450,7 +502,8 @@ export function isAcceptablePath(candidate: string, projectRoot?: string): boole
 
   if (projectRoot) {
     try {
-      const canonicalRoot = realpathSync.native(resolve(projectRoot));
+      const canonicalRoot = getMemoizedCanonicalRoot(projectRoot);
+      if (!canonicalRoot) return false;
       let cursor = canonicalRoot;
       for (const segment of candidate.split("/")) {
         cursor = join(cursor, segment);
@@ -482,6 +535,9 @@ function isAcceptableSymbol(sym: string, filePathBasenames: ReadonlySet<string>)
     return false;
   }
   if (/^\d/u.test(sym)) {
+    return false;
+  }
+  if (/^[0-9a-f]{7,40}$/u.test(sym) && /\d/u.test(sym)) {
     return false;
   }
   if (sym.startsWith("#")) {

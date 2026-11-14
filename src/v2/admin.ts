@@ -1331,6 +1331,7 @@ export async function runV2Admin(argv: readonly string[]): Promise<unknown> {
       port,
       host,
       entryUrl,
+      autoSyncBuild: process.env.MEMORY_V2_AUTO_SYNC_BUILD !== "0",
     });
     process.stderr.write(`Project Memory V2 WebUI listening at ${handle.url}\n`);
     await new Promise<void>((resolveStop) => {

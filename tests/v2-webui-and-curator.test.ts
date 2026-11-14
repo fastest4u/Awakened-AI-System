@@ -15,7 +15,6 @@ import { join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import { pathToFileURL } from "node:url";
-import { Script, runInNewContext } from "node:vm";
 import type { FreshStartRelease } from "../src/orchestrator/fresh-start/contracts.js";
 import { FreshStartInitializer } from "../src/orchestrator/fresh-start/fresh-start-initializer.js";
 import { canonicalJson } from "../src/orchestrator/serialization/canonical-json.js";
@@ -30,6 +29,7 @@ import {
   loadV2LaunchConfig,
 } from "../src/v2/config.js";
 import { V2MemoryCuratorAgent } from "../src/v2/curator.js";
+import { V2_PUBLIC_TOOL_DEFINITIONS } from "../src/v2/public-tools.js";
 import {
   buildMemoryKnowledgeGraph,
   discoverV2Projects,
@@ -427,82 +427,7 @@ test("Task 2: V2 WebUI Server, Knowledge Graph, Multi-Project Switcher, Governan
     assert.equal(chatJson.ok, true);
     assert.equal(chatJson.intent, "search");
 
-    // 8. Verify React + TanStack + shadcn/ui + Web Components MVC Architecture
-    assert.ok(html.includes("<pm-mission-control"), "HTML should mount <pm-mission-control> Web Component");
-    assert.ok(html.includes("--background"), "HTML should include shadcn/ui HSL CSS variables");
-    assert.ok(html.includes("/mvc/vendor.js"), "HTML should load React + TanStack vendor runtime");
-    assert.ok(html.includes("/mvc/models.js"), "HTML should load MVC Models");
-    assert.ok(html.includes("/mvc/controllers.js"), "HTML should load MVC Controllers");
-    assert.ok(html.includes("/mvc/shadcn-ui.js"), "HTML should load shadcn/ui components");
-    assert.ok(html.includes("/mvc/views.js"), "HTML should load React MVC Views");
-    assert.ok(html.includes("/mvc/web-components.js"), "HTML should load Custom Elements Web Components");
-
-    const vendorJs = await (await fetch(`${baseUrl}/mvc/vendor.js`)).text();
-    assert.ok(vendorJs.includes("QueryClient"));
-    assert.ok(vendorJs.includes("useQuery"));
-    assert.ok(vendorJs.includes("useMutation"));
-    assert.ok(vendorJs.includes("useReactTable"));
-    assert.ok(vendorJs.includes("flexRender"));
-
-    const modelsJs = await (await fetch(`${baseUrl}/mvc/models.js`)).text();
-    assert.ok(modelsJs.includes("ProjectModel"));
-    assert.ok(modelsJs.includes("MemoryNoteModel"));
-    assert.ok(modelsJs.includes("KnowledgeGraphModel"));
-    assert.ok(modelsJs.includes("CuratorModel"));
-    assert.ok(modelsJs.includes("McpToolModel"));
-
-    const controllersJs = await (await fetch(`${baseUrl}/mvc/controllers.js`)).text();
-    assert.ok(controllersJs.includes("MissionControlController"));
-    assert.ok(controllersJs.includes("KanbanController"));
-    assert.ok(controllersJs.includes("KnowledgeGraphController"));
-    assert.ok(controllersJs.includes("CuratorController"));
-    assert.ok(controllersJs.includes("McpConsoleController"));
-
-    const shadcnJs = await (await fetch(`${baseUrl}/mvc/shadcn-ui.js`)).text();
-    assert.ok(shadcnJs.includes("Button"));
-    assert.ok(shadcnJs.includes("Card"));
-    assert.ok(shadcnJs.includes("Badge"));
-    assert.ok(shadcnJs.includes("Tabs"));
-    assert.ok(shadcnJs.includes("Table"));
-    assert.ok(shadcnJs.includes("Dialog"));
-    assert.ok(shadcnJs.includes("LucideIcon"), "shadcn-ui.js should export LucideIcon SVG component");
-    assert.ok(shadcnJs.includes("LUCIDE_ICON_NODES"), "shadcn-ui.js should include official Lucide SVG vector definitions");
-    assert.ok(shadcnJs.includes("lucide-"), "LucideIcon should render standard lucide CSS classes");
-
-    const viewsJs = await (await fetch(`${baseUrl}/mvc/views.js`)).text();
-    assert.ok(viewsJs.includes("OverviewView"));
-    assert.ok(viewsJs.includes("KanbanBoardView"));
-    assert.ok(viewsJs.includes("KnowledgeGraphView"));
-    assert.ok(viewsJs.includes("CuratorStudioView"));
-    assert.ok(viewsJs.includes("McpConsoleView"));
-    assert.ok(viewsJs.includes("LucideIcon"), "MVC Views should render LucideIcon instead of emojis");
-    assert.ok(viewsJs.includes("humanKindLabel"), "KnowledgeGraphView should include human-friendly node translator");
-    assert.ok(viewsJs.includes("renderHumanMarkdownBlocks"), "Note Inspector should format content into readable blocks");
-    assert.ok(controllersJs.includes("selectedStory"), "KnowledgeGraphController should compute connected human story neighborhood");
-
-    const webComponentsJs = await (await fetch(`${baseUrl}/mvc/web-components.js`)).text();
-    assert.ok(webComponentsJs.includes('customElements.define("pm-mission-control"'));
-    assert.ok(webComponentsJs.includes('customElements.define("pm-overview-panel"'));
-    assert.ok(webComponentsJs.includes('customElements.define("pm-kanban-board"'));
-    assert.ok(webComponentsJs.includes('customElements.define("pm-knowledge-graph"'));
-    assert.ok(webComponentsJs.includes('customElements.define("pm-curator-studio"'));
-    assert.ok(webComponentsJs.includes('customElements.define("pm-mcp-console"'));
-
-    // Verify all 6 browser MVC scripts parse with zero V8 SyntaxErrors
-    for (const [filename, code] of [
-      ["vendor.js", vendorJs],
-      ["models.js", modelsJs],
-      ["controllers.js", controllersJs],
-      ["shadcn-ui.js", shadcnJs],
-      ["views.js", viewsJs],
-      ["web-components.js", webComponentsJs],
-    ] as const) {
-      assert.doesNotThrow(
-        () => new Script(code, { filename }),
-        `Browser script ${filename} must parse without SyntaxError`,
-      );
-    }
-
+    // 8. Verify SPA Architecture Manifest (/api/mvc/architecture)
     const archRes = await fetch(`${baseUrl}/api/mvc/architecture`);
     assert.equal(archRes.status, 200);
     const archJson = (await archRes.json()) as {
@@ -511,23 +436,24 @@ test("Task 2: V2 WebUI Server, Knowledge Graph, Multi-Project Switcher, Governan
       models: string[];
       views: string[];
       controllers: string[];
-      webComponents: string[];
+      stack: string[];
+      endpoints: string[];
     };
     assert.equal(archJson.ok, true);
-    assert.equal(archJson.pattern, "MVC");
-    assert.ok(archJson.webComponents.includes("pm-mission-control"));
-    assert.ok(archJson.webComponents.includes("pm-health-gauge"));
-    assert.ok(archJson.webComponents.includes("pm-distribution-chart"));
-    assert.ok(archJson.webComponents.includes("pm-activity-chart"));
-    assert.ok(archJson.webComponents.includes("pm-session-activity-map"));
-    assert.ok(viewsJs.includes("HealthGaugeChart"));
-    assert.ok(viewsJs.includes("DistributionDonutChart"));
-    assert.ok(viewsJs.includes("ActivityAreaChart"));
-    assert.ok(viewsJs.includes("SessionActivityMap"));
-    assert.ok(webComponentsJs.includes('customElements.define("pm-health-gauge"'));
-    assert.ok(webComponentsJs.includes('customElements.define("pm-distribution-chart"'));
-    assert.ok(webComponentsJs.includes('customElements.define("pm-activity-chart"'));
-    assert.ok(webComponentsJs.includes('customElements.define("pm-session-activity-map"'));
+    assert.equal(archJson.pattern, "SPA + REST API");
+    assert.ok(archJson.stack.some((s) => s.includes("React 19")));
+    assert.ok(archJson.stack.some((s) => s.includes("Vite 8")));
+    assert.ok(archJson.views.includes("OverviewView"));
+    assert.ok(archJson.views.includes("KanbanBoardView"));
+    assert.ok(archJson.views.includes("KnowledgeGraphView"));
+    assert.ok(archJson.views.includes("CuratorStudioView"));
+    assert.ok(archJson.views.includes("McpConsoleView"));
+    assert.ok(archJson.views.includes("NoteDetailSheet"));
+    assert.ok(archJson.models.includes("ProjectModel"));
+    assert.ok(archJson.models.includes("MemoryNoteModel"));
+    assert.ok(archJson.controllers.includes("WebUiMvcController"));
+    assert.ok(archJson.endpoints.includes("/api/bootstrap"));
+    assert.ok(archJson.endpoints.includes("/api/overview"));
 
     // 9. Verify Session <-> Memory Note Relationship Graph & Live AI Session Activity
     assert.ok(
@@ -975,253 +901,477 @@ test("Task 3: WebUI security hardening, CSRF/Host/Origin/GET-registration guards
       rmSync(existingUnregisteredDir, { recursive: true, force: true });
     }
 
-    // 7. Compile ALL 6 frontend MVC JS bundles via vm.Script + verify UX/Deep-Linking invariants
-    const bundlePaths = [
-      "/mvc/vendor.js",
-      "/mvc/models.js",
-      "/mvc/controllers.js",
-      "/mvc/shadcn-ui.js",
-      "/mvc/views.js",
-      "/mvc/web-components.js",
-    ] as const;
-    const bundles: Record<string, string> = {};
-    for (const p of bundlePaths) {
-      const res = await fetch(`${baseUrl}${p}`);
-      assert.equal(res.status, 200, `Expected 200 for ${p}`);
-      const code = await res.text();
-      assert.doesNotThrow(
-        () => new Script(code, { filename: p }),
-        `Syntax error detected in WebUI bundle ${p}`,
-      );
-      bundles[p] = code;
-    }
-
-    assert.ok(bundles["/mvc/vendor.js"]!.includes("data-pm-mount-id"), "vendor.js must isolate hook slots per mount instance");
-    assert.ok(bundles["/mvc/vendor.js"]!.includes("scrollTop"), "vendor.js must preserve scroll positions across renders");
-    assert.ok(bundles["/mvc/models.js"]!.includes("pm-csrf-token"), "models.js must attach X-PM-CSRF-Token from meta tag");
-    assert.ok(bundles["/mvc/controllers.js"]!.includes("hashchange"), "controllers.js must sync URL hash/query deep-links");
-    assert.ok(bundles["/mvc/controllers.js"]!.includes("openInGraph"), "controllers.js must expose openInGraph cross-view navigation");
-    assert.ok(bundles["/mvc/controllers.js"]!.includes("openInKanban"), "controllers.js must expose openInKanban cross-view navigation");
-    assert.ok(bundles["/mvc/shadcn-ui.js"]!.includes("crosshair") && bundles["/mvc/shadcn-ui.js"]!.includes("map-pin"));
-    assert.ok(html.includes(".pm-mobile-nav"), "CSS must include .pm-mobile-nav responsive navigation bar");
-    assert.ok(!bundles["/mvc/views.js"]!.includes("🎯") && !bundles["/mvc/views.js"]!.includes("📍"), "views.js must replace raw 🎯/📍 emojis with Lucide icons");
-    assert.ok(bundles["/mvc/views.js"]!.includes("ctrlKey") && bundles["/mvc/views.js"]!.includes("metaKey"), "Graph SVG wheel zoom must require ctrlKey/metaKey");
-    assert.ok(bundles["/mvc/views.js"]!.includes("causalTriads"), "views.js must surface Causal Triads");
-    assert.ok(
-      bundles["/mvc/views.js"]!.includes("relatedAdrs") &&
-        bundles["/mvc/views.js"]!.includes("relatedInsights"),
-      "views.js Causal Triads must render human-readable relatedAdrs/relatedInsights titles",
-    );
-    assert.ok(bundles["/mvc/views.js"]!.includes("vscode:") && bundles["/mvc/views.js"]!.includes("[[") , "views.js must safely render allowlisted links and clickable [[wikilinks]]");
-
-    // 8. Execute parseDeepLinkHash inside a VM sandbox for both #<tab>?... and #view=<tab>&... formats
-    const vmWindow: Record<string, unknown> = {
-      location: { hash: "#kanban?note=rec-123&q=lifecycle" },
-      history: { replaceState() {} },
-      React: {
-        useState: (init: unknown) => [typeof init === "function" ? (init as () => unknown)() : init, () => {}],
-        useEffect: () => {},
-        useMemo: (fn: () => unknown) => fn(),
-        useCallback: (fn: unknown) => fn,
-        createContext: () => ({}),
-        useContext: () => null,
-        createElement: () => ({}),
-      },
-      TanStackQuery: {
-        useQuery: () => ({}),
-        useMutation: () => ({}),
-        useQueryClient: () => ({}),
-      },
-      PM_MVC_MODELS: {},
-    };
-    runInNewContext(bundles["/mvc/controllers.js"]!, { window: vmWindow, URLSearchParams });
-    const parseDeepLinkHash = (
-      vmWindow.PM_MVC_CONTROLLERS as {
-        parseDeepLinkHash?: (defaultRoot: string) => {
-          tab: string;
-          note: string | null;
-          q: string;
-          kind?: string;
-        };
-      }
-    ).parseDeepLinkHash;
-    assert.equal(typeof parseDeepLinkHash, "function");
-
-    const parsedCanonical = parseDeepLinkHash!(fixture.projectRoot);
-    assert.equal(parsedCanonical.tab, "kanban");
-    assert.equal(parsedCanonical.note, "rec-123");
-    assert.equal(parsedCanonical.q, "lifecycle");
-
-    (vmWindow.location as { hash: string }).hash = "#view=graph&q=curator&type=file";
-    const parsedKeyValue = parseDeepLinkHash!(fixture.projectRoot);
-    assert.equal(parsedKeyValue.tab, "graph");
-    assert.equal(parsedKeyValue.q, "curator");
-    assert.equal(parsedKeyValue.kind, "file");
-
-    // 9. F6 Regression: Verify vendor.js preserves live Custom Element instances across parent root re-renders
-    class FakeNode {
-      nodeType = 1;
-      tagName: string;
-      id = "";
-      className = "";
-      textContent = "";
-      style: Record<string, string> = {};
-      dataset: Record<string, string> = {};
-      attrs = new Map<string, string>();
-      children: FakeNode[] = [];
-      parentNode: FakeNode | null = null;
-      scrollTop = 0;
-      scrollLeft = 0;
-      constructor(tag: string) {
-        this.tagName = tag.toUpperCase();
-      }
-      get childNodes() {
-        return this.children;
-      }
-      getAttributeNames() {
-        return [...this.attrs.keys()];
-      }
-      setAttribute(k: string, v: string) {
-        this.attrs.set(k, String(v));
-        if (k === "id") this.id = String(v);
-        if (k.startsWith("data-")) {
-          const camel = k
-            .slice(5)
-            .replace(/-([a-z])/gu, (_, c: string) => c.toUpperCase());
-          this.dataset[camel] = String(v);
-        }
-      }
-      getAttribute(k: string) {
-        return this.attrs.get(k) ?? null;
-      }
-      removeAttribute(k: string) {
-        this.attrs.delete(k);
-      }
-      appendChild(child: FakeNode) {
-        if (child.parentNode) child.parentNode.removeChild(child);
-        child.parentNode = this;
-        this.children.push(child);
-        return child;
-      }
-      removeChild(child: FakeNode) {
-        const idx = this.children.indexOf(child);
-        if (idx >= 0) this.children.splice(idx, 1);
-        child.parentNode = null;
-        return child;
-      }
-      addEventListener() {}
-      querySelectorAll() {
-        return [];
-      }
-      set innerHTML(_v: string) {
-        for (const c of this.children) c.parentNode = null;
-        this.children = [];
-      }
-    }
-    const fakeDoc = {
-      activeElement: null,
-      createElement: (tag: string) => new FakeNode(tag),
-      createElementNS: (_ns: string, tag: string) => new FakeNode(tag),
-      createTextNode: (t: string) => {
-        const n = new FakeNode("#text");
-        n.nodeType = 3;
-        n.textContent = t;
-        return n;
-      },
-      querySelector: () => null,
-      getElementById: () => null,
-    };
-    const vendorSandbox: Record<string, unknown> = {
-      window: { document: fakeDoc },
-      document: fakeDoc,
-      Node: { ELEMENT_NODE: 1 },
-      SVGElement: class {},
-      HTMLInputElement: class {},
-      HTMLTextAreaElement: class {},
-      HTMLElement: FakeNode,
-      Promise,
-      Map,
-      Set,
-      Object,
-      Array,
-      String,
-      Number,
-      Boolean,
-      Error,
-      queueMicrotask,
-      setTimeout,
-      clearTimeout,
-    };
-    vendorSandbox.window = vendorSandbox;
-    runInNewContext(bundles["/mvc/vendor.js"]!, vendorSandbox);
-    const VendorReact = vendorSandbox.React as {
-      createElement: (type: unknown, props: Record<string, unknown> | null, ...children: unknown[]) => unknown;
-      useState: <T>(init: T) => [T, (next: T) => void];
-    };
-    const VendorReactDOM = vendorSandbox.ReactDOM as {
-      createRoot: (container: FakeNode) => { render: (vnode: unknown) => void };
-    };
-    const hostContainer = new FakeNode("div");
-    const childContainer = new FakeNode("div");
-    let triggerParentRerender: ((v: number) => void) | null = null;
-    let setChildDraft: ((v: string) => void) | null = null;
-    let latestChildDraft = "";
-
-    function ChildPanel() {
-      const [draft, setDraft] = VendorReact.useState("initial");
-      setChildDraft = setDraft;
-      latestChildDraft = draft;
-      return VendorReact.createElement("div", null, draft);
-    }
-    const childRoot = VendorReactDOM.createRoot(childContainer);
-    childRoot.render(VendorReact.createElement(ChildPanel, null));
-
-    let createdCustomElements = 0;
-    const origCreateElement = fakeDoc.createElement;
-    fakeDoc.createElement = (tag: string) => {
-      if (tag.toLowerCase() === "pm-kanban-view") {
-        createdCustomElements += 1;
-        const ce = new FakeNode(tag);
-        ce.appendChild(childContainer);
-        return ce;
-      }
-      return origCreateElement(tag);
-    };
-
-    function ParentShell() {
-      const [toastTick, setToastTick] = VendorReact.useState(0);
-      triggerParentRerender = setToastTick;
-      return VendorReact.createElement(
-        "div",
-        { className: `tick-${toastTick}` },
-        VendorReact.createElement("pm-kanban-view", { "data-scope": "p1" }),
-      );
-    }
-    const parentRoot = VendorReactDOM.createRoot(hostContainer);
-    parentRoot.render(VendorReact.createElement(ParentShell, null));
-    assert.equal(createdCustomElements, 1);
-
-    // Mutate child state, then trigger parent re-render (like a toast or theme toggle)
-    setChildDraft!("typed-user-input");
-    await Promise.resolve();
-    assert.equal(latestChildDraft, "typed-user-input");
-    triggerParentRerender!(1);
-    await Promise.resolve();
-    triggerParentRerender!(2);
-    await Promise.resolve();
-    assert.equal(
-      createdCustomElements,
-      1,
-      "Parent root re-render must reuse live <pm-kanban-view> custom element instead of recreating it",
-    );
-    assert.equal(
-      latestChildDraft,
-      "typed-user-input",
-      "Child custom element hook state must survive parent root re-renders",
-    );
   } finally {
     await serverHandle.close();
     rmSync(unregisteredPath, { recursive: true, force: true });
     await fixture.cleanup();
   }
 });
+
+test("Task 4: WebUI Readability — Modal Markdown Unwrapping, Orbital/Flow Decluttering, Kanban Badge Caps & Session Cards", async (t) => {
+  const fixture = await createActiveStoreFixture("pm-v2-webui-readability-");
+  const serverHandle = await startV2WebUiServer({
+    defaultProjectRoot: fixture.projectRoot,
+    port: 0,
+    host: "127.0.0.1",
+    foundations: new Map([[fixture.projectRoot, fixture.foundation]]),
+  });
+
+  try {
+    const baseUrl = serverHandle.url;
+    const htmlRes = await fetch(`${baseUrl}/`);
+    const html = await htmlRes.text();
+    const csrfToken = /<meta\s+name="pm-csrf-token"\s+content="([^"]+)"/u.exec(html)![1]!;
+
+    await t.test("4.1 GET /api/notes/:id unwraps content.body and derives human title", async () => {
+      const createRes = await fetch(`${baseUrl}/api/governance`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-pm-csrf-token": csrfToken },
+        body: JSON.stringify({
+          projectRoot: fixture.projectRoot,
+          action: "writeADR",
+          title: "Readable Modal Architecture",
+          summary: "Unwrap content.body in src/v2/webui/models.ts (`MemoryNoteModel`).",
+          content: "# Readable Modal Architecture\n\n- Bullet alpha\n- Bullet beta",
+        }),
+      });
+      assert.equal(createRes.status, 200);
+      const created = (await createRes.json()) as { result: { recordId: string } };
+      const noteId = created.result.recordId;
+
+      const noteDetailRes = await fetch(
+        `${baseUrl}/api/notes/${encodeURIComponent(noteId)}?project=${encodeURIComponent(fixture.projectRoot)}`,
+      );
+      assert.equal(noteDetailRes.status, 200);
+      const noteDetailJson = (await noteDetailRes.json()) as {
+        ok: boolean;
+        note: {
+          recordId: string;
+          title?: string;
+          summary?: string;
+          body?: string;
+          content?: unknown;
+        };
+      };
+      assert.equal(noteDetailJson.ok, true);
+      assert.equal(
+        noteDetailJson.note.title,
+        "Readable Modal Architecture",
+        "GET /api/notes/:id must derive human-readable title instead of leaving it undefined",
+      );
+      assert.equal(
+        typeof noteDetailJson.note.body,
+        "string",
+        "GET /api/notes/:id must expose normalized string body from content.body",
+      );
+      assert.ok(noteDetailJson.note.body!.includes("Bullet alpha"));
+      assert.ok(!noteDetailJson.note.body!.includes("[object Object]"));
+
+      const missingRes = await fetch(
+        `${baseUrl}/api/notes/non-existent-note-id-9999?project=${encodeURIComponent(fixture.projectRoot)}`,
+      );
+      assert.equal(
+        missingRes.status,
+        404,
+        "GET /api/notes/:id must return HTTP 404 instead of fabricating a fake provisional note with raw UUID title",
+      );
+      const missingJson = (await missingRes.json()) as { ok: boolean; error: string };
+      assert.equal(missingJson.ok, false);
+      assert.equal(missingJson.error, "NOTE_NOT_FOUND");
+    });
+
+  } finally {
+    await serverHandle.close();
+    await fixture.cleanup();
+  }
+});
+
+test("Task 5: WebUI Usability & System Efficiency Upgrades (E1-E4 & U1-U5)", async (t) => {
+  const fixture = await createActiveStoreFixture("pm-v2-webui-efficiency-");
+  const serverHandle = await startV2WebUiServer({
+    defaultProjectRoot: fixture.projectRoot,
+    foundations: new Map([[fixture.projectRoot, fixture.foundation]]),
+    port: 0,
+  });
+
+  try {
+    const baseUrl = serverHandle.url;
+    const htmlRes = await fetch(`${baseUrl}/`);
+    assert.equal(htmlRes.status, 200);
+    const html = await htmlRes.text();
+    const csrfMatch = html.match(/<meta\s+name="pm-csrf-token"\s+content="([^"]+)"/iu);
+    assert.ok(csrfMatch?.[1], "Expected non-empty pm-csrf-token meta tag");
+    const csrfToken = csrfMatch![1];
+
+    await t.test("5.2 Backend Efficiency, ETag/Gzip Static Bundles, Zero-Work Curator & Authentic Analytics (E3 + E4 + U1 + U2)", async () => {
+      // Empty vault overview: activitySeries must reflect real 0-note state, NOT synthetic 1..6 staircase
+      const emptyOverviewRes = await fetch(
+        `${baseUrl}/api/overview?project=${encodeURIComponent(fixture.projectRoot)}`,
+      );
+      assert.equal(emptyOverviewRes.status, 200);
+      const emptyOverview = (await emptyOverviewRes.json()) as {
+        ok: boolean;
+        analytics: {
+          activitySeries: Array<{ label: string; notes: number; verified: number; sessions: number }>;
+        };
+      };
+      assert.equal(emptyOverview.ok, true);
+      assert.ok(emptyOverview.analytics.activitySeries.length >= 1);
+      assert.ok(
+        emptyOverview.analytics.activitySeries.every((pt) => pt.notes === 0 && pt.verified === 0),
+        `Empty vault activitySeries must report 0 notes instead of synthetic staircase: ${JSON.stringify(emptyOverview.analytics.activitySeries)}`,
+      );
+
+      // Zero-work autoCurate on clean vault must NOT spawn empty governed sessions
+      const curator = new V2MemoryCuratorAgent(fixture.foundation);
+      const lifecycleBefore = (await fixture.foundation.content.invoke(
+        "memory_lifecycleStatus",
+        {},
+      )) as { sessions?: unknown[] };
+      const sessionCountBefore = lifecycleBefore.sessions?.length ?? 0;
+
+      const noopReceipt = await curator.autoCurate();
+      assert.equal(noopReceipt.ok, true);
+      assert.equal(noopReceipt.promoted.length, 0);
+      assert.equal(noopReceipt.superseded.length, 0);
+      assert.equal(noopReceipt.expired.length, 0);
+
+      const lifecycleAfter = (await fixture.foundation.content.invoke(
+        "memory_lifecycleStatus",
+        {},
+      )) as { sessions?: unknown[] };
+      assert.equal(
+        lifecycleAfter.sessions?.length ?? 0,
+        sessionCountBefore,
+        "autoCurate() on a clean vault with 0 actionable items must NOT spawn a governed session",
+      );
+
+      // Interrogative Thai question containing 'อนุมัติ' must route to read-only 'audit', NOT 'auto_curate'
+      const questionReply = await curator.chat({ message: "มีรายการรออนุมัติกี่อัน?" });
+      assert.equal(
+        questionReply.intent,
+        "audit",
+        "Question containing 'อนุมัติ' + 'กี่' + '?' must route to read-only audit intent",
+      );
+
+      // Natural Thai ADR command without colon ('บันทึก ADR เรื่อง ...') must create ADR
+      const naturalAdrReply = await curator.chat({
+        message: "บันทึก ADR เรื่อง ใช้ In-Place DOM Reconciliation ใน vendor.js",
+      });
+      assert.equal(
+        naturalAdrReply.intent,
+        "write_adr",
+        "Natural Thai 'บันทึก ADR เรื่อง ...' without colon must match write_adr intent",
+      );
+      // Cleanup session opened by naturalAdrReply if any
+      const openSessions = (await fixture.foundation.content.invoke("memory_lifecycleStatus", {})) as {
+        sessions?: Array<{ sessionId: string; semanticState: string }>;
+      };
+      for (const s of openSessions.sessions ?? []) {
+        if (s.semanticState === "active") {
+          await fixture.foundation.content.invoke("memory_sessionEnd", {
+            sessionId: s.sessionId,
+            summary: "End test ADR session",
+            finalize: true,
+          });
+        }
+      }
+
+    });
+
+    await t.test("5.4 Code Review Regressions (C1, C2, I1-I6, M1-M4)", async () => {
+      // C1 & I2: Concurrent read + write must not poison #cachedProjectionManifest or generation-keyed WebUI read cache
+      const [concurrentOverviewRes, createdAdr] = await Promise.all([
+        fetch(`${baseUrl}/api/overview?project=${encodeURIComponent(fixture.projectRoot)}`),
+        fixture.foundation.content.invoke("memory_writeADR", {
+          title: "C1 Concurrent Projection Safety ADR",
+          summary: "Verify concurrent read+write never poisons projection cache",
+          content: "# C1 Concurrent Projection Safety ADR\n\nBody text",
+        }) as Promise<{ recordId: string }>,
+      ]);
+      assert.equal(concurrentOverviewRes.status, 200);
+      assert.ok(createdAdr.recordId, "Expected recordId from memory_writeADR");
+
+      const noteDetailAfterWrite = await fetch(
+        `${baseUrl}/api/notes/${encodeURIComponent(createdAdr.recordId)}?project=${encodeURIComponent(fixture.projectRoot)}`,
+      );
+      assert.equal(
+        noteDetailAfterWrite.status,
+        200,
+        "C1: Verified note detail read immediately after concurrent read+write must find the new ADR",
+      );
+      const freshOverviewRes = await fetch(
+        `${baseUrl}/api/overview?project=${encodeURIComponent(fixture.projectRoot)}`,
+      );
+      const freshOverviewJson = (await freshOverviewRes.json()) as {
+        audit: { counts: { totalNotes: number } };
+      };
+      assert.ok(
+        freshOverviewJson.audit.counts.totalNotes >= 2,
+        `I2: Post-write /api/overview must immediately reflect updated globalPosition instead of stale cache (got ${freshOverviewJson.audit.counts.totalNotes})`,
+      );
+      // Cleanup any auto-session opened by memory_writeADR
+      const postWriteLifecycle = (await fixture.foundation.content.invoke("memory_lifecycleStatus", {})) as {
+        sessions?: Array<{ sessionId: string; semanticState: string }>;
+      };
+      for (const s of postWriteLifecycle.sessions ?? []) {
+        if (s.semanticState === "active") {
+          await fixture.foundation.content.invoke("memory_sessionEnd", {
+            sessionId: s.sessionId,
+            summary: "Close C1 test session",
+            finalize: true,
+          });
+        }
+      }
+
+      // I3: V2_PUBLIC_TOOL_DEFINITIONS required metadata + alias-free starter template + clickable parameter pills
+      const supersedeDef = V2_PUBLIC_TOOL_DEFINITIONS.find((d) => d.name === "memory_supersede");
+      const supersedeSchema = supersedeDef?.inputSchema as unknown as { required?: string[] } | undefined;
+      assert.ok(
+        Array.isArray(supersedeSchema?.required) &&
+          supersedeSchema.required.includes("supersedingRecordId"),
+        "I3: memory_supersede inputSchema must declare required: ['supersedingRecordId']",
+      );
+      // I6: Curator explicit write prefix beats interrogative body, 'เท่าไหร่' is interrogative, and clean autoCurate omits sessionStart/End in executedTools
+      const curator = new V2MemoryCuratorAgent(fixture.foundation);
+      const adrWithQuestion = await curator.chat({
+        message: "บันทึก ADR: ควรใช้ Redis ไหม? สรุปใช้ SQLite",
+        autoExecute: false,
+      });
+      assert.equal(
+        adrWithQuestion.intent,
+        "write_adr",
+        "I6: Explicit 'บันทึก ADR: ...' command containing '?' or 'ไหม' in body must still match write_adr",
+      );
+      const howManyApproved = await curator.chat({ message: "อนุมัติไปเท่าไหร่" });
+      assert.equal(
+        howManyApproved.intent,
+        "audit",
+        "I6: Thai question 'อนุมัติไปเท่าไหร่' must route to read-only audit, never auto_curate",
+      );
+
+      const cleanFixture = await createActiveStoreFixture("pm-v2-clean-curator-");
+      try {
+        const cleanCurator = new V2MemoryCuratorAgent(cleanFixture.foundation);
+        const cleanChat = await cleanCurator.chat({ message: "จัดระเบียบความจำ" });
+        assert.equal(cleanChat.intent, "auto_curate");
+        assert.ok(
+          !cleanChat.executedTools.includes("memory_sessionStart") &&
+            !cleanChat.executedTools.includes("memory_sessionEnd"),
+          `I6: Clean-vault noop auto_curate must NOT claim memory_sessionStart/End in executedTools: ${JSON.stringify(cleanChat.executedTools)}`,
+        );
+      } finally {
+        await cleanFixture.cleanup();
+      }
+    });
+
+    await t.test("5.5 Overview & Graph causalTriads exclude superseded/expired notes and missing repo files", async () => {
+      mkdirSync(join(fixture.projectRoot, "src"), { recursive: true });
+      writeFileSync(
+        join(fixture.projectRoot, "src", "live-module.ts"),
+        "export function liveHandler() { return true; }\n",
+        "utf8",
+      );
+
+      const triadSession = (await fixture.foundation.content.invoke("memory_sessionStart", {
+        taskSummary: "Seed active and superseded notes for causalTriad filtering regression",
+        contextArea: "webui causalTriads",
+        includeContext: false,
+      })) as { sessionId: string };
+
+      const obsoleteMistake = (await fixture.foundation.content.invoke("memory_writeMistake", {
+        sessionId: triadSession.sessionId,
+        title: "Obsolete Legacy MVC Mistake",
+        summary: "Bug in src/deleted-legacy.ts and src/live-module.ts (`liveHandler`).",
+        autoVerify: true,
+        verificationMethod: "test-verified",
+      })) as { recordId: string };
+
+      const activeMistake = (await fixture.foundation.content.invoke("memory_writeMistake", {
+        sessionId: triadSession.sessionId,
+        title: "Active Handler Mistake",
+        summary: "Race condition in src/live-module.ts and src/deleted-legacy.ts (`liveHandler`).",
+        autoVerify: true,
+        verificationMethod: "test-verified",
+      })) as { recordId: string };
+
+      const obsoleteAdr = (await fixture.foundation.content.invoke("memory_writeADR", {
+        sessionId: triadSession.sessionId,
+        title: "Obsolete Legacy MVC ADR",
+        summary: "Old architecture in src/live-module.ts (`liveHandler`).",
+        autoVerify: true,
+        verificationMethod: "test-verified",
+      })) as { recordId: string };
+
+      const activeAdr = (await fixture.foundation.content.invoke("memory_writeADR", {
+        sessionId: triadSession.sessionId,
+        title: "Active Handler Architecture ADR",
+        summary: "New architecture in src/live-module.ts replacing src/deleted-legacy.ts (`liveHandler`).",
+        autoVerify: true,
+        verificationMethod: "test-verified",
+      })) as { recordId: string };
+
+      const staleSessionA = (await fixture.foundation.content.invoke("memory_sessionStart", {
+        taskSummary: "Stale mistake session A",
+        contextArea: "legacy",
+        includeContext: false,
+      })) as { sessionId: string };
+      const staleOnlyMistake = (await fixture.foundation.content.invoke("memory_writeMistake", {
+        sessionId: staleSessionA.sessionId,
+        title: "Legacy Deleted-Only File Mistake",
+        summary: "Historical bug in src/deleted-only-a.ts (`staleOnlyFn`).",
+        autoVerify: true,
+        verificationMethod: "test-verified",
+      })) as { recordId: string };
+      await fixture.foundation.content.invoke("memory_sessionEnd", {
+        sessionId: staleSessionA.sessionId,
+        summary: "End stale A",
+        finalize: true,
+      });
+
+      const staleSessionB = (await fixture.foundation.content.invoke("memory_sessionStart", {
+        taskSummary: "Stale ADR session B",
+        contextArea: "legacy",
+        includeContext: false,
+      })) as { sessionId: string };
+      await fixture.foundation.content.invoke("memory_writeADR", {
+        sessionId: staleSessionB.sessionId,
+        title: "Legacy Deleted-Only File ADR",
+        summary: "Legacy design in src/deleted-only-a.ts.",
+        autoVerify: true,
+        verificationMethod: "test-verified",
+      });
+      await fixture.foundation.content.invoke("memory_sessionEnd", {
+        sessionId: staleSessionB.sessionId,
+        summary: "End stale B",
+        finalize: true,
+      });
+
+      await fixture.foundation.content.invoke("memory_supersede", {
+        sessionId: triadSession.sessionId,
+        recordId: obsoleteMistake.recordId,
+        supersedingRecordId: activeAdr.recordId,
+        reason: "Replaced by active ADR",
+      });
+      await fixture.foundation.content.invoke("memory_supersede", {
+        sessionId: triadSession.sessionId,
+        recordId: obsoleteAdr.recordId,
+        supersedingRecordId: activeAdr.recordId,
+        reason: "Replaced by active ADR",
+      });
+
+      await fixture.foundation.content.invoke("memory_sessionEnd", {
+        sessionId: triadSession.sessionId,
+        summary: "Finish causalTriads filtering test setup",
+        finalize: true,
+      });
+
+      const overviewRes = await fetch(
+        `${baseUrl}/api/overview?project=${encodeURIComponent(fixture.projectRoot)}`,
+      );
+      assert.equal(overviewRes.status, 200);
+      const overviewJson = (await overviewRes.json()) as {
+        ok: boolean;
+        causalTriads: Array<{
+          anchorMistakeId: string;
+          relatedAdrIds: string[];
+          sharedContext: string[];
+        }>;
+      };
+      assert.equal(overviewJson.ok, true);
+      assert.ok(
+        !overviewJson.causalTriads.some((c) => c.anchorMistakeId === obsoleteMistake.recordId),
+        "Superseded mistake must NOT appear in /api/overview causalTriads",
+      );
+      const activeTriad = overviewJson.causalTriads.find(
+        (c) => c.anchorMistakeId === activeMistake.recordId,
+      );
+      assert.ok(activeTriad, "Active mistake should produce a causal triad in /api/overview");
+      assert.ok(
+        activeTriad.relatedAdrIds.includes(activeAdr.recordId),
+        "Active triad should link activeAdr",
+      );
+      assert.ok(
+        !activeTriad.relatedAdrIds.includes(obsoleteAdr.recordId),
+        "Active triad must NOT link superseded ADR",
+      );
+      assert.ok(
+        activeTriad.sharedContext.includes("file:src/live-module.ts"),
+        "Active triad should retain existing repo file context",
+      );
+      assert.ok(
+        !activeTriad.sharedContext.includes("file:src/deleted-legacy.ts"),
+        "Active triad must NOT include deleted/nonexistent repo files in sharedContext",
+      );
+      assert.ok(
+        !overviewJson.causalTriads.some((c) => c.anchorMistakeId === staleOnlyMistake.recordId),
+        "Mistake & ADR sharing only a deleted repo file must NOT form a causal triad in /api/overview",
+      );
+
+      // Direct unit verification that buildMemoryKnowledgeGraph suppresses causal-triad for superseded inputs while keeping supersedes edges
+      const unitGraph = buildMemoryKnowledgeGraph([
+        {
+          recordId: "sup-mistake",
+          recordKind: "mistake",
+          title: "Superseded Legacy Mistake",
+          summary: "Old bug in src/live-module.ts (`liveHandler`).",
+          status: "superseded",
+        },
+        {
+          recordId: "cur-adr",
+          recordKind: "adr",
+          title: "Current Active ADR",
+          summary: "Current design in src/live-module.ts (`liveHandler`).",
+          status: "verified",
+          supersedesRecordIds: ["sup-mistake"],
+        },
+      ]);
+      assert.ok(
+        !unitGraph.edges.some(
+          (e) => e.relation === "causal-triad" && e.source === "note:sup-mistake",
+        ),
+        "buildMemoryKnowledgeGraph must NOT emit causal-triad edge from superseded note",
+      );
+      assert.ok(
+        unitGraph.edges.some(
+          (e) => e.relation === "supersedes" && e.source === "note:cur-adr" && e.target === "note:sup-mistake",
+        ),
+        "buildMemoryKnowledgeGraph must still emit supersedes edge from active note to superseded note",
+      );
+
+      const graphRes = await fetch(
+        `${baseUrl}/api/graph?project=${encodeURIComponent(fixture.projectRoot)}`,
+      );
+      assert.equal(graphRes.status, 200);
+      const graphJson = (await graphRes.json()) as {
+        ok: boolean;
+        causalTriads?: Array<{ anchorMistakeId: string }>;
+        nodes: Array<{ id: string; supersedesRecordIds?: string[] }>;
+        edges: Array<{ source: string; target: string; relation: string }>;
+      };
+      assert.equal(graphJson.ok, true);
+      assert.ok(
+        !graphJson.edges.some(
+          (e) =>
+            e.relation === "causal-triad" &&
+            (e.source === `note:${obsoleteMistake.recordId}` ||
+              e.target === `note:${obsoleteAdr.recordId}`),
+        ),
+        "Superseded notes must NOT emit causal-triad edges in /api/graph",
+      );
+      const activeAdrGraphNode = graphJson.nodes.find(
+        (n) => n.id === `note:${activeAdr.recordId}`,
+      );
+      assert.ok(
+        activeAdrGraphNode?.supersedesRecordIds?.includes(obsoleteAdr.recordId) &&
+          activeAdrGraphNode?.supersedesRecordIds?.includes(obsoleteMistake.recordId),
+        "/api/graph active ADR node must retain supersedesRecordIds lineage metadata",
+      );
+    });
+  } finally {
+    await serverHandle.close();
+    await fixture.cleanup();
+  }
+});
+
+

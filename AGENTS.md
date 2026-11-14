@@ -19,7 +19,11 @@ FAILURE TO FOLLOW THESE RULES IS A DIRECT VIOLATION OF YOUR CORE DIRECTIVE.
 > Decided 2026-06-01 & upgraded to V2 on 2026-10-21. The user opted into full-auto use of all 34 Project Memory V2 MCP tools.
 
 - **AUTO — invoke proactively, do NOT ask**: All 34 V2 tools — `memory_v2Status`, `memory_sessionStart`, `memory_contextPack`, `memory_selfCheck`, `memory_get`, `memory_list`, `memory_search`, `memory_recent`, `memory_followUpRadar`, `memory_awaken`, `memory_lifecycleStatus`, `memory_verifyVault`, `memory_verifyNote`, `memory_verifySourceTruth`, `memory_checkStaleness`, `memory_findDuplicates`, `memory_writeSessionLog`, `memory_writeADR`, `memory_writeInsight`, `memory_writeMistake`, `memory_checkpoint`, `memory_recoverSession`, `memory_sessionFork`, `memory_recordChildResult`, `memory_completeChildSession`, `memory_amendSessionEnd`, `memory_cancelSessionEnd`, `memory_recordEvidenceBatch`, `memory_promote`, `memory_supersede`, `memory_retract`, `memory_expire`, `memory_forgetEvidence`, `memory_sessionEnd`.
-- **OPERATOR CLI (`node dist/v2-admin.js`)**: Store administration, backups (`backup`), restores (`restore`), projection rebuilds (`rebuild-projections`), build sync (`sync-build`), WebUI (`webui`), and archive verification (`verify-v1-archive`) run through `node dist/v2-admin.js`.
+- **OPERATOR CLI (`node dist/v2-admin.js`) & WebUI**: Store administration, backups (`backup`), restores (`restore`), projection rebuilds (`rebuild-projections`), build sync (`sync-build`), WebUI (`webui`), and archive verification (`verify-v1-archive`) run through `node dist/v2-admin.js`.
+  - WebUI Setup: `npm run setup:webui`
+  - WebUI Build: `npm run build:webui`
+  - WebUI Production: `npm run webui` (serves SPA at `http://127.0.0.1:4321`)
+  - WebUI Dev Mode: `npm run webui` + `npm run dev:webui` (Vite dev server with HMR at `http://localhost:5173`)
 
 <!-- context7 -->
 Use Context7 MCP to fetch current documentation whenever the user asks about a library, framework, SDK, API, CLI tool, or cloud service. This includes API syntax, configuration, version migration, library-specific debugging, setup instructions, and CLI tool usage. Use it even for well-known tools because local knowledge may be stale. Prefer Context7 over web search for library documentation.

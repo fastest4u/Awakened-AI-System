@@ -141,6 +141,7 @@ export interface McpToolDefinition {
   readonly inputSchema: {
     readonly type: "object";
     readonly properties: Readonly<Record<string, unknown>>;
+    readonly required?: readonly string[];
     readonly additionalProperties?: boolean;
   };
   readonly annotations: {
@@ -265,7 +266,14 @@ const CHECKPOINT_DRAFT_PROPS = Object.freeze({
 });
 
 const PUBLIC_TOOL_SCHEMA_CATALOG: Readonly<
-  Record<string, { readonly description: string; readonly properties: Readonly<Record<string, unknown>> }>
+  Record<
+    string,
+    {
+      readonly description: string;
+      readonly properties: Readonly<Record<string, unknown>>;
+      readonly required?: readonly string[];
+    }
+  >
 > = Object.freeze({
   memory_search: Object.freeze({
     description: "Hybrid BM25, Soft-OR, and cross-session semantic/lexical search across governed V2 project memory.",
@@ -503,6 +511,7 @@ const PUBLIC_TOOL_SCHEMA_CATALOG: Readonly<
   }),
   memory_recordChildResult: Object.freeze({
     description: "Record structured findings and outcome report from a forked child session.",
+    required: Object.freeze(["childSessionId"]),
     properties: Object.freeze({
       ...PROJECT_ROOT_PROP,
       parentSessionId: Object.freeze({ type: "string", description: "Parent root session UUID." }),
@@ -518,6 +527,7 @@ const PUBLIC_TOOL_SCHEMA_CATALOG: Readonly<
   }),
   memory_completeChildSession: Object.freeze({
     description: "Complete a forked child session after its report has been recorded.",
+    required: Object.freeze(["childSessionId", "reportId"]),
     properties: Object.freeze({
       ...PROJECT_ROOT_PROP,
       parentSessionId: Object.freeze({ type: "string", description: "Parent root session UUID." }),
@@ -547,6 +557,7 @@ const PUBLIC_TOOL_SCHEMA_CATALOG: Readonly<
   }),
   memory_cancelSessionEnd: Object.freeze({
     description: "Cancel an active session-end workflow and resume the session.",
+    required: Object.freeze(["workflowId"]),
     properties: Object.freeze({
       ...PROJECT_ROOT_PROP,
       ...SESSION_ID_PROP,
@@ -591,6 +602,7 @@ const PUBLIC_TOOL_SCHEMA_CATALOG: Readonly<
   }),
   memory_supersede: Object.freeze({
     description: "Supersede an outdated or conflicted governed note with a newer active note.",
+    required: Object.freeze(["supersedingRecordId"]),
     properties: Object.freeze({
       ...PROJECT_ROOT_PROP,
       ...SESSION_ID_PROP,
@@ -660,6 +672,7 @@ function buildPublicToolDefinitions(): readonly McpToolDefinition[] {
         inputSchema: Object.freeze({
           type: "object",
           properties: schemaMeta?.properties ?? Object.freeze({ ...PROJECT_ROOT_PROP }),
+          ...(schemaMeta?.required ? { required: schemaMeta.required } : {}),
           additionalProperties: true,
         }),
         annotations: Object.freeze({
@@ -1015,6 +1028,13 @@ export class V2PublicToolRouter {
       readonly lowerSearchText: string;
     }>;
   } | null = null;
+  #inflightProjectionPublish: {
+    readonly targetPos: bigint;
+    readonly workspaceId: string;
+    readonly branchScopeId: string | null;
+    readonly branchRef: string | null;
+    readonly promise: Promise<ProjectionManifestV3>;
+  } | null = null;
 
   constructor(options: V2PublicToolRouterOptions) {
     this.#connection = options.connection;
@@ -1052,8 +1072,22 @@ export class V2PublicToolRouter {
       establishedAt: nowIso,
       contextFingerprint: "",
     };
+    const branchRef = options.workspace.kind === "git" ? options.workspace.branchRef : null;
+    const inspectedBranchScopeId: BranchScopeId | null = options.workspace.kind === "git"
+      ? new BranchScopeRepository().inspect(
+          options.connection,
+          options.identity.projectId as ProjectId,
+          {
+            branchRef: options.workspace.branchRef,
+            headCommit: options.workspace.headCommit,
+            detached: options.workspace.detached,
+          },
+        )
+      : null;
+
     this.#rootContext = Object.freeze({
       workspace: options.workspace,
+      ...(inspectedBranchScopeId !== null ? { branchScopeId: inspectedBranchScopeId } : {}),
       checkedAt: nowIso,
       binding: Object.freeze({
         ...baseBinding,
@@ -1069,6 +1103,7 @@ export class V2PublicToolRouter {
     };
     this.#childContext = Object.freeze({
       workspace: options.workspace,
+      ...(inspectedBranchScopeId !== null ? { branchScopeId: inspectedBranchScopeId } : {}),
       checkedAt: nowIso,
       binding: Object.freeze({
         ...childBindingBase,
@@ -1076,30 +1111,18 @@ export class V2PublicToolRouter {
       }),
     });
 
-    const branchRef = options.workspace.kind === "git" ? options.workspace.branchRef : null;
-    let branchScopeId: BranchScopeId | null = null;
-    if (options.workspace.kind === "git") {
-      branchScopeId = new BranchScopeRepository().inspect(
-        options.connection,
-        options.identity.projectId as ProjectId,
-        {
-          branchRef: options.workspace.branchRef,
-          headCommit: options.workspace.headCommit,
-          detached: options.workspace.detached,
-        },
-      );
-      if (!branchScopeId) {
-        const branchScopeRow = options.connection
-          .prepare(
-            `SELECT branch_scope_id FROM branch_scopes
-             WHERE project_id = $projectId AND retired_at IS NULL
-             ORDER BY created_at DESC LIMIT 1`,
-          )
-          .get({
-            $projectId: options.identity.projectId,
-          }) as { branch_scope_id?: string } | undefined;
-        branchScopeId = (branchScopeRow?.branch_scope_id ?? null) as BranchScopeId | null;
-      }
+    let branchScopeId: BranchScopeId | null = inspectedBranchScopeId;
+    if (options.workspace.kind === "git" && !branchScopeId) {
+      const branchScopeRow = options.connection
+        .prepare(
+          `SELECT branch_scope_id FROM branch_scopes
+           WHERE project_id = $projectId AND retired_at IS NULL
+           ORDER BY created_at DESC LIMIT 1`,
+        )
+        .get({
+          $projectId: options.identity.projectId,
+        }) as { branch_scope_id?: string } | undefined;
+      branchScopeId = (branchScopeRow?.branch_scope_id ?? null) as BranchScopeId | null;
     }
 
     this.#projectionBinding = Object.freeze({
@@ -1372,6 +1395,10 @@ export class V2PublicToolRouter {
     });
   }
 
+  getGlobalPosition(): string {
+    return this.#currentGlobalPosition();
+  }
+
   close(): void {
     try {
       this.#lifecycleRuntime.dispose();
@@ -1636,8 +1663,9 @@ export class V2PublicToolRouter {
       liveWorkspace.branchRef !== this.#workspace.branchRef ||
       liveWorkspace.headCommit !== this.#workspace.headCommit ||
       liveWorkspace.detached !== this.#workspace.detached;
+    const scopeChanged = (resolvedScopeId ?? undefined) !== this.#rootContext.branchScopeId;
 
-    if (workspaceChanged) {
+    if (workspaceChanged || scopeChanged) {
       this.#workspace = liveWorkspace;
       const nowIso = new Date().toISOString();
       const updatedRootBase = {
@@ -1647,6 +1675,7 @@ export class V2PublicToolRouter {
       };
       this.#rootContext = Object.freeze({
         workspace: liveWorkspace,
+        ...(resolvedScopeId !== null ? { branchScopeId: resolvedScopeId } : {}),
         checkedAt: nowIso,
         binding: Object.freeze({
           ...updatedRootBase,
@@ -1660,6 +1689,7 @@ export class V2PublicToolRouter {
       };
       this.#childContext = Object.freeze({
         workspace: liveWorkspace,
+        ...(resolvedScopeId !== null ? { branchScopeId: resolvedScopeId } : {}),
         checkedAt: nowIso,
         binding: Object.freeze({
           ...updatedChildBase,
@@ -1686,6 +1716,23 @@ export class V2PublicToolRouter {
       });
       this.#cachedProjectedNotes = null;
     }
+  }
+
+  #ensureLiveBranchScopeId(): void {
+    this.#refreshLiveGitBinding();
+    if (this.#readOnlyMode || this.#workspace.kind !== "git") return;
+    if (this.#rootContext.branchScopeId !== undefined) return;
+    new BranchScopeRepository().resolveOrCreate(
+      this.#connection,
+      this.#identity.projectId as ProjectId,
+      {
+        branchRef: this.#workspace.branchRef,
+        headCommit: this.#workspace.headCommit,
+        detached: this.#workspace.detached,
+      },
+      new Date().toISOString(),
+    );
+    this.#refreshLiveGitBinding();
   }
 
   #resolveActiveRootSessionId(explicitSessionId?: unknown): string | null {
@@ -1801,7 +1848,7 @@ export class V2PublicToolRouter {
     readonly evidenceIds: readonly string[];
     readonly eventIds: readonly string[];
   }> {
-    this.#refreshLiveGitBinding();
+    this.#ensureLiveBranchScopeId();
     const b = this.#rootContext.binding;
     const branchRef = this.#projectionBinding.branchRef;
     const sessionId = randomUUID();
@@ -1970,10 +2017,57 @@ export class V2PublicToolRouter {
   }
 
   async #publishProjectionV3(force = false): Promise<ProjectionManifestV3> {
+    while (this.#inflightProjectionPublish) {
+      const active = this.#inflightProjectionPublish;
+      if (!this.#readOnlyMode) {
+        this.#refreshLiveGitBinding();
+      }
+      const currentPosBig = BigInt(this.#currentGlobalPosition());
+      const scopeMatches =
+        this.#readOnlyMode ||
+        (active.workspaceId === this.#projectionBinding.workspaceId &&
+          active.branchScopeId === this.#projectionBinding.branchScopeId &&
+          active.branchRef === this.#projectionBinding.branchRef);
+      if (!force && scopeMatches && active.targetPos >= currentPosBig) {
+        return active.promise;
+      }
+      try {
+        await active.promise;
+      } catch {
+        // Proceed with fresh publish after prior attempt settles
+      }
+    }
     if (!this.#readOnlyMode) {
       this.#refreshLiveGitBinding();
     }
-    const currentPos = this.#currentGlobalPosition();
+    const targetPosStr = this.#currentGlobalPosition();
+    const targetPos = BigInt(targetPosStr);
+    const snapshotWorkspaceId = this.#projectionBinding.workspaceId;
+    const snapshotBranchScopeId = this.#projectionBinding.branchScopeId;
+    const snapshotBranchRef = this.#projectionBinding.branchRef;
+    const runPromise = this.#publishProjectionV3Impl(force, targetPosStr);
+    const entry = {
+      targetPos,
+      workspaceId: snapshotWorkspaceId,
+      branchScopeId: snapshotBranchScopeId,
+      branchRef: snapshotBranchRef,
+      promise: runPromise,
+    };
+    this.#inflightProjectionPublish = entry;
+    try {
+      return await runPromise;
+    } finally {
+      if (this.#inflightProjectionPublish === entry) {
+        this.#inflightProjectionPublish = null;
+      }
+    }
+  }
+
+  async #publishProjectionV3Impl(force = false, preReadPos?: string): Promise<ProjectionManifestV3> {
+    if (!this.#readOnlyMode && preReadPos === undefined) {
+      this.#refreshLiveGitBinding();
+    }
+    const currentPos = preReadPos ?? this.#currentGlobalPosition();
     if (
       !force
       && this.#cachedProjectionManifest?.globalPos === currentPos
@@ -2025,7 +2119,7 @@ export class V2PublicToolRouter {
             && prior.terminalEventPosition.toString() === currentPos
           ) {
             this.#cachedProjectionManifest = Object.freeze({
-              globalPos: currentPos,
+              globalPos: prior.terminalEventPosition.toString(),
               manifest: prior,
             });
             return prior;
@@ -2073,7 +2167,7 @@ export class V2PublicToolRouter {
       30_000,
     );
     this.#cachedProjectionManifest = Object.freeze({
-      globalPos: this.#currentGlobalPosition(),
+      globalPos: published.manifest.terminalEventPosition.toString(),
       manifest: published.manifest,
     });
     return published.manifest;
@@ -2675,6 +2769,7 @@ export class V2PublicToolRouter {
     }
 
     const supersedesByKeeper = new Map<string, string[]>();
+    const foldedPos = this.#currentGlobalPosition();
     try {
       const eventRows = this.#connection
         .prepare(
@@ -2852,7 +2947,7 @@ export class V2PublicToolRouter {
       });
     });
     this.#cachedProjectedNotes = Object.freeze({
-      globalPos: currentPos,
+      globalPos: foldedPos,
       notes: mappedNotes,
     });
     return mappedNotes;
@@ -5452,7 +5547,7 @@ export class V2PublicToolRouter {
     if (!coordinator) {
       throw new FreshStartError("FRESH_START_STORAGE_FAILURE");
     }
-    this.#refreshLiveGitBinding();
+    this.#ensureLiveBranchScopeId();
     const b = this.#rootContext.binding;
     const authority = this.#authorityRepo.get(this.#connection, b.projectId, sessionId);
     if (!authority || authority.ownerGeneration === null) {
@@ -5853,7 +5948,7 @@ export class V2PublicToolRouter {
   }
 
   async #handleSessionEnd(args: Record<string, unknown>): Promise<Record<string, unknown>> {
-    this.#refreshLiveGitBinding();
+    this.#ensureLiveBranchScopeId();
     const sessionId =
       this.#resolveOpenOrEndingRootSessionId(args.sessionId)
       ?? (await this.#ensureActiveRootSession(args.sessionId));
@@ -5935,6 +6030,7 @@ export class V2PublicToolRouter {
       sessionId,
       taskSummary: String(args.summary ?? "Pre-session-end checkpoint"),
     });
+    this.#ensureLiveBranchScopeId();
     authority = this.#authorityRepo.get(this.#connection, b.projectId, sessionId);
     if (!authority || authority.ownerGeneration === null) {
       throw new FreshStartError("FRESH_START_INPUT_INVALID");
@@ -6044,6 +6140,7 @@ export class V2PublicToolRouter {
   }
 
   async #handleAmendSessionEnd(args: Record<string, unknown>): Promise<Record<string, unknown>> {
+    this.#ensureLiveBranchScopeId();
     const sessionId =
       this.#resolveOpenOrEndingRootSessionId(args.sessionId)
       ?? (await this.#ensureActiveRootSession(args.sessionId));
@@ -6161,6 +6258,7 @@ export class V2PublicToolRouter {
   }
 
   async #handleCancelSessionEnd(args: Record<string, unknown>): Promise<Record<string, unknown>> {
+    this.#ensureLiveBranchScopeId();
     const sessionId =
       this.#resolveOpenOrEndingRootSessionId(args.sessionId)
       ?? (await this.#ensureActiveRootSession(args.sessionId));
