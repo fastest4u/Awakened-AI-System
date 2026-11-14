@@ -504,4 +504,105 @@ describe('Overview page', () => {
     ).toBeNull();
     expect(document.body.innerHTML).not.toMatch(/(hsl|rgb|oklch)\(var\(--/);
   });
+
+  it('renders RecommendationsCard items in clean flex cards without 0px Alert grid wrapper, shows healthy emerald badge for clean vault, and avoids justify-between blank gap', async () => {
+    const mockOverview = {
+      ok: true,
+      projectRoot: 'C:\\default',
+      projectName: 'default',
+      status: 'active',
+      audit: {
+        healthScore: 100,
+        counts: {
+          verifiedNotes: 5,
+          unpromotedCandidates: 1,
+          conflictedNotes: 0,
+          duplicateGroups: 0,
+        },
+        recommendations: [
+          {
+            id: 'rec-vault-healthy',
+            priority: 'low',
+            category: 'healthy',
+            title: 'คลังความจำสะอาดและพร้อมใช้งาน 100%',
+            description: 'ไม่พบความจำซ้ำหรือรายการค้างอนุมัติ',
+            actionType: 'none',
+          },
+          {
+            id: 'rec-promote-candidates',
+            priority: 'medium',
+            category: 'promotion',
+            title: 'มี Candidate รออนุมัติ 1 รายการ',
+            description: 'สามารถกด Promote เป็น Verified ได้ทันที',
+            actionType: 'promote_candidates',
+          },
+        ],
+        duplicateGroups: [],
+      },
+      analytics: {
+        byStatus: { verified: 5, candidate: 1 },
+        byKind: { adr: 2, insight: 3 },
+        activitySeries: [],
+      },
+      lifecycle: {
+        sessions: [
+          {
+            sessionId: 'sess-row5-1',
+            currentTask: 'Session for row 5 test',
+            semanticState: 'ended',
+            kind: 'root',
+            noteCount: 1,
+            noteTitles: [],
+            noteIds: [],
+            inProgressItems: [],
+            filesTouched: [],
+          },
+        ],
+        latestCheckpoint: null,
+      },
+      causalTriads: [],
+    };
+
+    renderApp({
+      initialUrl: '/overview',
+      fetchHandler: (url) => {
+        if (url.startsWith('/api/overview')) {
+          return new Response(JSON.stringify(mockOverview), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+      },
+    });
+
+    const healthyTitle = await screen.findByText('คลังความจำสะอาดและพร้อมใช้งาน 100%');
+    const healthyDesc = screen.getByText('ไม่พบความจำซ้ำหรือรายการค้างอนุมัติ');
+    const healthyItem = healthyTitle.closest('[data-slot="recommendation-item"]');
+    expect(healthyItem).not.toBeNull();
+    expect(healthyDesc.closest('[data-slot="recommendation-item"]')).toBe(healthyItem);
+    expect(
+      document.querySelector('[data-slot="alert"] > div:not([data-slot])'),
+    ).toBeNull();
+
+    expect(within(healthyItem as HTMLElement).getByText('ปกติ (Healthy)')).toBeInTheDocument();
+    expect(within(healthyItem as HTMLElement).queryByText(/^low$/i)).toBeNull();
+
+    const mediumTitle = screen.getByText('มี Candidate รออนุมัติ 1 รายการ');
+    const mediumItem = mediumTitle.closest('[data-slot="recommendation-item"]');
+    expect(mediumItem).not.toBeNull();
+    expect(within(mediumItem as HTMLElement).getByText('แนะนำ (Medium)')).toBeInTheDocument();
+
+    const recCard = screen
+      .getByText('คำแนะนำอัจฉริยะ (AI Curator Insights)')
+      .closest('[data-slot="card"]');
+    const sessionsCard = screen
+      .getByText('ประวัติเซสชันล่าสุด (Sessions)')
+      .closest('[data-slot="card"]');
+    expect(recCard).not.toBeNull();
+    expect(sessionsCard).not.toBeNull();
+    expect(recCard?.className ?? '').not.toContain('justify-between');
+    expect(sessionsCard?.className ?? '').not.toContain('justify-between');
+
+    expect(document.body.innerHTML).not.toMatch(/(hsl|rgb|oklch)\(var\(--/);
+  });
 });

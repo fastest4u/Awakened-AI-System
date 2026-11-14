@@ -101,7 +101,7 @@ export function OverviewPage() {
       )}
 
       {/* Row 5: Recommendations + Sessions Table */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 lg:gap-6">
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 lg:gap-6 items-start">
         <RecommendationsCard
           recommendations={audit?.recommendations}
           statusInfo={statusInfo}

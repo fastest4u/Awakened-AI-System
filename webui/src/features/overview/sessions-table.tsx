@@ -103,7 +103,7 @@ export function SessionsTable({ sessions }: SessionsTableProps) {
   };
 
   return (
-    <Card className="h-full flex flex-col justify-between">
+    <Card className="flex flex-col">
       <CardHeader>
         <div className="flex items-center justify-between gap-3">
           <div>
