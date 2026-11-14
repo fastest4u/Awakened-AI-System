@@ -1,9 +1,8 @@
-import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
+import { randomBytes, timingSafeEqual } from "node:crypto";
 import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { gzipSync } from "node:zlib";
 import { buildWikilinkResolver } from "../utils/links.js";
 import {
   createV2Foundation,
@@ -21,15 +20,7 @@ import {
   type CausalTriadSummary,
 } from "./entity-extractor.js";
 import { V2_PUBLIC_TOOL_DEFINITIONS } from "./public-tools.js";
-import { WebUiMvcController, renderMvcControllersJs } from "./webui/controllers.js";
-import { renderMvcModelsJs } from "./webui/models.js";
-import { renderShadcnUiJs } from "./webui/shadcn-ui.js";
-import { renderVendorRuntimeJs } from "./webui/vendor-runtime.js";
-import {
-  renderMvcIndexHtml,
-  renderMvcViewsJs,
-  renderWebComponentsJs,
-} from "./webui/views-and-web-components.js";
+import { WebUiMvcController } from "./webui/controllers.js";
 import {
   SPA_ROUTE_PATHS,
   loadSpaClientBundle,
@@ -683,62 +674,6 @@ function sendJson(res: ServerResponse, statusCode: number, payload: unknown): vo
   res.end(body);
 }
 
-interface PrecomputedJsAsset {
-  readonly raw: Buffer;
-  readonly gzip: Buffer;
-  readonly etag: string;
-}
-
-function buildPrecomputedJsAsset(scriptBody: string): PrecomputedJsAsset {
-  const raw = Buffer.from(scriptBody, "utf8");
-  const gzip = gzipSync(raw, { level: 6 });
-  const digest = createHash("sha256").update(raw).digest("hex").slice(0, 24);
-  return Object.freeze({
-    raw,
-    gzip,
-    etag: `"pmv2-${digest}"`,
-  });
-}
-
-function sendStaticJsAsset(
-  req: IncomingMessage,
-  res: ServerResponse,
-  asset: PrecomputedJsAsset,
-): void {
-  const ifNoneMatch =
-    typeof req.headers["if-none-match"] === "string" ? req.headers["if-none-match"] : "";
-  if (
-    ifNoneMatch &&
-    ifNoneMatch
-      .split(",")
-      .map((s) => s.trim())
-      .includes(asset.etag)
-  ) {
-    res.writeHead(304, {
-      ...WEBUI_SECURITY_HEADERS,
-      etag: asset.etag,
-      "cache-control": "private, no-cache",
-      vary: "Accept-Encoding",
-    });
-    res.end();
-    return;
-  }
-
-  const acceptEncoding =
-    typeof req.headers["accept-encoding"] === "string" ? req.headers["accept-encoding"] : "";
-  const supportsGzip = /\bgzip\b/iu.test(acceptEncoding);
-  const body = supportsGzip ? asset.gzip : asset.raw;
-  res.writeHead(200, {
-    ...WEBUI_SECURITY_HEADERS,
-    "content-type": "application/javascript; charset=utf-8",
-    "cache-control": "private, no-cache",
-    etag: asset.etag,
-    vary: "Accept-Encoding",
-    ...(supportsGzip ? { "content-encoding": "gzip" } : {}),
-  });
-  res.end(body);
-}
-
 export interface V2WebUiOptions {
   readonly defaultProjectRoot: string;
   readonly extraProjectRoots?: readonly string[];
@@ -803,14 +738,6 @@ export function createV2WebUiHandler(options: V2WebUiOptions) {
     res.end(body);
   }
 
-  const staticMvcAssets: Readonly<Record<string, PrecomputedJsAsset>> = Object.freeze({
-    "/mvc/vendor.js": buildPrecomputedJsAsset(renderVendorRuntimeJs()),
-    "/mvc/models.js": buildPrecomputedJsAsset(renderMvcModelsJs()),
-    "/mvc/controllers.js": buildPrecomputedJsAsset(renderMvcControllersJs()),
-    "/mvc/shadcn-ui.js": buildPrecomputedJsAsset(renderShadcnUiJs()),
-    "/mvc/views.js": buildPrecomputedJsAsset(renderMvcViewsJs()),
-    "/mvc/web-components.js": buildPrecomputedJsAsset(renderWebComponentsJs()),
-  });
   const inflightApiReads = new Map<string, Promise<unknown>>();
   const cachedApiReads = new Map<string, { readonly ts: number; readonly payload: unknown }>();
   const mutationEpochs = new Map<string, number>();
@@ -1094,12 +1021,6 @@ export function createV2WebUiHandler(options: V2WebUiOptions) {
 
       if (method === "GET" && pathname.startsWith("/assets/")) {
         sendJson(res, 404, { ok: false, error: "NOT_FOUND", path: pathname });
-        return;
-      }
-
-      // Legacy /mvc/*.js routes (kept until Task 10)
-      if (method === "GET" && Object.prototype.hasOwnProperty.call(staticMvcAssets, pathname)) {
-        sendStaticJsAsset(req, res, staticMvcAssets[pathname]!);
         return;
       }
 

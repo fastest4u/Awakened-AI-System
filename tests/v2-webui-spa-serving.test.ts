@@ -389,6 +389,21 @@ test("Task 2: WebUI SPA serving & /api/bootstrap suite", async (t) => {
         "Meta must appear before </head>",
       );
     });
+
+    await t.test("legacy /mvc routes are gone", async () => {
+      const legacyPaths = [
+        "/mvc/vendor.js",
+        "/mvc/models.js",
+        "/mvc/controllers.js",
+        "/mvc/shadcn-ui.js",
+        "/mvc/views.js",
+        "/mvc/web-components.js",
+      ];
+      for (const p of legacyPaths) {
+        const res = await rawHttpGet(baseUrl, p);
+        assert.equal(res.statusCode, 404, `Legacy route ${p} must return 404`);
+      }
+    });
   } finally {
     await server.close();
     spaClient.cleanup();

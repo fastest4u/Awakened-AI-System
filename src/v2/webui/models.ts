@@ -19,13 +19,14 @@ import {
 
 export const MVC_ARCHITECTURE_MANIFEST = Object.freeze({
   ok: true,
-  pattern: "MVC",
+  pattern: "SPA + REST API",
   stack: Object.freeze([
-    "React (Functional Components & Hooks)",
-    "TanStack Query (QueryClient, useQuery, useMutation)",
-    "TanStack Table (useReactTable, getCoreRowModel, getSortedRowModel, getFilteredRowModel, flexRender)",
-    "shadcn/ui Minimalist Pro (Light/Dark Theme, Button, Card, Badge, Tabs, Table, Dialog, Input, Select, Alert, Progress)",
-    "W3C Web Components (Custom Elements wrapping React Views & Interactive SVG Charts)",
+    "Vite 8 SPA Bundler",
+    "React 19 (Functional Components & Hooks)",
+    "TanStack Router (Client-side routing & search params)",
+    "TanStack Query v5 (QueryClient, useQuery, useMutation)",
+    "Tailwind CSS v4 + shadcn/ui Minimalist Pro (Light/Dark Theme)",
+    "lucide-react & recharts (Data Visualization)",
   ]),
   models: Object.freeze([
     "ProjectModel",
@@ -41,58 +42,25 @@ export const MVC_ARCHITECTURE_MANIFEST = Object.freeze({
     "KnowledgeGraphView",
     "CuratorStudioView",
     "McpConsoleView",
-    "HealthGaugeChart",
-    "DistributionDonutChart",
-    "ActivityAreaChart",
-    "SessionActivityMap",
+    "NoteDetailSheet",
   ]),
   controllers: Object.freeze([
-    "MissionControlController",
-    "KanbanController",
-    "KnowledgeGraphController",
-    "CuratorController",
-    "McpConsoleController",
+    "WebUiMvcController",
   ]),
-  shadcnComponents: Object.freeze([
-    "LucideIcon",
-    "Button",
-    "Card",
-    "CardHeader",
-    "CardTitle",
-    "CardDescription",
-    "CardContent",
-    "CardFooter",
-    "Badge",
-    "Tabs",
-    "TabsList",
-    "TabsTrigger",
-    "TabsContent",
-    "Input",
-    "Textarea",
-    "Select",
-    "Table",
-    "TableHeader",
-    "TableBody",
-    "TableRow",
-    "TableHead",
-    "TableCell",
-    "Dialog",
-    "Alert",
-    "Separator",
-    "Progress",
-  ]),
-  webComponents: Object.freeze([
-    "pm-mission-control",
-    "pm-stat-card",
-    "pm-health-gauge",
-    "pm-distribution-chart",
-    "pm-activity-chart",
-    "pm-session-activity-map",
-    "pm-overview-panel",
-    "pm-kanban-board",
-    "pm-knowledge-graph",
-    "pm-curator-studio",
-    "pm-mcp-console",
+  endpoints: Object.freeze([
+    "/api/bootstrap",
+    "/api/projects",
+    "/api/projects/register",
+    "/api/overview",
+    "/api/notes",
+    "/api/notes/:id",
+    "/api/graph",
+    "/api/curator/audit",
+    "/api/curator/auto-curate",
+    "/api/curator/chat",
+    "/api/mcp/call",
+    "/api/governance",
+    "/api/mvc/architecture",
   ]),
 });
 
@@ -449,145 +417,4 @@ export class McpToolModel {
   static listTools(): readonly unknown[] {
     return V2_PUBLIC_TOOL_DEFINITIONS;
   }
-}
-
-export function renderMvcModelsJs(): string {
-  return `// ============================================================================
-// Project Memory V2 WebUI — MVC Model Layer (/mvc/models.js)
-// Models: ProjectModel, OverviewModel, MemoryNoteModel, KnowledgeGraphModel, CuratorModel, McpToolModel
-// ============================================================================
-(function (global) {
-  const QueryKeys = {
-    projects: () => ["pm-v2", "projects"],
-    overview: (projectRoot) => ["pm-v2", "overview", projectRoot],
-    notes: (projectRoot, query, status, kind) => ["pm-v2", "notes", projectRoot, query || "", status || "", kind || ""],
-    noteDetail: (projectRoot, recordId) => ["pm-v2", "note-detail", projectRoot, recordId],
-    graph: (projectRoot) => ["pm-v2", "graph", projectRoot],
-    curatorAudit: (projectRoot) => ["pm-v2", "curator-audit", projectRoot],
-  };
-
-  function getCsrfToken() {
-    if (typeof document === "undefined" || !document.querySelector) return "";
-    const meta = document.querySelector('meta[name="pm-csrf-token"]');
-    return meta ? meta.getAttribute("content") || "" : "";
-  }
-
-  async function apiJson(url, options) {
-    const opts = options ? { ...options } : {};
-    const method = String(opts.method || "GET").toUpperCase();
-    const headers = { ...(opts.headers || {}) };
-    if (method !== "GET" && method !== "HEAD") {
-      const token = getCsrfToken();
-      if (token && !headers["x-pm-csrf-token"] && !headers["X-PM-CSRF-Token"]) {
-        headers["X-PM-CSRF-Token"] = token;
-      }
-    }
-    opts.headers = headers;
-    const res = await fetch(url, opts);
-    const data = await res.json();
-    if (!res.ok || data.ok === false) {
-      throw new Error(data.message || data.error || ("HTTP " + res.status));
-    }
-    return data;
-  }
-
-  class ProjectModel {
-    static queryKey() {
-      return QueryKeys.projects();
-    }
-    static async fetchAll() {
-      return apiJson("/api/projects");
-    }
-  }
-
-  class OverviewModel {
-    static queryKey(projectRoot) {
-      return QueryKeys.overview(projectRoot);
-    }
-    static async fetch(projectRoot) {
-      return apiJson("/api/overview?project=" + encodeURIComponent(projectRoot));
-    }
-  }
-
-  class MemoryNoteModel {
-    static queryKey(projectRoot, filters = {}) {
-      return QueryKeys.notes(projectRoot, filters.query, filters.status, filters.kind);
-    }
-    static async fetchList(projectRoot, filters = {}) {
-      const params = new URLSearchParams({ project: projectRoot });
-      if (filters.query) params.set("query", filters.query);
-      if (filters.status) params.set("status", filters.status);
-      if (filters.kind) params.set("kind", filters.kind);
-      return apiJson(
-        "/api/notes?" + params.toString(),
-        filters.signal ? { signal: filters.signal } : undefined,
-      );
-    }
-    static async fetchById(projectRoot, recordId) {
-      return apiJson(
-        "/api/notes/" + encodeURIComponent(recordId) + "?project=" + encodeURIComponent(projectRoot)
-      );
-    }
-    static async mutateGovernance(payload) {
-      return apiJson("/api/governance", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify(payload),
-      });
-    }
-  }
-
-  class KnowledgeGraphModel {
-    static queryKey(projectRoot) {
-      return QueryKeys.graph(projectRoot);
-    }
-    static async fetch(projectRoot) {
-      return apiJson("/api/graph?project=" + encodeURIComponent(projectRoot));
-    }
-  }
-
-  class CuratorModel {
-    static queryKey(projectRoot) {
-      return QueryKeys.curatorAudit(projectRoot);
-    }
-    static async fetchAudit(projectRoot) {
-      return apiJson("/api/curator/audit?project=" + encodeURIComponent(projectRoot));
-    }
-    static async runAutoCurate(projectRoot, options = {}) {
-      return apiJson("/api/curator/auto-curate", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ projectRoot, ...options }),
-      });
-    }
-    static async sendChat(projectRoot, message, autoExecute = true) {
-      return apiJson("/api/curator/chat", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ projectRoot, message, autoExecute }),
-      });
-    }
-  }
-
-  class McpToolModel {
-    static async invokeTool(projectRoot, tool, args) {
-      return apiJson("/api/mcp/call", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ projectRoot, tool, args }),
-      });
-    }
-  }
-
-  global.PM_MVC_MODELS = {
-    QueryKeys,
-    ProjectModel,
-    OverviewModel,
-    MemoryNoteModel,
-    KnowledgeGraphModel,
-    CuratorModel,
-    McpToolModel,
-  };
-})(window);
-`;
 }
