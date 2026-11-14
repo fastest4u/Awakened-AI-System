@@ -349,6 +349,7 @@ export class SqliteProjectionEventReader implements ProjectionEventReaderV3 {
     return openBoundedProjectionEventSnapshot(bindingValue, {
       driver: this.#driver, eventStorePath: this.#eventStorePath, busyTimeoutMs: this.#busyTimeoutMs,
       maxEvents: MAX_PROJECTION_SOURCE_EVENTS, maxAggregateBytes: MAX_PROJECTION_SOURCE_BYTES,
+      trackCrossScopeSessions: true,
     });
   }
 
@@ -364,6 +365,7 @@ export class SqliteProjectionEventReader implements ProjectionEventReaderV3 {
 interface BoundedProjectionSnapshotOptions extends CommittedProjectionSnapshotOptions {
   readonly maxEvents: number;
   readonly maxAggregateBytes: number;
+  readonly trackCrossScopeSessions?: boolean;
 }
 
 const STORE_TERMINAL_LIFECYCLE_EVENTS = new Set([
@@ -582,7 +584,7 @@ function openBoundedProjectionEventSnapshot(
     let streamComplete = false;
     const crossScopeItemIdsSet = new Set<string>();
     const crossScopeSessionsMap = new Map<string, CrossScopeSessionProjection>();
-    const trackCrossScopeSessions = binding.branchScopeId !== null;
+    const trackCrossScopeSessions = options.trackCrossScopeSessions === true && binding.branchScopeId !== null;
     const dispositions = (): Iterable<ProjectionSourceDisposition> => {
         if (released || streamRequested) return integrity();
         streamRequested = true;
@@ -709,6 +711,7 @@ export function replayCommittedProjectionSources(
     ...options,
     maxEvents: boundedPositiveInteger(options.maxEvents, MAX_INTEGRITY_REPLAY_EVENTS, MAX_INTEGRITY_REPLAY_EVENTS),
     maxAggregateBytes: boundedPositiveInteger(options.maxAggregateBytes, MAX_INTEGRITY_REPLAY_BYTES, MAX_INTEGRITY_REPLAY_BYTES),
+    trackCrossScopeSessions: true,
   });
   try {
     const crossScopeIds = snapshot.crossScopeItemIds?.() ?? new Set<string>();
