@@ -14,6 +14,12 @@ export const SPA_ROUTE_PATHS: ReadonlySet<string> = new Set<string>([
   "/mcp",
 ]);
 
+export const MAX_SPA_INDEX_BYTES = 2 * 1024 * 1024;
+export const MAX_SPA_ASSET_BYTES = 16 * 1024 * 1024;
+export const MAX_SPA_TOTAL_BUNDLE_BYTES = 64 * 1024 * 1024;
+export const MAX_SPA_ASSET_COUNT = 256;
+export const MAX_SPA_SCAN_DEPTH = 6;
+
 export interface PrecomputedStaticAsset {
   readonly raw: Buffer;
   readonly gzip: Buffer | null;
@@ -93,8 +99,10 @@ export function resolveSpaClientDir(opts: {
     try {
       const entryPath = fileURLToPath(opts.entryUrl);
       candidates.push(resolve(dirname(entryPath), "webui"));
-    } catch {
-      // Ignore URL error
+    } catch (err) {
+      process.stderr.write(
+        `[v2-webui] invalid entryUrl fallback (${err instanceof Error ? err.name : "UrlError"})\n`,
+      );
     }
   }
   const cwd = opts.cwd ?? process.cwd();
@@ -118,23 +126,77 @@ export function loadSpaClientBundle(dir: string): SpaClientBundle | null {
   try {
     const indexStat = statSync(indexPath);
     if (!indexStat.isFile()) return null;
-  } catch {
+    if (indexStat.size > MAX_SPA_INDEX_BYTES) {
+      process.stderr.write(
+        `[v2-webui] skipped oversized index.html (${indexStat.size} bytes)\n`,
+      );
+      return null;
+    }
+  } catch (err) {
+    process.stderr.write(
+      `[v2-webui] unable to stat index.html (${err instanceof Error ? err.name : "StatError"})\n`,
+    );
     return null;
   }
 
   let indexTemplate: string;
   try {
     indexTemplate = readFileSync(indexPath, "utf8");
-  } catch {
+  } catch (err) {
+    process.stderr.write(
+      `[v2-webui] unable to read index.html (${err instanceof Error ? err.name : "ReadError"})\n`,
+    );
     return null;
   }
 
   const assets = new Map<string, PrecomputedStaticAsset>();
+  let totalRawBytes = 0;
+
+  const tryAddAsset = (fullPath: string, urlPath: string, filename: string): void => {
+    if (assets.size >= MAX_SPA_ASSET_COUNT) {
+      return;
+    }
+    try {
+      const st = statSync(fullPath);
+      if (!st.isFile()) return;
+      if (st.size > MAX_SPA_ASSET_BYTES) {
+        process.stderr.write(
+          `[v2-webui] skipped oversized static asset ${filename} (${st.size} bytes)\n`,
+        );
+        return;
+      }
+      if (totalRawBytes + st.size > MAX_SPA_TOTAL_BUNDLE_BYTES) {
+        process.stderr.write(
+          `[v2-webui] skipped static asset ${filename} (bundle memory limit exceeded)\n`,
+        );
+        return;
+      }
+      const raw = readFileSync(fullPath);
+      if (
+        raw.byteLength > MAX_SPA_ASSET_BYTES ||
+        totalRawBytes + raw.byteLength > MAX_SPA_TOTAL_BUNDLE_BYTES
+      ) {
+        process.stderr.write(
+          `[v2-webui] skipped static asset ${filename} (actual byte limit exceeded)\n`,
+        );
+        return;
+      }
+      totalRawBytes += raw.byteLength;
+      assets.set(urlPath, precomputeAsset(raw, filename));
+    } catch (err) {
+      process.stderr.write(
+        `[v2-webui] skipped unreadable static asset ${filename} (${err instanceof Error ? err.name : "ReadError"})\n`,
+      );
+    }
+  };
 
   let topEntries: Dirent[];
   try {
     topEntries = readdirSync(resolvedDir, { withFileTypes: true });
-  } catch {
+  } catch (err) {
+    process.stderr.write(
+      `[v2-webui] unable to list SPA dir (${err instanceof Error ? err.name : "ReaddirError"})\n`,
+    );
     return null;
   }
 
@@ -144,7 +206,10 @@ export function loadSpaClientBundle(dir: string): SpaClientBundle | null {
     let isSymlink = false;
     try {
       isSymlink = entry.isSymbolicLink() || lstatSync(fullPath).isSymbolicLink();
-    } catch {
+    } catch (err) {
+      process.stderr.write(
+        `[v2-webui] skipped inaccessible static entry ${entry.name} (${err instanceof Error ? err.name : "LstatError"})\n`,
+      );
       continue;
     }
     if (isSymlink) continue;
@@ -154,22 +219,26 @@ export function loadSpaClientBundle(dir: string): SpaClientBundle | null {
       if (lower === "index.html" || lower.endsWith(".html") || lower.endsWith(".map")) {
         continue;
       }
-      try {
-        const raw = readFileSync(fullPath);
-        assets.set(`/${entry.name}`, precomputeAsset(raw, entry.name));
-      } catch {
-        // Ignore file read error
-      }
+      tryAddAsset(fullPath, `/${entry.name}`, entry.name);
     }
   }
 
   const assetsSubdir = join(resolvedDir, "assets");
   if (existsSync(assetsSubdir)) {
-    function scanDir(currentDir: string, urlPrefix: string): void {
+    function scanDir(currentDir: string, urlPrefix: string, depth: number): void {
+      if (depth > MAX_SPA_SCAN_DEPTH) {
+        process.stderr.write(
+          `[v2-webui] skipped deep asset directory at depth ${depth}\n`,
+        );
+        return;
+      }
       let entries: Dirent[];
       try {
         entries = readdirSync(currentDir, { withFileTypes: true });
-      } catch {
+      } catch (err) {
+        process.stderr.write(
+          `[v2-webui] unable to list asset subdir (${err instanceof Error ? err.name : "ReaddirError"})\n`,
+        );
         return;
       }
       for (const entry of entries) {
@@ -178,25 +247,23 @@ export function loadSpaClientBundle(dir: string): SpaClientBundle | null {
         let isSymlink = false;
         try {
           isSymlink = entry.isSymbolicLink() || lstatSync(fullPath).isSymbolicLink();
-        } catch {
+        } catch (err) {
+          process.stderr.write(
+            `[v2-webui] skipped inaccessible asset entry ${entry.name} (${err instanceof Error ? err.name : "LstatError"})\n`,
+          );
           continue;
         }
         if (isSymlink) continue;
 
         if (entry.isDirectory()) {
-          scanDir(fullPath, `${urlPrefix}/${entry.name}`);
+          scanDir(fullPath, `${urlPrefix}/${entry.name}`, depth + 1);
         } else if (entry.isFile()) {
           if (entry.name.toLowerCase().endsWith(".map")) continue;
-          try {
-            const raw = readFileSync(fullPath);
-            assets.set(`${urlPrefix}/${entry.name}`, precomputeAsset(raw, entry.name));
-          } catch {
-            // Ignore file read error
-          }
+          tryAddAsset(fullPath, `${urlPrefix}/${entry.name}`, entry.name);
         }
       }
     }
-    scanDir(assetsSubdir, "/assets");
+    scanDir(assetsSubdir, "/assets", 0);
   }
 
   return {

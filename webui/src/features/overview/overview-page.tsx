@@ -72,7 +72,7 @@ export function OverviewPage() {
   const latestCheckpoint = data?.lifecycle?.latestCheckpoint;
   const statusInfo =
     typeof data?.status === 'object' && data?.status !== null
-      ? (data.status as any)
+      ? data.status
       : null;
 
   return (

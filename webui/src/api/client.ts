@@ -10,10 +10,79 @@ export class ApiError extends Error {
   }
 }
 
+const DEFAULT_RETRY_BASE_DELAY_MS = 120;
+const RETRYABLE_HTTP_STATUSES = new Set([429, 502, 503, 504]);
+
 let bootstrapCache: { csrfToken: string; defaultProjectRoot: string } | null = null;
+let retryBaseDelayMs = DEFAULT_RETRY_BASE_DELAY_MS;
+
+export function setApiRetryBaseDelayMs(ms: number): void {
+  retryBaseDelayMs = Math.max(0, ms);
+}
 
 export function resetBootstrap(): void {
   bootstrapCache = null;
+  retryBaseDelayMs = DEFAULT_RETRY_BASE_DELAY_MS;
+}
+
+function sleepWithSignal(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) {
+    return Promise.reject(
+      signal.reason ?? new DOMException('The operation was aborted.', 'AbortError'),
+    );
+  }
+  if (ms <= 0) {
+    return Promise.resolve();
+  }
+  return new Promise((resolve, reject) => {
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(
+        signal?.reason ?? new DOMException('The operation was aborted.', 'AbortError'),
+      );
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+async function fetchWithExponentialBackoff(
+  url: string,
+  init?: RequestInit,
+  maxRetries = 3,
+): Promise<Response> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    if (init?.signal?.aborted) {
+      throw (
+        init.signal.reason ??
+        new DOMException('The operation was aborted.', 'AbortError')
+      );
+    }
+    try {
+      const res = await fetch(url, init);
+      if (!RETRYABLE_HTTP_STATUSES.has(res.status) || attempt === maxRetries) {
+        return res;
+      }
+    } catch (err) {
+      lastError = err;
+      if (
+        init?.signal?.aborted ||
+        (err instanceof Error && err.name === 'AbortError')
+      ) {
+        throw err;
+      }
+      if (attempt === maxRetries) {
+        throw err;
+      }
+    }
+    const delayMs = retryBaseDelayMs * 2 ** attempt;
+    await sleepWithSignal(delayMs, init?.signal ?? undefined);
+  }
+  throw lastError instanceof Error ? lastError : new Error('Request failed');
 }
 
 export async function getBootstrap(
@@ -36,7 +105,7 @@ export async function getBootstrap(
     }
   }
 
-  const res = await fetch('/api/bootstrap');
+  const res = await fetchWithExponentialBackoff('/api/bootstrap', undefined, 3);
   let data: any = null;
   try {
     data = await res.json();
@@ -84,7 +153,11 @@ export async function apiGet<T>(
     }
   }
 
-  const res = await fetch(url, { method: 'GET', signal });
+  const res = await fetchWithExponentialBackoff(
+    url,
+    { method: 'GET', signal },
+    3,
+  );
   let json: any = null;
   try {
     json = await res.json();

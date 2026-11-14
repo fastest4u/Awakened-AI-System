@@ -18,6 +18,7 @@ import {
   ChevronUp,
 } from 'lucide-react';
 import { useNavigate } from '@tanstack/react-router';
+import type { OverviewStatusInfo } from '@/api/types';
 
 export interface RecommendationItem {
   id?: string;
@@ -30,12 +31,7 @@ export interface RecommendationItem {
 
 export interface RecommendationsCardProps {
   recommendations?: RecommendationItem[] | null;
-  statusInfo?: {
-    projectId?: string;
-    vaultId?: string;
-    releaseId?: string;
-    generation?: number;
-  } | null;
+  statusInfo?: OverviewStatusInfo | null;
   latestCheckpoint?: unknown;
 }
 

@@ -162,8 +162,10 @@ export function AutoCurateCard({
             {recommendations.length > 0 && (
               <div className="space-y-2">
                 {recommendations.map((r: any, idx: number) => (
-                  <Alert key={idx} className="py-2.5">
-                    <AlertTitle className="text-xs font-semibold">{r.title}</AlertTitle>
+                  <Alert key={r.id ?? `${r.title ?? 'rec'}-${idx}`} className="py-2.5">
+                    <AlertTitle className="text-xs font-semibold line-clamp-none break-words">
+                      {r.title}
+                    </AlertTitle>
                     {r.description && (
                       <AlertDescription className="text-xs text-muted-foreground mt-0.5">
                         {r.description}
@@ -191,8 +193,10 @@ export function AutoCurateCard({
               ) : (
                 <div className="space-y-2.5">
                   {duplicateGroups.map((g, idx) => (
-                    <Alert key={idx} className="py-2.5">
-                      <AlertTitle className="text-xs font-medium">{g.title}</AlertTitle>
+                    <Alert key={g.keeperRecordId ?? `${g.title}-${idx}`} className="py-2.5">
+                      <AlertTitle className="text-xs font-medium line-clamp-none break-words">
+                        {g.title}
+                      </AlertTitle>
                       <AlertDescription>
                         <div className="mt-1.5 flex flex-wrap items-center gap-1.5 text-xs">
                           <span className="text-muted-foreground text-[11px]">รายการหลัก:</span>

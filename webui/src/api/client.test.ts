@@ -1,5 +1,11 @@
 import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
-import { apiPost, apiGet, resetBootstrap, ApiError } from './client';
+import {
+  apiPost,
+  apiGet,
+  resetBootstrap,
+  setApiRetryBaseDelayMs,
+  ApiError,
+} from './client';
 
 describe('API Client', () => {
   beforeEach(() => {
@@ -186,5 +192,67 @@ describe('API Client', () => {
     expect(thrownError.status).toBe(404);
     expect(thrownError.code).toBe('NOTE_NOT_FOUND');
     expect(thrownError.message).toBe('ไม่พบข้อมูลความจำที่ระบุ');
+  });
+
+  it('retries up to 3 times with exponential backoff on transient 503/network errors', async () => {
+    setApiRetryBaseDelayMs(1);
+
+    let attempts = 0;
+    const fetchMock = vi.fn().mockImplementation(async () => {
+      attempts++;
+      if (attempts < 3) {
+        return {
+          ok: false,
+          status: 503,
+          json: async () => ({ ok: false, error: 'SERVICE_UNAVAILABLE' }),
+        };
+      }
+      if (attempts === 3) {
+        throw new TypeError('network reset');
+      }
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ ok: true, items: ['recovered'] }),
+      };
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const result = await apiGet<{ ok: boolean; items: string[] }>('/api/notes');
+    expect(result).toEqual({ ok: true, items: ['recovered'] });
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+
+    // Exhausting all 3 retries (4 total attempts) rethrows network error
+    const alwaysRejectFetch = vi.fn().mockRejectedValue(new TypeError('offline'));
+    vi.stubGlobal('fetch', alwaysRejectFetch);
+    await expect(apiGet('/api/overview')).rejects.toThrow('offline');
+    expect(alwaysRejectFetch).toHaveBeenCalledTimes(4);
+  });
+
+  it('does not retry deterministic 404/403 responses or aborted AbortSignals', async () => {
+    setApiRetryBaseDelayMs(1);
+
+    const forbiddenFetch = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 403,
+      json: async () => ({ ok: false, error: 'FORBIDDEN' }),
+    });
+    vi.stubGlobal('fetch', forbiddenFetch);
+
+    await expect(apiGet('/api/overview')).rejects.toMatchObject({
+      status: 403,
+      code: 'FORBIDDEN',
+    });
+    expect(forbiddenFetch).toHaveBeenCalledTimes(1);
+
+    const controller = new AbortController();
+    controller.abort(new DOMException('Aborted', 'AbortError'));
+    const abortedFetch = vi.fn();
+    vi.stubGlobal('fetch', abortedFetch);
+
+    await expect(
+      apiGet('/api/overview', undefined, controller.signal),
+    ).rejects.toThrow();
+    expect(abortedFetch).not.toHaveBeenCalled();
   });
 });

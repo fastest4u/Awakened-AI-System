@@ -7,7 +7,18 @@ export interface ProjectSummary {
   projectId?: string;
   vaultId?: string;
   releaseId?: string;
-  generation?: number;
+  generation?: number | string;
+  error?: string;
+}
+
+export interface OverviewStatusInfo {
+  projectId?: string;
+  vaultId?: string;
+  releaseId?: string;
+  mode?: string;
+  generation?: number | string;
+  productionReady?: boolean;
+  initialized?: boolean;
   error?: string;
 }
 
@@ -96,7 +107,7 @@ export interface OverviewResponse {
   ok: boolean;
   projectRoot: string;
   projectName: string;
-  status: string;
+  status: OverviewStatusInfo | string;
   lifecycle?: {
     sessions?: any[];
     latestCheckpoint?: any;

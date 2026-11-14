@@ -14,6 +14,17 @@ function RootLayout() {
   const navigate = useNavigate();
 
   useEffect(() => {
+    const focusTimers = new Set<ReturnType<typeof setTimeout>>();
+
+    const scheduleKanbanFocus = () => {
+      const timer = setTimeout(() => {
+        focusTimers.delete(timer);
+        const el = document.getElementById('kanban-search-input');
+        if (el) el.focus();
+      }, 0);
+      focusTimers.add(timer);
+    };
+
     const handleKeyDown = (e: KeyboardEvent) => {
       if (isImeComposing(e)) return;
 
@@ -30,24 +41,20 @@ function RootLayout() {
           to: '/kanban',
           search: (prev: any) => ({ project: prev.project }),
         }).then(() => {
-          setTimeout(() => {
-            const el = document.getElementById('kanban-search-input');
-            if (el) el.focus();
-          }, 0);
+          scheduleKanbanFocus();
         });
-        setTimeout(() => {
-          const el = document.getElementById('kanban-search-input');
-          if (el) el.focus();
-        }, 0);
-        setTimeout(() => {
-          const el = document.getElementById('kanban-search-input');
-          if (el) el.focus();
-        }, 50);
+        scheduleKanbanFocus();
       }
     };
 
     window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown);
+      for (const timer of focusTimers) {
+        clearTimeout(timer);
+      }
+      focusTimers.clear();
+    };
   }, [navigate]);
 
   return (

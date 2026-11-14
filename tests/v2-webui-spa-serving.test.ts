@@ -29,7 +29,12 @@ import {
   loadV2LaunchConfig,
 } from "../src/v2/config.js";
 import { startV2WebUiServer } from "../src/v2/webui.js";
-import { renderSpaIndexHtml } from "../src/v2/webui/spa-assets.js";
+import {
+  loadSpaClientBundle,
+  MAX_SPA_ASSET_BYTES,
+  MAX_SPA_SCAN_DEPTH,
+  renderSpaIndexHtml,
+} from "../src/v2/webui/spa-assets.js";
 import { activateFreshTestStore } from "./support/fresh-start-fixture.js";
 
 function sha(value: unknown): string {
@@ -540,5 +545,35 @@ test("WebUI auto-syncs stale project build_identity_hash by default and surfaces
     );
   } finally {
     spaClient.cleanup();
+  }
+});
+
+test("loadSpaClientBundle skips oversized files and directories exceeding MAX_SPA_SCAN_DEPTH", () => {
+  const dir = realpathSync.native(mkdtempSync(join(tmpdir(), "pm-v2-spa-bounds-")));
+  try {
+    writeFileSync(join(dir, "index.html"), "<html><head></head><body>ok</body></html>", "utf8");
+    const assetsDir = join(dir, "assets");
+    mkdirSync(assetsDir, { recursive: true });
+    writeFileSync(join(assetsDir, "valid.js"), "console.log('ok');", "utf8");
+    // Sparse / oversized file exceeding MAX_SPA_ASSET_BYTES (allocate buffer of MAX + 1 byte)
+    writeFileSync(join(assetsDir, "too-big.js"), Buffer.alloc(MAX_SPA_ASSET_BYTES + 1));
+
+    // Directory exceeding MAX_SPA_SCAN_DEPTH
+    let deepDir = assetsDir;
+    let urlPath = "/assets";
+    for (let d = 1; d <= MAX_SPA_SCAN_DEPTH + 1; d++) {
+      deepDir = join(deepDir, `d${d}`);
+      urlPath += `/d${d}`;
+      mkdirSync(deepDir, { recursive: true });
+      writeFileSync(join(deepDir, `lvl${d}.js`), `// depth ${d}`, "utf8");
+    }
+
+    const bundle = loadSpaClientBundle(dir);
+    assert.ok(bundle, "Bundle should still load valid assets");
+    assert.equal(bundle.assets.has("/assets/valid.js"), true);
+    assert.equal(bundle.assets.has("/assets/too-big.js"), false);
+    assert.equal(bundle.assets.has(`${urlPath}/lvl${MAX_SPA_SCAN_DEPTH + 1}.js`), false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
   }
 });

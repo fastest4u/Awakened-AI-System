@@ -1457,6 +1457,11 @@ export function createV2WebUiHandler(options: V2WebUiOptions) {
         sendJson(res, 400, { ok: false, error: code || "INVALID_REQUEST" });
         return;
       }
+      const safePath = (req.url ?? "/").split("?")[0] || "/";
+      const errName = err instanceof Error ? err.name : "UnknownError";
+      process.stderr.write(
+        `[v2-webui] ${(req.method ?? "GET").toUpperCase()} ${safePath} -> 500 WEBUI_INTERNAL_ERROR (${errName})\n`,
+      );
       sendJson(res, 500, {
         ok: false,
         error: "WEBUI_INTERNAL_ERROR",
