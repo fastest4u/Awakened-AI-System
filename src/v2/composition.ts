@@ -450,7 +450,7 @@ export async function createV2Foundation(
   }
   const routedFoundations = new Map<string, RoutedFoundationEntry>();
   const autoHealEnabled =
-    options?.autoHealBuildSync === true || process.env.MEMORY_V2_AUTO_SYNC_BUILD === "1";
+    options?.autoHealBuildSync ?? process.env.MEMORY_V2_AUTO_SYNC_BUILD === "1";
 
   const READ_ONLY_ROUTED_TOOLS = new Set<string>([
     "memory_v2Status",

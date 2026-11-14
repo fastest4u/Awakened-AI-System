@@ -3,6 +3,8 @@ import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync, statSyn
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { FreshStartError } from "../orchestrator/fresh-start/contracts.js";
+import { SchemaCompatibilityError } from "../orchestrator/storage/schema-compatibility.js";
 import { buildWikilinkResolver } from "../utils/links.js";
 import {
   createV2Foundation,
@@ -681,6 +683,7 @@ export interface V2WebUiOptions {
   readonly foundations?: ReadonlyMap<string, V2Foundation>;
   readonly allowedHost?: string;
   readonly clientDistDir?: string;
+  readonly autoSyncBuild?: boolean;
 }
 
 export function createV2WebUiHandler(options: V2WebUiOptions) {
@@ -858,7 +861,8 @@ export function createV2WebUiHandler(options: V2WebUiOptions) {
     const inflight = foundationPromiseCache.get(inflightKey);
     if (inflight) return inflight;
 
-    const autoSyncBuild = process.env.MEMORY_V2_AUTO_SYNC_BUILD === "1";
+    const autoSyncBuild =
+      options.autoSyncBuild ?? process.env.MEMORY_V2_AUTO_SYNC_BUILD !== "0";
     const initPromise = (async () => {
       const config = await ensureProjectV2StoreReady({
         projectRoot: canonicalRoot,
@@ -1394,6 +1398,46 @@ export function createV2WebUiHandler(options: V2WebUiOptions) {
 
       sendJson(res, 404, { ok: false, error: "NOT_FOUND", path: pathname });
     } catch (err) {
+      if (err instanceof SchemaCompatibilityError) {
+        sendJson(res, 409, {
+          ok: false,
+          error: err.code,
+          message: `สคีมาฐานข้อมูลความจำของโปรเจกต์ไม่ตรงกับเซิร์ฟเวอร์ปัจจุบัน (${err.code}) กรุณาอัปเกรดสคีมาหรือรัน sync-build`,
+        });
+        return;
+      }
+      if (err instanceof FreshStartError) {
+        if (
+          err.code === "FRESH_START_RELEASE_MISMATCH"
+          || err.code === "FRESH_START_BUILD_MISMATCH"
+          || err.code === "FRESH_START_SCHEMA_MISMATCH"
+        ) {
+          sendJson(res, 409, {
+            ok: false,
+            error: err.code,
+            message: `โปรเจกต์นี้มีเวอร์ชันบิลด์หรือสคีมาของฐานข้อมูลความจำไม่ตรงกับเซิร์ฟเวอร์ปัจจุบัน (${err.code}) กรุณารัน sync-build หรือรีสตาร์ท WebUI`,
+          });
+          return;
+        }
+        if (
+          err.code === "FRESH_START_ADMISSION_DENIED"
+          || err.code === "FRESH_START_NOT_INITIALIZED"
+          || err.code === "FRESH_START_RECOVERY_REQUIRED"
+        ) {
+          sendJson(res, 409, {
+            ok: false,
+            error: err.code,
+            message: `ฐานข้อมูลความจำของโปรเจกต์ยังไม่พร้อมใช้งานหรือต้องการการกู้คืน (${err.code})`,
+          });
+          return;
+        }
+        sendJson(res, 500, {
+          ok: false,
+          error: err.code,
+          message: `เกิดข้อผิดพลาดจากระบบความจำ V2 (${err.code})`,
+        });
+        return;
+      }
       const code = err instanceof Error ? err.message : "";
       if (code === "PAYLOAD_TOO_LARGE") {
         sendJson(res, 413, { ok: false, error: "PAYLOAD_TOO_LARGE" });

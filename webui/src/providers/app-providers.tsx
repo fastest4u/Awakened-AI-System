@@ -24,7 +24,7 @@ export function createDefaultQueryClient(): QueryClient {
         retry: (failureCount, error) => {
           if (
             error instanceof ApiError &&
-            (error.status === 404 || error.status === 403)
+            (error.status === 404 || error.status === 403 || error.status === 409)
           ) {
             return false;
           }

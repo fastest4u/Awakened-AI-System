@@ -22,7 +22,7 @@ import { PROJECT_STORE_MIGRATIONS } from "../src/orchestrator/storage/migrations
 import { NodeSqliteDriver } from "../src/orchestrator/storage/node-sqlite-driver.js";
 import { expectedSchemaFingerprint } from "../src/orchestrator/storage/schema-fingerprint.js";
 import { inspectV2Build } from "../src/v2/build-identity.js";
-import { createV2Foundation } from "../src/v2/composition.js";
+import { createV2Foundation, ensureProjectV2StoreReady } from "../src/v2/composition.js";
 import {
   V2_PRODUCTION_CAPABILITIES,
   V2_PRODUCTION_RECOVERY_POLICY,
@@ -408,5 +408,137 @@ test("Task 2: WebUI SPA serving & /api/bootstrap suite", async (t) => {
     await server.close();
     spaClient.cleanup();
     await store.cleanup();
+  }
+});
+
+async function createStaleBuildStore(prefix: string): Promise<string> {
+  const projectRoot = realpathSync.native(mkdtempSync(join(tmpdir(), prefix)));
+  await ensureProjectV2StoreReady({
+    projectRoot,
+    entryUrl: V2_DIST_ENTRY_URL,
+    allowBootstrap: true,
+    syncBuild: true,
+    ensureActive: true,
+    promotePrepared: true,
+  });
+  const eventsPath = join(projectRoot, "memory-v2", ".memory-mcp", "v2", "events.sqlite");
+  const db = new DatabaseSync(eventsPath);
+  try {
+    db.exec("DROP TRIGGER IF EXISTS fresh_start_releases_no_update");
+    db.prepare("UPDATE fresh_start_releases SET build_identity_hash = ?").run("0".repeat(64));
+    db.exec(
+      "CREATE TRIGGER fresh_start_releases_no_update BEFORE UPDATE ON fresh_start_releases BEGIN SELECT RAISE(ABORT, 'FRESH_START_IMMUTABLE'); END;",
+    );
+  } finally {
+    db.close();
+  }
+  return projectRoot;
+}
+
+test("WebUI auto-syncs stale project build_identity_hash by default and surfaces 409 FreshStartError when disabled", async (t) => {
+  const spaClient = createTempSpaClient();
+  const assertReleaseMismatch409 = (res: { statusCode: number; body: Buffer }) => {
+    assert.equal(res.statusCode, 409);
+    const body = JSON.parse(res.body.toString("utf8")) as {
+      ok?: unknown;
+      error?: unknown;
+      message?: unknown;
+    };
+    assert.equal(body.ok, false);
+    assert.equal(body.error, "FRESH_START_RELEASE_MISMATCH");
+    assert.equal(typeof body.message, "string");
+    const msg = body.message as string;
+    assert.ok(msg.includes("FRESH_START_RELEASE_MISMATCH"));
+    assert.ok(msg.includes("sync-build") && /[\u0E00-\u0E7F]/u.test(msg));
+  };
+  try {
+    await t.test(
+      "auto-syncs stale project build_identity_hash by default when MEMORY_V2_AUTO_SYNC_BUILD is unset",
+      async () => {
+        const staleRoot = await createStaleBuildStore("pm-v2-stale-sync-default-");
+        const prevAutoSync = process.env.MEMORY_V2_AUTO_SYNC_BUILD;
+        delete process.env.MEMORY_V2_AUTO_SYNC_BUILD;
+        let srv: Awaited<ReturnType<typeof startV2WebUiServer>> | undefined;
+        try {
+          srv = await startV2WebUiServer({
+            defaultProjectRoot: staleRoot,
+            port: 0,
+            entryUrl: V2_DIST_ENTRY_URL,
+            clientDistDir: spaClient.dir,
+          });
+          const res = await rawHttpGet(srv.url, "/api/overview");
+          assert.equal(res.statusCode, 200);
+          const body = JSON.parse(res.body.toString("utf8")) as { ok?: unknown };
+          assert.equal(body.ok, true);
+        } finally {
+          if (srv) await srv.close();
+          if (prevAutoSync === undefined) {
+            delete process.env.MEMORY_V2_AUTO_SYNC_BUILD;
+          } else {
+            process.env.MEMORY_V2_AUTO_SYNC_BUILD = prevAutoSync;
+          }
+          rmSync(staleRoot, { recursive: true, force: true });
+        }
+      },
+    );
+
+    await t.test(
+      "surfaces 409 FRESH_START_RELEASE_MISMATCH with Thai message when autoSyncBuild is disabled",
+      async () => {
+        const staleRoot = await createStaleBuildStore("pm-v2-stale-sync-disabled-");
+        const prevAutoSync = process.env.MEMORY_V2_AUTO_SYNC_BUILD;
+        process.env.MEMORY_V2_AUTO_SYNC_BUILD = "1";
+        let srv: Awaited<ReturnType<typeof startV2WebUiServer>> | undefined;
+        try {
+          srv = await startV2WebUiServer({
+            defaultProjectRoot: staleRoot,
+            port: 0,
+            entryUrl: V2_DIST_ENTRY_URL,
+            clientDistDir: spaClient.dir,
+            autoSyncBuild: false,
+          });
+          const res = await rawHttpGet(srv.url, "/api/overview");
+          assertReleaseMismatch409(res);
+        } finally {
+          if (srv) await srv.close();
+          if (prevAutoSync === undefined) {
+            delete process.env.MEMORY_V2_AUTO_SYNC_BUILD;
+          } else {
+            process.env.MEMORY_V2_AUTO_SYNC_BUILD = prevAutoSync;
+          }
+          rmSync(staleRoot, { recursive: true, force: true });
+        }
+      },
+    );
+
+    await t.test(
+      "surfaces 409 FRESH_START_RELEASE_MISMATCH when MEMORY_V2_AUTO_SYNC_BUILD is '0' and autoSyncBuild is omitted",
+      async () => {
+        const staleRoot = await createStaleBuildStore("pm-v2-stale-sync-env0-");
+        const prevAutoSync = process.env.MEMORY_V2_AUTO_SYNC_BUILD;
+        process.env.MEMORY_V2_AUTO_SYNC_BUILD = "0";
+        let srv: Awaited<ReturnType<typeof startV2WebUiServer>> | undefined;
+        try {
+          srv = await startV2WebUiServer({
+            defaultProjectRoot: staleRoot,
+            port: 0,
+            entryUrl: V2_DIST_ENTRY_URL,
+            clientDistDir: spaClient.dir,
+          });
+          const res = await rawHttpGet(srv.url, "/api/overview");
+          assertReleaseMismatch409(res);
+        } finally {
+          if (srv) await srv.close();
+          if (prevAutoSync === undefined) {
+            delete process.env.MEMORY_V2_AUTO_SYNC_BUILD;
+          } else {
+            process.env.MEMORY_V2_AUTO_SYNC_BUILD = prevAutoSync;
+          }
+          rmSync(staleRoot, { recursive: true, force: true });
+        }
+      },
+    );
+  } finally {
+    spaClient.cleanup();
   }
 });

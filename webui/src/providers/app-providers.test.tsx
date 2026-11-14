@@ -15,7 +15,7 @@ describe('AppProviders & getOrCreateQueryClient retry logic', () => {
     resetGlobalQueryClient();
   });
 
-  it('default retry function skips retrying on 404 and 403 ApiError but retries once on 500', () => {
+  it('default retry function skips retrying on 404, 403, and 409 ApiError but retries once on 500', () => {
     const qc = getOrCreateQueryClient();
     const retryFn = qc.getDefaultOptions().queries?.retry;
     expect(typeof retryFn).toBe('function');
@@ -25,6 +25,8 @@ describe('AppProviders & getOrCreateQueryClient retry logic', () => {
       expect(retryFn(0, new ApiError(404, 'NOTE_NOT_FOUND'))).toBe(false);
       // 403 should not retry
       expect(retryFn(0, new ApiError(403, 'CSRF_ORIGIN_DENIED'))).toBe(false);
+      // 409 should not retry
+      expect(retryFn(0, new ApiError(409, 'FRESH_START_RELEASE_MISMATCH'))).toBe(false);
       // 500 should retry once on failureCount 0
       expect(retryFn(0, new ApiError(500, 'INTERNAL_SERVER_ERROR'))).toBe(true);
       // 500 should stop retrying on failureCount 1
