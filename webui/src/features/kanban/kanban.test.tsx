@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { screen, waitFor, fireEvent } from '@testing-library/react';
+import { screen, waitFor, fireEvent, act } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { renderApp } from '@/test/render-app';
 import type { NoteItem } from '@/api/types';
@@ -93,6 +93,72 @@ describe('Kanban page', () => {
         expect(newRequests.length).toBe(1);
         expect(newRequests[0]).toContain('query=redis');
         expect((router.state.location.search as any)?.q).toBe('redis');
+      },
+      { timeout: 2000 },
+    );
+  });
+
+  it('syncs external URL search param updates without stomping', async () => {
+    const user = userEvent.setup();
+    const notesRequests: string[] = [];
+
+    const { router } = renderApp({
+      initialUrl: '/kanban?q=initial',
+      fetchHandler: (url) => {
+        if (url.startsWith('/api/notes')) {
+          notesRequests.push(url);
+          return new Response(
+            JSON.stringify({
+              ok: true,
+              projectRoot: 'C:\\default',
+              items: sampleNotes,
+            }),
+            { status: 200, headers: { 'Content-Type': 'application/json' } },
+          );
+        }
+      },
+    });
+
+    const searchInput = (await screen.findByPlaceholderText(
+      /พิมพ์ค้นหาความจำ ชื่อไฟล์ หรือฟังก์ชัน/,
+    )) as HTMLInputElement;
+
+    // Initially has "initial" from mount
+    expect(searchInput.value).toBe('initial');
+
+    // External navigation while mounted (e.g. clicking a deep link or wikilink to /kanban?q=external-jwt)
+    await act(async () => {
+      await router.navigate({
+        to: '/kanban',
+        search: (prev: any) => ({ ...prev, q: 'external-jwt' }),
+      });
+    });
+
+    // Verify input updated and URL was not overwritten back
+    await waitFor(() => {
+      expect(searchInput.value).toBe('external-jwt');
+      expect((router.state.location.search as any)?.q).toBe('external-jwt');
+      expect(notesRequests.some((u) => u.includes('query=external-jwt'))).toBe(true);
+    });
+
+    // Wait past the 250ms debounce window to ensure no delayed debounce stomps it back
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 350));
+    });
+    expect(searchInput.value).toBe('external-jwt');
+    expect((router.state.location.search as any)?.q).toBe('external-jwt');
+
+    // Now verify typing still debounces cleanly
+    const countBeforeTyping = notesRequests.length;
+    await user.clear(searchInput);
+    await user.type(searchInput, 'typed-query');
+
+    await waitFor(
+      () => {
+        const afterTypingRequests = notesRequests.slice(countBeforeTyping);
+        expect(afterTypingRequests.length).toBe(1);
+        expect(afterTypingRequests[0]).toContain('query=typed-query');
+        expect((router.state.location.search as any)?.q).toBe('typed-query');
       },
       { timeout: 2000 },
     );

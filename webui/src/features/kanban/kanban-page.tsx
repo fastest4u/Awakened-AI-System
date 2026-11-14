@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo } from 'react';
+import { useState, useEffect, useMemo, useRef } from 'react';
 import { useSearch, useNavigate } from '@tanstack/react-router';
 import { useQuery, keepPreviousData } from '@tanstack/react-query';
 import { notesQuery } from '@/api/queries';
@@ -23,19 +23,37 @@ export function KanbanPage() {
   const navigate = useNavigate();
   const search = useSearch({ strict: false }) as Record<string, string | undefined>;
 
-  const [searchQuery, setSearchQuery] = useState(search?.q || '');
+  const urlQ = search?.q || '';
+  const [searchQuery, setSearchQuery] = useState(urlQ);
   const debouncedSearch = useDebouncedValue(searchQuery, 250);
+  const lastSyncedUrlQ = useRef(urlQ);
+  const isUserTypingRef = useRef(false);
+
   const [viewMode, setViewMode] = useState<'kanban' | 'table'>('kanban');
   const [pendingConfirmAction, setPendingConfirmAction] =
     useState<GovernanceConfirmAction | null>(null);
 
   const kindFilter = search?.kind || '';
 
-  // Synchronize debounced search input to URL `q` parameter
+  // Synchronize external URL `q` parameter changes into local search state
   useEffect(() => {
-    const currentQ = (search?.q || '').trim();
+    if (urlQ !== lastSyncedUrlQ.current) {
+      lastSyncedUrlQ.current = urlQ;
+      isUserTypingRef.current = false;
+      setSearchQuery(urlQ);
+    }
+  }, [urlQ]);
+
+  // Synchronize local debounced search input to URL `q` parameter only when user typed
+  useEffect(() => {
+    if (!isUserTypingRef.current) {
+      return;
+    }
     const nextQ = debouncedSearch.trim();
+    const currentQ = (search?.q || '').trim();
     if (currentQ !== nextQ) {
+      lastSyncedUrlQ.current = nextQ;
+      isUserTypingRef.current = false;
       navigate({
         to: '.',
         search: (prev: any) => {
@@ -51,6 +69,11 @@ export function KanbanPage() {
       });
     }
   }, [debouncedSearch, navigate, search?.q]);
+
+  const handleSearchChange = (val: string) => {
+    isUserTypingRef.current = true;
+    setSearchQuery(val);
+  };
 
   const handleKindChange = (val: string) => {
     navigate({
@@ -68,9 +91,13 @@ export function KanbanPage() {
     });
   };
 
+  const effectiveQuery = isUserTypingRef.current
+    ? debouncedSearch.trim()
+    : (urlQ || debouncedSearch).trim();
+
   const { data: notesData, isLoading } = useQuery({
     ...notesQuery(projectRoot, {
-      query: debouncedSearch.trim() || undefined,
+      query: effectiveQuery || undefined,
       kind: kindFilter || undefined,
     }),
     placeholderData: keepPreviousData,
@@ -155,7 +182,7 @@ export function KanbanPage() {
 
       <KanbanToolbar
         searchQuery={searchQuery}
-        onSearchChange={setSearchQuery}
+        onSearchChange={handleSearchChange}
         kindFilter={kindFilter}
         onKindChange={handleKindChange}
         viewMode={viewMode}
