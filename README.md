@@ -1,19 +1,21 @@
 # Awakened AI Memory MCP Server (Project Memory V2)
 
-MCP Server สำหรับระบบความจำระยะยาวระดับ Production (**Project Memory V2**) ที่จัดเก็บข้อมูลในรูปแบบ **Event-Sourced SQLite + Deterministic Read Projections + Full-Text Search (FTS5) + Causal Knowledge Graph** พร้อม **WebUI Mission Control** และระบบ **Always-On Governed Session Lifecycle** สำหรับ AI IDE และ Autonomous Agents ทุกค่าย
+**เวอร์ชันปัจจุบัน:** [`v2.3.0`](https://github.com/fastest4u/Awakened-AI-System/releases) (2026-11-14)
+
+MCP Server สำหรับระบบความจำระยะยาวระดับ Production (**Project Memory V2**) ที่จัดเก็บข้อมูลในรูปแบบ **Event-Sourced SQLite + Deterministic Read Projections + Hybrid Thai/BM25 Retrieval + Causal Knowledge Graph** พร้อม **WebUI Mission Control (Vite 8 + React 19 SPA)** และระบบ **Always-On Governed Session Lifecycle** สำหรับ AI IDE และ Autonomous Agents ทุกค่าย
 
 ## ภาพรวมระบบ (Project Memory V2)
 
-- **Authoritative Store (`memory-v2/`)**: บันทึกทุกเหตุการณ์แบบ append-only พร้อม cryptographic HMAC integrity chain, fencing tokens, session leases และ verified read projections
+- **Authoritative Store (`memory-v2/`)**: บันทึกทุกเหตุการณ์แบบ append-only พร้อม cryptographic HMAC integrity chain, fencing tokens, session leases, Cross-Branch V2 Session Continuity และ verified read projections
 - **Frozen V1 Archive (`memory/`)**: เก็บคลัง Markdown V1 เดิมในสถานะ read-only (`0o444`) พร้อม cryptographic archive manifest ที่ตรวจสอบได้ตลอดเวลาผ่าน `verify-v1-archive`
-- **34 Public MCP Tools**: ครอบคลุมการเริ่มต้น/ปิด session, token-budgeted context pack, ค้นหาความจำ, บันทึก ADR/Insight/Mistake/Session Log, ตรวจสอบความถูกต้องกับซอร์สโค้ดจริง (`memory_verifySourceTruth`), และการจัดการ lifecycle (`promote`, `supersede`, `retract`, `expire`, `forgetEvidence`)
+- **34 Public MCP Tools**: ครอบคลุมการเริ่มต้น/ปิด session, token-budgeted context pack, Autonomous Awakening (`memory_awaken`), Hybrid Thai/BM25 Retrieval, บันทึก ADR/Insight/Mistake/Session Log, ตรวจสอบความถูกต้องกับซอร์สโค้ดจริง (`memory_verifySourceTruth`), และการจัดการ lifecycle (`promote`, `supersede`, `retract`, `expire`, `forgetEvidence`)
 - **MCP Resources, Resource Templates & Prompts**:
   - Static Resources: `memory://current/status`, `memory://current/radar`, `memory://current/awaken`, `memory://current/rules`, `memory://current/adrs`, `memory://current/mistakes`, `memory://graph`
   - Resource Templates: `memory://notes/{recordId}`, `memory://sessions/{sessionId}`, `memory://projects/{projectRoot}/status`, `memory://projects/{projectRoot}/radar`, `memory://projects/{projectRoot}/awaken`, `memory://projects/{projectRoot}/rules`
   - Governed Prompt: `session-handoff`
 - **Unified Knowledge Graph & Causal Triads**: สกัดความเชื่อมโยงอัตโนมัติระหว่าง Notes, ไฟล์โค้ด (`filePaths`), สัญลักษณ์ (`symbols`), `[[wikilinks]]`, สายวิวัฒนาการ (`supersedes`), และสามเหลี่ยมเหตุ-ผล (`Mistake -> Insight -> ADR`) แบบถ่วงน้ำหนัก IDF
-- **WebUI Mission Control (`npm run webui`)**: แดชบอร์ดแบบ Local-First พร้อมระบบป้องกัน DNS Rebinding / CSRF / CSP, Kanban Lifecycle Board, Interactive Knowledge Graph, Deep-Linking (`#graph?...` / `#view=...`) และ Automated Memory Curator
-- **Multi-IDE Sync (`generate-client-configs`)**: ซิงก์ไฟล์ตั้งค่า MCP และกฎ Always-On V2 Protocol ให้กับ Antigravity, Cursor, Claude Code, Windsurf, Codex, OpenCode, Zed และ GitHub Copilot ในคำสั่งเดียว
+- **WebUI Mission Control (`npm run webui`)**: **Vite 8 + React 19 SPA** (`webui/` -> `dist/webui/`) พร้อม TanStack Router & Query, Tailwind CSS v4, shadcn/ui, **Interactive Knowledge Graph (`@xyflow/react` + `elkjs`)**, **AI Memory Curator Studio** (ภาษาไทย/อังกฤษ), **MCP Console**, clean URL deep-linking (`/overview`, `/kanban`, `/graph`, `/curator`, `/mcp`) และการป้องกัน DNS rebinding / CSRF / CSP
+- **Multi-Project Routing & Multi-IDE Sync (`generate-client-configs`)**: รองรับการสลับหลายโปรเจกต์ผ่าน `projectRoot` และการซิงก์ไฟล์ตั้งค่า MCP พร้อมกฎ Always-On V2 Protocol ให้ Antigravity, Cursor, Claude Code, Windsurf, Codex, OpenCode, Zed และ GitHub Copilot ในคำสั่งเดียว
 
 ---
 
@@ -32,8 +34,10 @@ Awakened-AI-System/
       curator.ts                  # Automated deduplication, supersession & verified promotion
       admin.ts                    # Operator CLI commands (bootstrap, sync-build, webui, cutover)
       webui.ts                    # Hardened local HTTP server & REST API สำหรับ Mission Control
-      webui/                      # Reactive Web Components, Kanban, Knowledge Graph & Deep-Linking
+      webui/                      # Backend MVC models/controllers & bounded immutable SPA asset server (spa-assets.ts)
     orchestrator/                 # Event store, SQLite worker, migrations, projections & fresh-start
+  webui/                          # Isolated Vite 8 + React 19 + TanStack Router/Query + Tailwind CSS v4 + shadcn/ui + XYFlow/ELK SPA
+  dist/                           # Compiled V2 MCP server (v2.js), admin CLI (v2-admin.js), workers & dist/webui/ SPA bundle
   memory-v2/                      # Authoritative Project Memory V2 vault descriptor & local state
   memory/                         # Frozen read-only V1 archive (0o444 — ห้ามเขียนทับโดยตรง)
   docs/
@@ -49,7 +53,9 @@ Awakened-AI-System/
 
 ```bash
 npm install
+npm run setup:webui
 npm run check:runtime
+npm run build:webui
 npm run build
 ```
 
@@ -65,12 +71,14 @@ npm run build
 | `npm run setup:webui` | ติดตั้ง dependencies ของ WebUI SPA (`npm --prefix webui ci`) |
 | `npm run build:webui` | คอมไพล์ WebUI SPA ด้วย Vite (`dist/webui/`) |
 | `npm run test:webui` | รันชุดทดสอบ WebUI Vitest |
+| `npm --prefix webui run typecheck` | ตรวจสอบชนิดข้อมูล TypeScript ของ WebUI SPA (`tsc -b --noEmit`) |
 | `npm run dev:webui` | รัน Vite dev server สำหรับ WebUI (`http://localhost:5173`) |
 | `npm run webui` | เปิด WebUI Mission Control ที่ `http://127.0.0.1:4321` |
 | `npm run v2-admin -- <cmd>` | เรียกใช้ Operator CLI (`dist/v2-admin.js`) |
 | `npm run typecheck` | ตรวจสอบชนิดข้อมูล TypeScript (`tsc --noEmit`) |
 | `npm run test:v2` | รันชุดทดสอบ V2 MCP Tools, AI IDE Acceleration, WebUI/Curator และ Cutover Gate |
-| `npm test` | รันชุดทดสอบมาตรฐานทั้งหมดแบบ serial ตามโปรไฟล์ CI |
+| `npm test` | รันชุดทดสอบมาตรฐานแบบขนานผ่าน LPT-scheduled worker runner (`scripts/run-test-profile.js`) |
+| `npm run test:all` | รันชุดทดสอบทั้งหมดแบบ serial ครบทุกไฟล์ |
 | `npm run test:rollout-control-plane` | รันชุดตรวจสอบ rollout control plane และ CI lifecycle gates |
 | `npm run test:v2-fresh-start-foundation` | รันชุดทดสอบ Fresh-Start Foundation Gate แบบ isolated |
 | `npm run test:build-artifacts` | Build และทดสอบ smoke test ของ compiled workers และ V2 artifacts จริง |
@@ -134,7 +142,7 @@ node dist/v2-admin.js verify-v1-archive \
 
 ## WebUI Mission Control
 
-หน้าต่างควบคุมและสำรวจความจำแบบ SPA ยุคใหม่ ขับเคลื่อนด้วย **Vite 8 + React 19 + TanStack Router & Query + Tailwind CSS v4 + shadcn/ui**:
+หน้าต่างควบคุมและสำรวจความจำแบบ SPA ยุคใหม่ ขับเคลื่อนด้วย **Vite 8 + React 19 + TanStack Router & Query + Tailwind CSS v4 + shadcn/ui + `@xyflow/react` + `elkjs`**:
 
 ```bash
 # ติดตั้ง dependencies และ build SPA client (ครั้งแรกหรือเมื่อแก้ไข webui/)
@@ -152,12 +160,19 @@ npm run webui          # เทอร์มินัล 1: รัน backend ser
 npm run dev:webui      # เทอร์มินัล 2: รัน Vite dev server ที่ http://localhost:5173
 ```
 
-ความสามารถหลักใน WebUI:
-- **Overview & Telemetry**: คะแนนสุขภาพความจำ, สถิติสถานะโน้ต, ปุ่มสั่งงาน Curator อัตโนมัติ และรายการ **Causal Triads** (`Mistake -> Insight -> ADR`)
-- **Kanban Lifecycle Board**: จัดการโน้ตแยกตามสถานะ (`candidate`, `provisional`, `verified`, `superseded`) พร้อมปุ่มคลิกข้ามไปยังไฟล์/สัญลักษณ์บนกราฟ
-- **Interactive Knowledge Graph**: แผนผังเชื่อมโยง Notes, Code Files, Symbols, Wikilinks และ Supersession Lineage พร้อมโหมด 1-Hop Focus, ดับเบิลคลิกเปิดอ่านโน้ต และปุ่มสลับกลับไปยัง Kanban
-- **URL Deep-Linking**: แชร์หรือบุ๊กมาร์กสถานะหน้าจอได้ผ่าน URL Hash ทั้งรูปแบบ `#graph?q=curator&kind=file`, `#kanban?note=<recordId>` และ `#view=graph&q=curator&type=file`
-- **Local Security Hardening**: บังคับตรวจสอบ loopback `Host` header (ป้องกัน DNS rebinding), `X-PM-CSRF-Token` แบบ constant-time, `Sec-Fetch-Site` / `Origin`, CSP headers และอนุญาตเฉพาะโปรเจกต์ที่ลงทะเบียนแล้วเท่านั้น
+### 5 หน้าจอหลักใน SPA (`webui/`)
+
+1. **Overview (`/overview`)**: Health score gauge, กราฟ Recharts แสดงสัดส่วนโน้ตและกิจกรรมย้อนหลัง, Live AI Session Activity Map, **Causal Triads** แบบถ่วงน้ำหนัก IDF (`Mistake -> Insight -> ADR` พร้อม context badges ของไฟล์/สัญลักษณ์/เซสชันที่คลิกนำทางได้) และ **AI Curator Insights** (`RecommendationsCard`)
+2. **Kanban & Table Board (`/kanban`)**: จัดการโน้ตแยกตามสถานะ (`candidate`, `provisional`, `verified`, `superseded`), ปุ่มสลับโหมดตาราง (Table mode), IME-safe quick entry, ค้นหาแบบ debounced (ปุ่มลัด `/`) และ confirmation dialog ก่อนเปลี่ยนสถานะเชิงธรรมาภิบาล
+3. **Interactive Knowledge Graph (`/graph`)**: ขับเคลื่อนด้วย `@xyflow/react` + `elkjs` ใน 2 มุมมองหลัก (**Story Flow**: `Session -> Memory -> File -> Symbol` และ **Orbital Galaxy**), ค่าเริ่มต้นโหมด **Focused Related-Only** (`#graph-focus-related-toggle`), glassmorphic node cards, MiniMap, Zoom HUD, ดับเบิลคลิกเปิดอ่านโน้ต และ Inspector ด้านข้าง
+4. **AI Memory Curator Studio (`/curator`)**: ห้องสนทนา Curator ภาษาไทย/อังกฤษ, ตรวจสอบสุขภาพคลังความจำ (`audit`), ตรวจกลุ่มโน้ตซ้ำ (`duplicateGroups`) และปุ่ม `Auto-Curate` ในคลิกเดียว
+5. **MCP Console (`/mcp`)**: ตัวเรียกใช้งาน V2 MCP Tools ทั้ง 34 รายการแบบอินเทอร์แอกทีฟ พร้อม JSON templates, parameter pills และ confirmation guard สำหรับเครื่องมือที่แก้ไขข้อมูล
+
+### Deep-Linking, คีย์ลัด และความปลอดภัย
+
+- **Clean URL & Search Params Deep-Linking**: รองรับ URL จริงของ SPA เช่น `/overview?project=...`, `/kanban?q=curator&note=<recordId>`, `/graph?node=file:src/v2/webui.ts&mode=flow&kind=file&session=<sessionId>`, `/curator`, `/mcp`
+- **Shell UX & Reliability**: `Ctrl+K` / `Cmd+K` สำหรับ Command Palette, กด `/` เพื่อค้นหาด่วนบน Kanban, Multi-Project Switcher, Light/Dark theme persistence และ abort-aware exponential backoff สำหรับ HTTP transient (`429/502/503/504`)
+- **Backend Static & Security Hardening**: ตรวจสอบ loopback `Host` header (ป้องกัน DNS rebinding), `X-PM-CSRF-Token` แบบ constant-time, `Sec-Fetch-Site` / `Origin`, CSP headers, ระบบโหลด SPA asset แบบ bounded preloader (`MAX_SPA_INDEX_BYTES` 2 MiB, `MAX_SPA_ASSET_BYTES` 16 MiB, `MAX_SPA_TOTAL_BUNDLE_BYTES` 64 MiB, `MAX_SPA_ASSET_COUNT` 256, `MAX_SPA_SCAN_DEPTH` 6) และซิงก์ build identity อัตโนมัติเมื่อเปิด `MEMORY_V2_AUTO_SYNC_BUILD`
 
 ---
 
@@ -176,6 +191,17 @@ npm run dev:webui      # เทอร์มินัล 2: รัน Vite dev se
    - การจัดการสถานะความจำ: `memory_promote`, `memory_supersede`, `memory_retract`, `memory_expire`, `memory_forgetEvidence`
    - การแตกงานให้ Subagent: `memory_sessionFork`, `memory_recordChildResult`, `memory_completeChildSession`
 5. **ปิดเซสชันอย่างสมบูรณ์**: เรียก `memory_sessionEnd` (`finalize: true`) ตามด้วย `memory_verifyVault` / `memory_verifySourceTruth` / `memory_v2Status`
+
+---
+
+## ประวัติการอัปเดต (Releases)
+
+ดูรายละเอียดทั้งหมดได้ที่ [GitHub Releases](https://github.com/fastest4u/Awakened-AI-System/releases):
+
+- **[v2.3.0](https://github.com/fastest4u/Awakened-AI-System/releases/tag/v2.3.0) (2026-11-14 — Latest, PR #18)**: ย้าย WebUI ไปสู่ Isolated **Vite 8 + React 19 + TanStack Router/Query + Tailwind CSS v4 + shadcn/ui SPA** (`webui/` -> `dist/webui/`), อัปเกรด Interactive Knowledge Graph ด้วย **`@xyflow/react` + `elkjs`** (โหมด **Story Flow** & **Orbital Galaxy** + ค่าเริ่มต้น **Focused Related-Only**), รองรับ **Cross-Branch V2 Session Continuity**, bounded gzip + ETag SPA asset serving (`spa-assets.ts`), abort-aware exponential backoff API client และลบโค้ด legacy `/mvc/*` ออกทั้งหมด
+- **[v2.2.0](https://github.com/fastest4u/Awakened-AI-System/releases/tag/v2.2.0) (2026-11-13 — PR #16, PR #17)**: เปิดตัว **WebUI Mission Control** REST API พร้อม loopback/CSRF/CSP hardening, **AI Memory Curator** (`audit`, `auto-curate`, สนทนาไทย/อังกฤษ), MCP Static & URI-Template Resources (`memory://*`) และ IDF-weighted **Causal Triads** (`Mistake -> Insight -> ADR`)
+- **[v2.1.0](https://github.com/fastest4u/Awakened-AI-System/releases/tag/v2.1.0) (2026-10-21 — PR #15)**: เพิ่ม **Autonomous Awakening (`memory_awaken`)**, **Hybrid Thai/BM25 Retrieval**, **Multi-Project Routing (`projectRoot`)**, Operator CLI (`bootstrap-project`, `sync-build`, `rebuild-projections`) และ **Multi-IDE Sync** (`generate-client-configs` ครบ 8 IDEs)
+- **[v2.0.0](https://github.com/fastest4u/Awakened-AI-System/releases/tag/v2.0.0) (2026-10-21 — PR #10, PR #13, PR #14)**: **Fresh-Start V2 Production Completion (`F1–F4`)** — append-only SQLite event store + cryptographic HMAC chain, root/child session leases & fencing tokens, 34 MCP tools, full-body governed Markdown notes, privacy erasure (`forgetEvidence`), key rotation, fenced backup/restore/replay และ frozen read-only V1 archive (`0o444`)
 
 ---
 
