@@ -326,4 +326,67 @@ describe('Knowledge Graph page', () => {
       expect(search.node).toBe('file:src/auth.ts');
     });
   });
+
+  it('supports keyboard navigation (Enter and Space) on related elements in inspector', async () => {
+    const { router } = renderApp({
+      initialUrl: '/graph?node=note:rec-1',
+      fetchHandler: (url) => {
+        if (url.startsWith('/api/graph')) {
+          return new Response(JSON.stringify(sampleGraph), {
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+      },
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText(/ไฟล์ซอร์สโค้ดที่เกี่ยวข้อง/)).toBeInTheDocument();
+    });
+
+    // 1. Related file badge responds to Enter
+    const fileBadge = screen.getByRole('button', { name: /src\/auth\.ts/ });
+    fireEvent.keyDown(fileBadge, { key: 'Enter', code: 'Enter' });
+
+    await waitFor(() => {
+      const search = router.state.location.search as any;
+      expect(search.node).toBe('file:src/auth.ts');
+    });
+
+    // Now on file:src/auth.ts, inspector shows related note and related symbol
+    await waitFor(() => {
+      expect(screen.getByText(/ความจำ & บทเรียนที่เชื่อมโยง/)).toBeInTheDocument();
+      expect(screen.getByText(/ฟังก์ชัน \/ คลาสที่เกี่ยวข้อง/)).toBeInTheDocument();
+    });
+
+    // 2. Related symbol responds to Enter
+    const symbolBadge = screen.getByRole('button', { name: /refreshToken/ });
+    fireEvent.keyDown(symbolBadge, { key: 'Enter', code: 'Enter' });
+
+    await waitFor(() => {
+      const search = router.state.location.search as any;
+      expect(search.node).toBe('symbol:refreshToken');
+    });
+
+    // Go back to file:src/auth.ts to test Space on related note
+    await act(async () => {
+      await router.navigate({
+        to: '/graph',
+        search: (prev: any) => ({ ...prev, node: 'file:src/auth.ts' }),
+      });
+    });
+
+    const noteItem = await waitFor(() => {
+      const el = screen.getByRole('button', { name: /Token Refresh Pattern/ });
+      expect(el).toBeInTheDocument();
+      return el;
+    });
+
+    // 3. Related note responds to Space
+    fireEvent.keyDown(noteItem, { key: ' ', code: 'Space' });
+
+    await waitFor(() => {
+      const search = router.state.location.search as any;
+      expect(search.node).toBe('note:rec-1');
+    });
+  });
 });

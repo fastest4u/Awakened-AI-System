@@ -71,11 +71,15 @@ export function NoteDetailSheet() {
     } else {
       navigate({
         to: '/kanban',
-        search: (prev: any) => ({
-          ...prev,
-          project: projectRoot,
-          q: target,
-        }),
+        search: (prev: any) => {
+          const next = {
+            ...prev,
+            project: projectRoot,
+            q: target,
+          };
+          delete next.note;
+          return next;
+        },
       });
     }
   };
@@ -83,7 +87,6 @@ export function NoteDetailSheet() {
   const handleGraphFocus = () => {
     if (!note?.recordId) return;
     const targetRecordId = note.recordId;
-    handleClose();
     navigate({
       to: '/graph',
       search: (prev: any) => {
@@ -97,11 +100,15 @@ export function NoteDetailSheet() {
   const handleGraphQuery = (queryVal: string) => {
     navigate({
       to: '/graph',
-      search: (prev: any) => ({
-        ...prev,
-        project: projectRoot,
-        q: queryVal,
-      }),
+      search: (prev: any) => {
+        const next = {
+          ...prev,
+          project: projectRoot,
+          q: queryVal,
+        };
+        delete next.note;
+        return next;
+      },
     });
   };
 

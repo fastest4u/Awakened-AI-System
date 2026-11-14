@@ -12,6 +12,7 @@ import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { Alert, AlertTitle, AlertDescription } from '@/components/ui/alert';
 import { humanKindLabel } from '@/lib/graph-labels';
+import { isImeComposing } from '@/lib/keyboard';
 import type { GraphNode } from '@/api/types';
 
 export interface GraphStory {
@@ -78,6 +79,22 @@ export function GraphInspector({
     selectedNode.kind === 'session'
       ? selectedNode.currentTask || selectedNode.label
       : selectedNode.label;
+
+  const handleItemKeyDown = (
+    e: React.KeyboardEvent,
+    action: () => void,
+  ) => {
+    if (e.target !== e.currentTarget) return;
+    if (e.key === ' ' || e.key === 'Spacebar') {
+      e.preventDefault();
+      action();
+    } else if (e.key === 'Enter') {
+      if (!isImeComposing(e)) {
+        e.preventDefault();
+        action();
+      }
+    }
+  };
 
   return (
     <div className="rounded-xl border border-border bg-card p-4 space-y-4">
@@ -218,8 +235,13 @@ export function GraphInspector({
             {story.relatedNotes.slice(0, 5).map((nNode) => (
               <div
                 key={nNode.id}
+                role="button"
+                tabIndex={0}
                 onClick={() => onSelectNode(nNode.id)}
-                className="p-2.5 rounded-lg border border-border bg-background hover:bg-accent/50 transition-colors cursor-pointer space-y-1 text-xs"
+                onKeyDown={(e) =>
+                  handleItemKeyDown(e, () => onSelectNode(nNode.id))
+                }
+                className="p-2.5 rounded-lg border border-border bg-background hover:bg-accent/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring transition-colors cursor-pointer space-y-1 text-xs"
               >
                 <div className="flex items-center justify-between gap-2">
                   <span className="font-semibold text-foreground truncate">
@@ -233,6 +255,9 @@ export function GraphInspector({
                       onClick={(e) => {
                         e.stopPropagation();
                         onOpenNote(nNode.recordId!);
+                      }}
+                      onKeyDown={(e) => {
+                        e.stopPropagation();
                       }}
                       className="h-6 text-[11px] px-2 shrink-0"
                     >
@@ -264,8 +289,13 @@ export function GraphInspector({
               <Badge
                 key={fNode.id}
                 variant="outline"
+                role="button"
+                tabIndex={0}
                 onClick={() => onSelectNode(fNode.id)}
-                className="cursor-pointer gap-1 text-xs hover:bg-accent"
+                onKeyDown={(e) =>
+                  handleItemKeyDown(e, () => onSelectNode(fNode.id))
+                }
+                className="cursor-pointer gap-1 text-xs hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
               >
                 <FileText className="size-3 text-[#10b981]" />
                 <span>{fNode.label}</span>
@@ -288,8 +318,13 @@ export function GraphInspector({
               <Badge
                 key={symNode.id}
                 variant="secondary"
+                role="button"
+                tabIndex={0}
                 onClick={() => onSelectNode(symNode.id)}
-                className="cursor-pointer gap-1 text-xs hover:bg-accent"
+                onKeyDown={(e) =>
+                  handleItemKeyDown(e, () => onSelectNode(symNode.id))
+                }
+                className="cursor-pointer gap-1 text-xs hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
               >
                 <Code2 className="size-3 text-[#f59e0b]" />
                 <span>{symNode.label}</span>

@@ -138,4 +138,162 @@ describe('NoteDetailSheet', () => {
       await screen.findByText(/ไม่พบข้อมูลความจำที่ระบุ/),
     ).toBeInTheDocument();
   });
+
+  it('clicking a file or symbol badge navigates to /graph?q= and clears note param', async () => {
+    const mockNote = {
+      id: 'n1',
+      recordId: 'n1',
+      kind: 'insight',
+      recordKind: 'insight',
+      title: 'Performance Insight',
+      summary: 'Caching queries improves responsiveness',
+      body: 'Body text',
+      status: 'verified',
+      filePaths: ['src/api/queries.ts'],
+      symbols: ['noteQuery'],
+      wikilinks: [],
+      sessionId: 'sess-1',
+    };
+
+    const { router } = renderApp({
+      initialUrl: '/kanban?note=n1',
+      fetchHandler: (url) => {
+        if (url.includes('/api/notes/n1')) {
+          return new Response(
+            JSON.stringify({
+              ok: true,
+              projectRoot: 'C:\\default',
+              note: mockNote,
+            }),
+            { status: 200, headers: { 'Content-Type': 'application/json' } },
+          );
+        }
+      },
+    });
+
+    await screen.findByRole('heading', {
+      name: 'รายละเอียดความจำ (Human-Readable Memory View)',
+    });
+
+    const fileBadge = await screen.findByText('src/api/queries.ts');
+    await userEvent.click(fileBadge);
+
+    await waitFor(() => {
+      const location = router.state.location;
+      expect(location.pathname).toBe('/graph');
+      const search = location.search as any;
+      expect(search.q).toBe('src/api/queries.ts');
+      expect(search.note).toBeUndefined();
+    });
+  });
+
+  it('clicking a non-note wikilink navigates to /kanban?q= and clears note param', async () => {
+    const mockNote = {
+      id: 'n1',
+      recordId: 'n1',
+      kind: 'insight',
+      recordKind: 'insight',
+      title: 'Performance Insight',
+      summary: 'Check related [[kanban-topic|Kanban Topic]]',
+      body: 'Body text',
+      status: 'verified',
+      filePaths: [],
+      symbols: [],
+      wikilinks: ['kanban-topic'],
+      sessionId: 'sess-1',
+    };
+
+    const { router } = renderApp({
+      initialUrl: '/kanban?note=n1',
+      fetchHandler: (url) => {
+        if (url.includes('/api/notes/n1')) {
+          return new Response(
+            JSON.stringify({
+              ok: true,
+              projectRoot: 'C:\\default',
+              note: mockNote,
+            }),
+            { status: 200, headers: { 'Content-Type': 'application/json' } },
+          );
+        }
+      },
+    });
+
+    await screen.findByRole('heading', {
+      name: 'รายละเอียดความจำ (Human-Readable Memory View)',
+    });
+
+    const wikilinkBtn = await screen.findByRole('button', {
+      name: 'Kanban Topic',
+    });
+    await userEvent.click(wikilinkBtn);
+
+    await waitFor(() => {
+      const location = router.state.location;
+      expect(location.pathname).toBe('/kanban');
+      const search = location.search as any;
+      expect(search.q).toBe('kanban-topic');
+      expect(search.note).toBeUndefined();
+    });
+  });
+
+  it('clicking Focus in Graph navigates to /graph in a single atomic transition and clears note param', async () => {
+    const mockNote = {
+      id: 'n1',
+      recordId: 'n1',
+      kind: 'insight',
+      recordKind: 'insight',
+      title: 'Performance Insight',
+      summary: 'Summary text',
+      body: 'Body text',
+      status: 'verified',
+      filePaths: [],
+      symbols: [],
+      wikilinks: [],
+      sessionId: 'sess-1',
+    };
+
+    const { router } = renderApp({
+      initialUrl: '/kanban?note=n1',
+      fetchHandler: (url) => {
+        if (url.includes('/api/notes/n1')) {
+          return new Response(
+            JSON.stringify({
+              ok: true,
+              projectRoot: 'C:\\default',
+              note: mockNote,
+            }),
+            { status: 200, headers: { 'Content-Type': 'application/json' } },
+          );
+        }
+      },
+    });
+
+    await screen.findByRole('heading', {
+      name: 'รายละเอียดความจำ (Human-Readable Memory View)',
+    });
+
+    const navigateSpy = vi.spyOn(router, 'navigate');
+
+    const focusBtn = await screen.findByRole('button', {
+      name: /ดูความเชื่อมโยงในกราฟ/,
+    });
+    await userEvent.click(focusBtn);
+
+    await waitFor(() => {
+      const location = router.state.location;
+      expect(location.pathname).toBe('/graph');
+      const search = location.search as any;
+      expect(search.node).toBe('n1');
+      expect(search.note).toBeUndefined();
+    });
+
+    // Verify atomic single navigation call
+    expect(navigateSpy).toHaveBeenCalledTimes(1);
+    expect(navigateSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        to: '/graph',
+      }),
+    );
+  });
 });
