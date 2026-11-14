@@ -340,6 +340,21 @@ export interface SessionTreeProjection {
   readonly anchor: string | null;
 }
 
+export interface CrossScopeSessionProjection {
+  readonly projectId: ProjectId;
+  readonly sessionId: string;
+  readonly rootSessionId: string;
+  readonly parentSessionId: string | null;
+  readonly lifecycleState: "open" | "closed";
+  readonly ownerGeneration: number;
+  readonly openedEventPosition: bigint;
+  readonly closedEventPosition: bigint | null;
+  readonly sourceEventId: string;
+  readonly sourceEventPosition: bigint;
+  readonly latestStreamVersion: bigint;
+  readonly openChildCount: number;
+}
+
 export interface CanonicalItemProjection {
   readonly projectId: ProjectId;
   readonly sessionId: string | null;

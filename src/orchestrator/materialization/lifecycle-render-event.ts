@@ -333,9 +333,22 @@ export function normalizeCandidateLifecycleRenderEvent(
       || root.vaultId !== input.context.binding.vaultId
       || root.storeId !== input.context.binding.storeId
       || root.workspaceId !== input.context.binding.workspaceId
-      || root.branchRef !== (input.context.workspace.kind === "git" ? input.context.workspace.branchRef : null)
-      || (input.context.branchScopeId !== undefined && input.context.branchScopeId !== root.branchScopeId)
     ) return integrity();
+    let candidateBranchScopeId: LifecycleRenderEventV1["branchScopeId"];
+    let candidateBranchRef: string | null;
+    if (input.context.workspace.kind !== "git") {
+      if (root.branchScopeId !== null || root.branchRef !== null) return integrity();
+      candidateBranchScopeId = null;
+      candidateBranchRef = null;
+    } else if (input.context.branchScopeId !== undefined) {
+      if (root.branchScopeId === null) return integrity();
+      candidateBranchScopeId = input.context.branchScopeId;
+      candidateBranchRef = input.context.workspace.branchRef;
+    } else {
+      if (root.branchRef !== input.context.workspace.branchRef) return integrity();
+      candidateBranchScopeId = root.branchScopeId;
+      candidateBranchRef = root.branchRef;
+    }
     const headVersion = BigInt(head.streamVersion);
     if (headVersion < 1n || headVersion >= SQLITE_INT64_MAX) return integrity();
     const nextStreamVersion = headVersion + 1n;
@@ -344,8 +357,8 @@ export function normalizeCandidateLifecycleRenderEvent(
       vaultId: root.vaultId,
       storeId: root.storeId,
       workspaceId: root.workspaceId,
-      branchScopeId: root.branchScopeId,
-      branchRef: root.branchRef,
+      branchScopeId: candidateBranchScopeId,
+      branchRef: candidateBranchRef,
       streamId: root.streamId,
       streamVersion: nextStreamVersion.toString(),
       globalPosition: input.expectedTriggerPosition.toString(),

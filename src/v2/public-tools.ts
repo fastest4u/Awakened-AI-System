@@ -1072,8 +1072,22 @@ export class V2PublicToolRouter {
       establishedAt: nowIso,
       contextFingerprint: "",
     };
+    const branchRef = options.workspace.kind === "git" ? options.workspace.branchRef : null;
+    const inspectedBranchScopeId: BranchScopeId | null = options.workspace.kind === "git"
+      ? new BranchScopeRepository().inspect(
+          options.connection,
+          options.identity.projectId as ProjectId,
+          {
+            branchRef: options.workspace.branchRef,
+            headCommit: options.workspace.headCommit,
+            detached: options.workspace.detached,
+          },
+        )
+      : null;
+
     this.#rootContext = Object.freeze({
       workspace: options.workspace,
+      ...(inspectedBranchScopeId !== null ? { branchScopeId: inspectedBranchScopeId } : {}),
       checkedAt: nowIso,
       binding: Object.freeze({
         ...baseBinding,
@@ -1089,6 +1103,7 @@ export class V2PublicToolRouter {
     };
     this.#childContext = Object.freeze({
       workspace: options.workspace,
+      ...(inspectedBranchScopeId !== null ? { branchScopeId: inspectedBranchScopeId } : {}),
       checkedAt: nowIso,
       binding: Object.freeze({
         ...childBindingBase,
@@ -1096,30 +1111,18 @@ export class V2PublicToolRouter {
       }),
     });
 
-    const branchRef = options.workspace.kind === "git" ? options.workspace.branchRef : null;
-    let branchScopeId: BranchScopeId | null = null;
-    if (options.workspace.kind === "git") {
-      branchScopeId = new BranchScopeRepository().inspect(
-        options.connection,
-        options.identity.projectId as ProjectId,
-        {
-          branchRef: options.workspace.branchRef,
-          headCommit: options.workspace.headCommit,
-          detached: options.workspace.detached,
-        },
-      );
-      if (!branchScopeId) {
-        const branchScopeRow = options.connection
-          .prepare(
-            `SELECT branch_scope_id FROM branch_scopes
-             WHERE project_id = $projectId AND retired_at IS NULL
-             ORDER BY created_at DESC LIMIT 1`,
-          )
-          .get({
-            $projectId: options.identity.projectId,
-          }) as { branch_scope_id?: string } | undefined;
-        branchScopeId = (branchScopeRow?.branch_scope_id ?? null) as BranchScopeId | null;
-      }
+    let branchScopeId: BranchScopeId | null = inspectedBranchScopeId;
+    if (options.workspace.kind === "git" && !branchScopeId) {
+      const branchScopeRow = options.connection
+        .prepare(
+          `SELECT branch_scope_id FROM branch_scopes
+           WHERE project_id = $projectId AND retired_at IS NULL
+           ORDER BY created_at DESC LIMIT 1`,
+        )
+        .get({
+          $projectId: options.identity.projectId,
+        }) as { branch_scope_id?: string } | undefined;
+      branchScopeId = (branchScopeRow?.branch_scope_id ?? null) as BranchScopeId | null;
     }
 
     this.#projectionBinding = Object.freeze({
@@ -1660,8 +1663,9 @@ export class V2PublicToolRouter {
       liveWorkspace.branchRef !== this.#workspace.branchRef ||
       liveWorkspace.headCommit !== this.#workspace.headCommit ||
       liveWorkspace.detached !== this.#workspace.detached;
+    const scopeChanged = (resolvedScopeId ?? undefined) !== this.#rootContext.branchScopeId;
 
-    if (workspaceChanged) {
+    if (workspaceChanged || scopeChanged) {
       this.#workspace = liveWorkspace;
       const nowIso = new Date().toISOString();
       const updatedRootBase = {
@@ -1671,6 +1675,7 @@ export class V2PublicToolRouter {
       };
       this.#rootContext = Object.freeze({
         workspace: liveWorkspace,
+        ...(resolvedScopeId !== null ? { branchScopeId: resolvedScopeId } : {}),
         checkedAt: nowIso,
         binding: Object.freeze({
           ...updatedRootBase,
@@ -1684,6 +1689,7 @@ export class V2PublicToolRouter {
       };
       this.#childContext = Object.freeze({
         workspace: liveWorkspace,
+        ...(resolvedScopeId !== null ? { branchScopeId: resolvedScopeId } : {}),
         checkedAt: nowIso,
         binding: Object.freeze({
           ...updatedChildBase,
@@ -1710,6 +1716,23 @@ export class V2PublicToolRouter {
       });
       this.#cachedProjectedNotes = null;
     }
+  }
+
+  #ensureLiveBranchScopeId(): void {
+    this.#refreshLiveGitBinding();
+    if (this.#readOnlyMode || this.#workspace.kind !== "git") return;
+    if (this.#rootContext.branchScopeId !== undefined) return;
+    new BranchScopeRepository().resolveOrCreate(
+      this.#connection,
+      this.#identity.projectId as ProjectId,
+      {
+        branchRef: this.#workspace.branchRef,
+        headCommit: this.#workspace.headCommit,
+        detached: this.#workspace.detached,
+      },
+      new Date().toISOString(),
+    );
+    this.#refreshLiveGitBinding();
   }
 
   #resolveActiveRootSessionId(explicitSessionId?: unknown): string | null {
@@ -1825,7 +1848,7 @@ export class V2PublicToolRouter {
     readonly evidenceIds: readonly string[];
     readonly eventIds: readonly string[];
   }> {
-    this.#refreshLiveGitBinding();
+    this.#ensureLiveBranchScopeId();
     const b = this.#rootContext.binding;
     const branchRef = this.#projectionBinding.branchRef;
     const sessionId = randomUUID();
@@ -5524,7 +5547,7 @@ export class V2PublicToolRouter {
     if (!coordinator) {
       throw new FreshStartError("FRESH_START_STORAGE_FAILURE");
     }
-    this.#refreshLiveGitBinding();
+    this.#ensureLiveBranchScopeId();
     const b = this.#rootContext.binding;
     const authority = this.#authorityRepo.get(this.#connection, b.projectId, sessionId);
     if (!authority || authority.ownerGeneration === null) {
@@ -5925,7 +5948,7 @@ export class V2PublicToolRouter {
   }
 
   async #handleSessionEnd(args: Record<string, unknown>): Promise<Record<string, unknown>> {
-    this.#refreshLiveGitBinding();
+    this.#ensureLiveBranchScopeId();
     const sessionId =
       this.#resolveOpenOrEndingRootSessionId(args.sessionId)
       ?? (await this.#ensureActiveRootSession(args.sessionId));
@@ -6007,6 +6030,7 @@ export class V2PublicToolRouter {
       sessionId,
       taskSummary: String(args.summary ?? "Pre-session-end checkpoint"),
     });
+    this.#ensureLiveBranchScopeId();
     authority = this.#authorityRepo.get(this.#connection, b.projectId, sessionId);
     if (!authority || authority.ownerGeneration === null) {
       throw new FreshStartError("FRESH_START_INPUT_INVALID");
@@ -6116,6 +6140,7 @@ export class V2PublicToolRouter {
   }
 
   async #handleAmendSessionEnd(args: Record<string, unknown>): Promise<Record<string, unknown>> {
+    this.#ensureLiveBranchScopeId();
     const sessionId =
       this.#resolveOpenOrEndingRootSessionId(args.sessionId)
       ?? (await this.#ensureActiveRootSession(args.sessionId));
@@ -6233,6 +6258,7 @@ export class V2PublicToolRouter {
   }
 
   async #handleCancelSessionEnd(args: Record<string, unknown>): Promise<Record<string, unknown>> {
+    this.#ensureLiveBranchScopeId();
     const sessionId =
       this.#resolveOpenOrEndingRootSessionId(args.sessionId)
       ?? (await this.#ensureActiveRootSession(args.sessionId));

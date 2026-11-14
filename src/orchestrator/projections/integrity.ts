@@ -28,7 +28,7 @@ import {
   type CanonicalProjectionRow,
   type ProjectionName,
 } from "./checksum.js";
-import type { ProjectBinding, ProjectionFoldState, ProjectionFoldStateV3, GovernedNoteProjectionRowV1, ProjectionSourceDisposition } from "./contracts.js";
+import type { CrossScopeSessionProjection, ProjectBinding, ProjectionFoldState, ProjectionFoldStateV3, GovernedNoteProjectionRowV1, ProjectionSourceDisposition } from "./contracts.js";
 import {
   replayCommittedProjectionEvents, replayCommittedProjectionSources,
   type CommittedProjectionReplayResult,
@@ -1050,11 +1050,16 @@ export class ProjectionIntegrityService {
       const manifest = parseRichProjectionManifest(manifestValue, binding);
       if (manifest.schemaVersion === 3) {
         const crossScopeIds = new Set<string>();
-        const accumulator = new ProjectionFoldAccumulatorV3(crossScopeIds);
+        const crossScopeSessions = new Map<string, CrossScopeSessionProjection>();
+        const accumulator = new ProjectionFoldAccumulatorV3(crossScopeIds, crossScopeSessions);
         const replayed = replayCommittedProjectionSources(binding, { driver:this.#options.driver, eventStorePath:this.#options.eventStorePath,
           busyTimeoutMs:this.#options.busyTimeoutMs, terminalEventPosition:BigInt(manifest.terminalEventPosition),
-          maxEvents:this.#options.maxReplayEvents, maxAggregateBytes:this.#options.maxReplayBytes }, (source, seenCrossScope) => {
+          maxEvents:this.#options.maxReplayEvents, maxAggregateBytes:this.#options.maxReplayBytes }, (source, seenCrossScope, seenSessions) => {
             for (const id of seenCrossScope) crossScopeIds.add(id);
+            if (seenSessions !== undefined) {
+              crossScopeSessions.clear();
+              for (const [sid, srow] of seenSessions) crossScopeSessions.set(sid, srow);
+            }
             accumulator.append(source);
           });
         if (replayed.terminalEventPosition !== BigInt(manifest.terminalEventPosition)

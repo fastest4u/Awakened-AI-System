@@ -1,4 +1,5 @@
 import type {
+  CrossScopeSessionProjection,
   ProjectionEventV3,
   GovernedMemorySourceProjectionEventV3,
   ProjectionSourceDisposition,
@@ -876,6 +877,7 @@ class ProjectionFoldAccumulatorCore {
   #binding: ProjectBinding | null = null;
   #terminalEventPosition: bigint | null = null;
   readonly #crossScopeItemIds: ReadonlySet<string> | undefined;
+  readonly #crossScopeSessions: ReadonlyMap<string, CrossScopeSessionProjection> | undefined;
   readonly #sessionTree = new Map<string, SessionTreeProjection>();
   readonly #openChildCounts = new Map<string, number>();
   readonly #sessionCheckpoints: SessionCheckpointProjection[] = [];
@@ -892,12 +894,76 @@ class ProjectionFoldAccumulatorCore {
   readonly #retrievalFeedback = new Map<string, RetrievalFeedbackProjection>();
   readonly #canonicalConflicts = new Map<string, CanonicalConflictProjectionRowV1>();
 
-  constructor(crossScopeItemIds?: ReadonlySet<string>) {
+  constructor(
+    crossScopeItemIds?: ReadonlySet<string>,
+    crossScopeSessions?: ReadonlyMap<string, CrossScopeSessionProjection>,
+  ) {
     this.#crossScopeItemIds = crossScopeItemIds;
+    this.#crossScopeSessions = crossScopeSessions;
   }
 
   canonicalConflicts(): readonly CanonicalConflictProjectionRowV1[] {
     return Object.freeze([...this.#canonicalConflicts.values()]);
+  }
+
+  #syncCrossScopeSession(sessionId: string): void {
+    if ((this.#binding?.branchScopeId ?? null) === null || this.#crossScopeSessions === undefined) return;
+    const cs = this.#crossScopeSessions.get(sessionId);
+    if (cs === undefined) return;
+    if (cs.parentSessionId !== null) {
+      this.#syncCrossScopeSession(cs.parentSessionId);
+    }
+    const local = this.#sessionTree.get(sessionId);
+    if (local === undefined) {
+      this.#room(this.#sessionTree.size, false);
+      this.#sessionTree.set(sessionId, Object.freeze({
+        projectId: cs.projectId,
+        sessionId: cs.sessionId,
+        rootSessionId: cs.rootSessionId,
+        parentSessionId: cs.parentSessionId,
+        lifecycleState: cs.lifecycleState,
+        ownerGeneration: cs.ownerGeneration,
+        openedEventPosition: cs.openedEventPosition,
+        closedEventPosition: cs.closedEventPosition,
+        latestCheckpointId: null,
+        latestCheckpointEventPosition: null,
+        sourceEventId: cs.sourceEventId,
+        sourceEventPosition: cs.sourceEventPosition,
+        latestStreamVersion: cs.latestStreamVersion,
+        anchor: null,
+      }));
+      this.#openChildCounts.set(sessionId, cs.openChildCount);
+    } else {
+      this.#openChildCounts.set(sessionId, cs.openChildCount);
+      if (cs.latestStreamVersion > local.latestStreamVersion) {
+        this.#sessionTree.set(sessionId, Object.freeze({
+          ...local,
+          lifecycleState: cs.lifecycleState,
+          ownerGeneration: cs.ownerGeneration,
+          closedEventPosition: cs.closedEventPosition,
+          sourceEventId: cs.sourceEventId,
+          sourceEventPosition: cs.sourceEventPosition,
+          latestStreamVersion: cs.latestStreamVersion,
+        }));
+      }
+    }
+    for (const [childId, childRow] of this.#sessionTree) {
+      if (childRow.parentSessionId !== sessionId) continue;
+      const csChild = this.#crossScopeSessions.get(childId);
+      if (csChild === undefined) continue;
+      this.#openChildCounts.set(childId, csChild.openChildCount);
+      if (csChild.latestStreamVersion > childRow.latestStreamVersion) {
+        this.#sessionTree.set(childId, Object.freeze({
+          ...childRow,
+          lifecycleState: csChild.lifecycleState,
+          ownerGeneration: csChild.ownerGeneration,
+          closedEventPosition: csChild.closedEventPosition,
+          sourceEventId: csChild.sourceEventId,
+          sourceEventPosition: csChild.sourceEventPosition,
+          latestStreamVersion: csChild.latestStreamVersion,
+        }));
+      }
+    }
   }
 
   append(event: ProjectionEventV3, independentGovernedStream = false): void {
@@ -906,6 +972,15 @@ class ProjectionFoldAccumulatorCore {
       return integrity();
     }
     this.#binding ??= event.binding;
+    if (event.kind === "session-lifecycle") {
+      if (event.eventType === "SessionStarted" || event.eventType === "SessionForked") {
+        if (event.parentSessionId !== null) this.#syncCrossScopeSession(event.parentSessionId);
+      } else {
+        this.#syncCrossScopeSession(event.sessionId);
+      }
+    } else if (event.binding.sessionId !== null) {
+      this.#syncCrossScopeSession(event.binding.sessionId);
+    }
     if (
       event.kind !== "session-lifecycle"
       && event.kind !== "checkpoint"
@@ -1496,8 +1571,11 @@ export class ProjectionFoldAccumulatorV3 {
   #lastSourcePosition: bigint | null = null;
   #binding: ProjectBinding | null = null;
 
-  constructor(crossScopeItemIds?: ReadonlySet<string>) {
-    this.#core = new ProjectionFoldAccumulatorCore(crossScopeItemIds);
+  constructor(
+    crossScopeItemIds?: ReadonlySet<string>,
+    crossScopeSessions?: ReadonlyMap<string, CrossScopeSessionProjection>,
+  ) {
+    this.#core = new ProjectionFoldAccumulatorCore(crossScopeItemIds, crossScopeSessions);
   }
 
   append(source: ProjectionSourceDisposition): void {

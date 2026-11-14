@@ -251,6 +251,13 @@ function sameSourceContext(left: LifecycleRenderEventV1, right: LifecycleRenderE
     && left.branchRef === right.branchRef;
 }
 
+function sameWorkspaceContext(left: LifecycleRenderEventV1, right: LifecycleRenderEventV1): boolean {
+  return left.projectId === right.projectId
+    && left.vaultId === right.vaultId
+    && left.storeId === right.storeId
+    && left.workspaceId === right.workspaceId;
+}
+
 function sameStoreContext(left: LifecycleRenderEventV1, right: LifecycleRenderEventV1): boolean {
   return left.projectId === right.projectId
     && left.vaultId === right.vaultId
@@ -435,7 +442,7 @@ function validateChildHistories(
         || item.event.sessionId !== group.childSessionId
         || item.event.parentSessionId !== root.sessionId
         || item.event.streamId !== `session/${group.childSessionId}`
-        || !sameSourceContext(item.event, root)
+        || !sameWorkspaceContext(item.event, root)
         || item.event.materializationOrigin !== null
         || occupiedPositions.has(item.event.globalPosition)
       ) return integrity();
@@ -786,7 +793,7 @@ export function projectCompatibilityLogV2(input: CompatibilityLogProjectionInput
       || trigger.event.sessionId !== start.event.sessionId
       || trigger.event.parentSessionId !== null
       || trigger.event.streamId !== start.event.streamId
-      || !sameSourceContext(trigger.event, start.event)
+      || !sameWorkspaceContext(trigger.event, start.event)
       || trigger.streamVersion !== BigInt(rootDecoded.length + 1)
     ) return integrity();
 
@@ -801,7 +808,7 @@ export function projectCompatibilityLogV2(input: CompatibilityLogProjectionInput
         || event.event.sessionId !== start.event.sessionId
         || event.event.parentSessionId !== null
         || event.event.streamId !== start.event.streamId
-        || !sameSourceContext(event.event, start.event)
+        || !sameWorkspaceContext(event.event, start.event)
         || event.event.materializationOrigin !== null
         || !ROOT_EVENT_TYPES.has(event.event.eventType)
         || occupiedPositions.has(event.event.globalPosition)
@@ -942,8 +949,8 @@ export function projectCompatibilityLogV2(input: CompatibilityLogProjectionInput
               checkpoint.sessionId !== start.event.sessionId
               || checkpoint.parentSessionId !== null
               || checkpoint.checkpointEventPosition !== current.event.globalPosition
-              || checkpoint.sourceState.workspaceId !== start.event.workspaceId
-              || checkpoint.sourceState.branchRef !== start.event.branchRef
+              || checkpoint.sourceState.workspaceId !== current.event.workspaceId
+              || checkpoint.sourceState.branchRef !== current.event.branchRef
               || positiveDecimal(checkpoint.baseEventPosition) >= current.position
             ) return integrity();
           }
